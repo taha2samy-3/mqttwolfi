@@ -136,9 +136,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = tls_server.run_tls(acceptor).await;
                     });
                 }
-                Err(e) => error!("Failed to bind TLS listener on {}: {}", tls_addr, e),
+                Err(e) => {
+                    error!("Failed to bind TLS listener on {}: {}", tls_addr, e);
+                    return Err(format!("Failed to bind TLS listener on {}: {}", tls_addr, e).into());
+                }
             },
-            Err(e) => error!("Failed to initialize TLS acceptor: {}", e),
+            Err(e) => {
+                error!("Failed to initialize TLS acceptor: {}", e);
+                return Err(format!("Failed to initialize TLS acceptor: {}", e).into());
+            }
         }
     }
 

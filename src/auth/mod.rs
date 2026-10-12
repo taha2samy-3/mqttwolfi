@@ -126,11 +126,19 @@ impl UserAccount {
         result.iter().map(|b| format!("{:02x}", b)).collect()
     }
 
+    /// Computes secure password hash using Argon2id with random salt (falling back to SHA-256 only if Argon2 fails).
+    pub fn hash_password_secure(password: &[u8]) -> String {
+        if password.is_empty() {
+            return String::new();
+        }
+        Self::hash_password_argon2(password).unwrap_or_else(|_| Self::hash_password(password))
+    }
+
     /// Creates a Superuser Administrator account with unrestricted access across all topics.
     pub fn new_admin(username: impl Into<String>, password: &str) -> Self {
         Self {
             username: username.into(),
-            password_hash: Self::hash_password(password.as_bytes()),
+            password_hash: Self::hash_password_secure(password.as_bytes()),
             role: UserRole::Admin,
             allowed_rooms: vec!["*".into()],
             custom_rules: vec![
@@ -148,7 +156,7 @@ impl UserAccount {
     ) -> Self {
         Self {
             username: username.into(),
-            password_hash: Self::hash_password(password.as_bytes()),
+            password_hash: Self::hash_password_secure(password.as_bytes()),
             role: UserRole::Moderator,
             allowed_rooms,
             custom_rules: vec![
@@ -166,7 +174,7 @@ impl UserAccount {
     ) -> Self {
         Self {
             username: username.into(),
-            password_hash: Self::hash_password(password.as_bytes()),
+            password_hash: Self::hash_password_secure(password.as_bytes()),
             role: UserRole::Member,
             allowed_rooms,
             custom_rules: vec![
@@ -187,7 +195,7 @@ impl UserAccount {
     ) -> Self {
         Self {
             username: username.into(),
-            password_hash: Self::hash_password(password.as_bytes()),
+            password_hash: Self::hash_password_secure(password.as_bytes()),
             role: UserRole::Viewer,
             allowed_rooms,
             custom_rules: vec![
@@ -203,7 +211,7 @@ impl UserAccount {
         let cid = client_id.into();
         Self {
             username: cid.clone(),
-            password_hash: Self::hash_password(secret_token.as_bytes()),
+            password_hash: Self::hash_password_secure(secret_token.as_bytes()),
             role: UserRole::Device,
             allowed_rooms: Vec::new(),
             custom_rules: vec![
@@ -483,7 +491,7 @@ impl AclEngine {
 
                     for &arg in &parts[2..] {
                         if let Some(pass) = arg.strip_prefix("password:") {
-                            password_hash = UserAccount::hash_password(pass.as_bytes());
+                            password_hash = UserAccount::hash_password_secure(pass.as_bytes());
                         } else if let Some(hash) = arg.strip_prefix("password_hash:") {
                             password_hash = hash.to_string();
                         } else if let Some(r_str) = arg.strip_prefix("role:") {
