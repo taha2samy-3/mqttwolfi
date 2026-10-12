@@ -35,51 +35,10 @@ impl BrokerContext {
             client_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
-}
-
-pub struct BrokerServer {
-    listener: TcpListener,
-    context: BrokerContext,
-}
-
-impl BrokerServer {
-    /// Binds the broker to a specific socket address (e.g., "127.0.0.1:0" for an ephemeral port).
-    pub async fn bind(addr: &str) -> Result<Self, std::io::Error> {
-        let listener = TcpListener::bind(addr).await?;
-        let context = BrokerContext::new(Arc::new(AclEngine::new(true)));
-        Ok(Self { listener, context })
-    }
-
-    /// Attaches an existing shared BrokerContext to this server instance.
-    pub fn with_context(mut self, context: BrokerContext) -> Self {
-        self.context = context;
-        self
-    }
-
-    /// Returns a reference to the shared BrokerContext.
-    pub fn context(&self) -> &BrokerContext {
-        &self.context
-    }
-
-    /// Attaches a custom AclEngine to the broker for authentication and authorization.
-    pub fn with_acl(mut self, acl: Arc<AclEngine>) -> Self {
-        self.context.acl = acl;
-        self
-    }
-
-    /// Returns a reference to the broker's AclEngine.
-    pub fn acl(&self) -> &Arc<AclEngine> {
-        &self.context.acl
-    }
-
-    /// Returns the local socket address the server is listening on.
-    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
-        self.listener.local_addr()
-    }
 
     /// Starts the background periodic $SYS topic publisher task.
     pub fn start_sys_publisher(&self, interval_sec: u64) {
-        let context = self.context.clone();
+        let context = self.clone();
         let start_time = std::time::Instant::now();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_sec.max(1)));
@@ -131,6 +90,52 @@ impl BrokerServer {
                 }
             }
         });
+    }
+}
+
+pub struct BrokerServer {
+    listener: TcpListener,
+    context: BrokerContext,
+}
+
+impl BrokerServer {
+    /// Binds the broker to a specific socket address (e.g., "127.0.0.1:0" for an ephemeral port).
+    pub async fn bind(addr: &str) -> Result<Self, std::io::Error> {
+        let listener = TcpListener::bind(addr).await?;
+        let context = BrokerContext::new(Arc::new(AclEngine::new(true)));
+        Ok(Self { listener, context })
+    }
+
+    /// Attaches an existing shared BrokerContext to this server instance.
+    pub fn with_context(mut self, context: BrokerContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Returns a reference to the shared BrokerContext.
+    pub fn context(&self) -> &BrokerContext {
+        &self.context
+    }
+
+    /// Attaches a custom AclEngine to the broker for authentication and authorization.
+    pub fn with_acl(mut self, acl: Arc<AclEngine>) -> Self {
+        self.context.acl = acl;
+        self
+    }
+
+    /// Returns a reference to the broker's AclEngine.
+    pub fn acl(&self) -> &Arc<AclEngine> {
+        &self.context.acl
+    }
+
+    /// Returns the local socket address the server is listening on.
+    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
+        self.listener.local_addr()
+    }
+
+    /// Starts the background periodic $SYS topic publisher task.
+    pub fn start_sys_publisher(&self, interval_sec: u64) {
+        self.context.start_sys_publisher(interval_sec);
     }
 
     /// Runs the server event loop accepting client connections concurrently.

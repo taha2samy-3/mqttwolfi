@@ -102,6 +102,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let shared_context = wolf_mqtt::server::BrokerContext::new(Arc::clone(&acl));
+    if config.monitoring.sys_topics_enabled {
+        shared_context.start_sys_publisher(config.monitoring.sys_update_interval_sec as u64);
+        info!(
+            "$SYS metric topics active (update interval: {}s)",
+            config.monitoring.sys_update_interval_sec
+        );
+    }
     let mut listeners_active = 0;
 
     if config.listeners.tls.enabled {
