@@ -1092,4 +1092,124 @@ mod tests {
         let decoded_ack = MqttPacket::decode(&mut read_ack).unwrap();
         assert_eq!(decoded_ack, unsuback);
     }
+
+    #[test]
+    fn test_mqtt5_connect_with_nonzero_properties() {
+        // Construct raw MQTT 5 CONNECT frame with properties
+        let mut raw = BytesMut::new();
+        raw.put_u8(0x10); // Connect fixed header
+
+        let mut payload = BytesMut::new();
+        payload.put_u16(4);
+        payload.put_slice(b"MQTT");
+        payload.put_u8(5); // Protocol version 5
+        payload.put_u8(0x02); // Clean start
+        payload.put_u16(60); // Keep alive
+
+        // MQTT v5 Properties: Length = 5 bytes
+        // Property ID 0x11 (Session Expiry Interval) = 60s (0x00, 0x00, 0x00, 0x3C)
+        payload.put_u8(5); // Properties length = 5
+        payload.put_u8(0x11); // Prop ID: Session Expiry
+        payload.put_u32(60);
+
+        // Client ID: "mqtt5-client"
+        payload.put_u16(12);
+        payload.put_slice(b"mqtt5-client");
+
+        encode_variable_byte_integer(payload.len() as u32, &mut raw).unwrap();
+        raw.put(payload);
+
+        let mut slice = &raw[..];
+        let decoded =
+            MqttPacket::decode(&mut slice).expect("MQTT 5 CONNECT with properties must succeed");
+        if let MqttPacket::Connect(conn) = decoded {
+            assert_eq!(conn.version, ProtocolVersion::V500);
+            assert_eq!(conn.client_id, "mqtt5-client");
+            assert!(conn.clean_start);
+            assert_eq!(conn.keep_alive_sec, 60);
+        } else {
+            panic!("Expected Connect packet");
+        }
+    }
+
+    #[test]
+    fn test_mqtt5_connect_with_will_properties() {
+        let mut raw = BytesMut::new();
+        raw.put_u8(0x10);
+
+        let mut payload = BytesMut::new();
+        payload.put_u16(4);
+        payload.put_slice(b"MQTT");
+        payload.put_u8(5); // v5
+        payload.put_u8(0x06); // Clean start (0x02) | Will Flag (0x04)
+        payload.put_u16(30);
+
+        // Connect properties: length 0
+        payload.put_u8(0x00);
+
+        // Client ID
+        payload.put_u16(8);
+        payload.put_slice(b"gateway1");
+
+        // Will properties: length 5 (Will Delay Interval = 10s: 0x18 + 0x00, 0x00, 0x00, 0x0A)
+        payload.put_u8(5);
+        payload.put_u8(0x18);
+        payload.put_u32(10);
+
+        // Will topic: "gateways/lwt"
+        payload.put_u16(12);
+        payload.put_slice(b"gateways/lwt");
+
+        // Will payload: "offline"
+        payload.put_u16(7);
+        payload.put_slice(b"offline");
+
+        encode_variable_byte_integer(payload.len() as u32, &mut raw).unwrap();
+        raw.put(payload);
+
+        let mut slice = &raw[..];
+        let decoded = MqttPacket::decode(&mut slice)
+            .expect("MQTT 5 CONNECT with will properties must succeed");
+        if let MqttPacket::Connect(conn) = decoded {
+            assert_eq!(conn.version, ProtocolVersion::V500);
+            assert_eq!(conn.client_id, "gateway1");
+            let will = conn.will.expect("Will must be present");
+            assert_eq!(will.topic, "gateways/lwt");
+            assert_eq!(&will.payload[..], b"offline");
+        } else {
+            panic!("Expected Connect packet with will");
+        }
+    }
+
+    #[test]
+    fn test_mqtt5_connack_and_puback_with_properties() {
+        // Raw MQTT 5 CONNACK with properties (Reason code 0x00, Session present false, Props length 0)
+        let v5_connack_bytes = [
+            0x20, 0x03, // CONNACK, Remaining Length = 3
+            0x00, // Flags: session present = false
+            0x00, // Reason code: Success
+            0x00, // Properties length = 0
+        ];
+        let mut slice = &v5_connack_bytes[..];
+        let decoded = MqttPacket::decode(&mut slice).expect("MQTT 5 CONNACK decode must succeed");
+        assert_eq!(
+            decoded,
+            MqttPacket::ConnAck {
+                session_present: false,
+                reason_code: 0x00,
+            }
+        );
+
+        // Raw MQTT 5 PUBACK with reason code & properties
+        let v5_puback_bytes = [
+            0x40, 0x04, // PUBACK, Remaining Length = 4
+            0x00, 0x2A, // Packet ID = 42
+            0x00, // Reason code = 0x00 Success
+            0x00, // Properties length = 0
+        ];
+        let mut slice2 = &v5_puback_bytes[..];
+        let decoded_puback =
+            MqttPacket::decode(&mut slice2).expect("MQTT 5 PUBACK decode must succeed");
+        assert_eq!(decoded_puback, MqttPacket::PubAck { packet_id: 42 });
+    }
 }
