@@ -121,9 +121,14 @@ pub struct PublishPacket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MqttPacket {
     Connect(ConnectPacket),
-    ConnAck { session_present: bool, reason_code: u8 },
+    ConnAck {
+        session_present: bool,
+        reason_code: u8,
+    },
     Publish(PublishPacket),
-    PubAck { packet_id: u16 },
+    PubAck {
+        packet_id: u16,
+    },
     PingReq,
     PingResp,
     Disconnect,

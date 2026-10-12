@@ -40,7 +40,10 @@ pub fn decode_variable_byte_integer<B: Buf>(buf: &mut B) -> Result<u32, VbiError
 }
 
 /// Encodes an MQTT variable-byte integer into a buffer.
-pub fn encode_variable_byte_integer<B: BufMut>(mut value: u32, buf: &mut B) -> Result<usize, VbiError> {
+pub fn encode_variable_byte_integer<B: BufMut>(
+    mut value: u32,
+    buf: &mut B,
+) -> Result<usize, VbiError> {
     if value > 268_435_455 {
         return Err(VbiError::MalformedVbi);
     }

@@ -41,7 +41,9 @@ impl<T: Clone + Eq + std::hash::Hash> TopicTrie<T> {
                 self.multi_wildcard_subscribers.insert(subscriber);
             }
             "+" => {
-                let node = self.single_wildcard.get_or_insert_with(|| Box::new(TopicTrie::new()));
+                let node = self
+                    .single_wildcard
+                    .get_or_insert_with(|| Box::new(TopicTrie::new()));
                 node.insert_recursive(&parts[1..], subscriber);
             }
             token => {
