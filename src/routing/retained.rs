@@ -160,4 +160,55 @@ mod tests {
         assert!(!store.contains_topic("device/status"));
         assert_eq!(store.count(), 0);
     }
+
+    #[test]
+    fn test_retained_store_capacity_quota() {
+        let mut store = RetainedStore::with_max_messages(2);
+
+        let p1 = PublishPacket {
+            topic: "topic/1".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"v1"),
+        };
+        let p2 = PublishPacket {
+            topic: "topic/2".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"v2"),
+        };
+        let p3 = PublishPacket {
+            topic: "topic/3".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"v3"),
+        };
+
+        assert!(store.update(p1));
+        assert!(store.update(p2));
+        assert_eq!(store.count(), 2);
+
+        // 3rd topic must be rejected because quota (2) is reached
+        assert!(!store.update(p3));
+        assert_eq!(store.count(), 2);
+        assert!(!store.contains_topic("topic/3"));
+
+        // Updating an existing topic should succeed even if quota is reached
+        let p1_updated = PublishPacket {
+            topic: "topic/1".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"v1_updated"),
+        };
+        assert!(store.update(p1_updated));
+        assert_eq!(store.count(), 2);
+    }
 }
