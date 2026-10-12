@@ -28,7 +28,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "wolf-bench-tls"
-path = "benches/bench_tls_comparison.rs"
+path = "src/bin/wolf_bench_tls.rs"
 
 [[bench]]
 name = "wolf-bench"
