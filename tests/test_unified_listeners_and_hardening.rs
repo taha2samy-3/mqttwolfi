@@ -3,9 +3,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use wolf_mqtt::auth::AclEngine;
-use wolf_mqtt::protocol::{
-    ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS,
-};
+use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS};
 use wolf_mqtt::server::{BrokerContext, BrokerServer};
 
 async fn send_packet(stream: &mut TcpStream, packet: MqttPacket) {
@@ -75,7 +73,10 @@ async fn test_shared_broker_context_cross_listener_routing() {
         }),
     )
     .await;
-    assert!(matches!(read_packet(&mut client_sub).await, MqttPacket::ConnAck { .. }));
+    assert!(matches!(
+        read_packet(&mut client_sub).await,
+        MqttPacket::ConnAck { .. }
+    ));
 
     send_packet(
         &mut client_sub,
@@ -85,7 +86,10 @@ async fn test_shared_broker_context_cross_listener_routing() {
         },
     )
     .await;
-    assert!(matches!(read_packet(&mut client_sub).await, MqttPacket::SubAck { .. }));
+    assert!(matches!(
+        read_packet(&mut client_sub).await,
+        MqttPacket::SubAck { .. }
+    ));
 
     // Client 2 connects to Listener B and publishes to "fleet/updates"
     let mut client_pub = TcpStream::connect(addr_b).await.unwrap();
@@ -102,7 +106,10 @@ async fn test_shared_broker_context_cross_listener_routing() {
         }),
     )
     .await;
-    assert!(matches!(read_packet(&mut client_pub).await, MqttPacket::ConnAck { .. }));
+    assert!(matches!(
+        read_packet(&mut client_pub).await,
+        MqttPacket::ConnAck { .. }
+    ));
 
     send_packet(
         &mut client_pub,
@@ -122,7 +129,10 @@ async fn test_shared_broker_context_cross_listener_routing() {
     if let MqttPacket::Publish(pkt) = delivered {
         assert_eq!(pkt.topic, "fleet/updates");
         assert_eq!(&pkt.payload[..], b"FIRMWARE_V2");
-        assert!(!pkt.retain, "Retain flag must be 0 for forwarded live messages");
+        assert!(
+            !pkt.retain,
+            "Retain flag must be 0 for forwarded live messages"
+        );
     } else {
         panic!("Expected Publish packet, got: {:?}", delivered);
     }
@@ -150,7 +160,10 @@ async fn test_live_unsubscribe_and_unsuback() {
         }),
     )
     .await;
-    assert!(matches!(read_packet(&mut client).await, MqttPacket::ConnAck { .. }));
+    assert!(matches!(
+        read_packet(&mut client).await,
+        MqttPacket::ConnAck { .. }
+    ));
 
     // Subscribe to test/topic
     send_packet(
@@ -161,7 +174,10 @@ async fn test_live_unsubscribe_and_unsuback() {
         },
     )
     .await;
-    assert!(matches!(read_packet(&mut client).await, MqttPacket::SubAck { .. }));
+    assert!(matches!(
+        read_packet(&mut client).await,
+        MqttPacket::SubAck { .. }
+    ));
 
     // Unsubscribe from test/topic
     send_packet(
@@ -200,7 +216,10 @@ async fn test_retained_qos1_delivery_with_packet_id() {
         }),
     )
     .await;
-    assert!(matches!(read_packet(&mut pub_stream).await, MqttPacket::ConnAck { .. }));
+    assert!(matches!(
+        read_packet(&mut pub_stream).await,
+        MqttPacket::ConnAck { .. }
+    ));
 
     send_packet(
         &mut pub_stream,
@@ -214,7 +233,10 @@ async fn test_retained_qos1_delivery_with_packet_id() {
         }),
     )
     .await;
-    assert_eq!(read_packet(&mut pub_stream).await, MqttPacket::PubAck { packet_id: 55 });
+    assert_eq!(
+        read_packet(&mut pub_stream).await,
+        MqttPacket::PubAck { packet_id: 55 }
+    );
     send_packet(&mut pub_stream, MqttPacket::Disconnect).await;
 
     // 2. Late subscriber subscribes to "system/version"
@@ -232,7 +254,10 @@ async fn test_retained_qos1_delivery_with_packet_id() {
         }),
     )
     .await;
-    assert!(matches!(read_packet(&mut sub_stream).await, MqttPacket::ConnAck { .. }));
+    assert!(matches!(
+        read_packet(&mut sub_stream).await,
+        MqttPacket::ConnAck { .. }
+    ));
 
     send_packet(
         &mut sub_stream,
@@ -242,15 +267,24 @@ async fn test_retained_qos1_delivery_with_packet_id() {
         },
     )
     .await;
-    assert!(matches!(read_packet(&mut sub_stream).await, MqttPacket::SubAck { .. }));
+    assert!(matches!(
+        read_packet(&mut sub_stream).await,
+        MqttPacket::SubAck { .. }
+    ));
 
     // Verify retained message is delivered with valid packet_id and retain=true
     let delivered = read_packet(&mut sub_stream).await;
     if let MqttPacket::Publish(pkt) = delivered {
         assert_eq!(pkt.topic, "system/version");
         assert_eq!(&pkt.payload[..], b"v1.0.0-fips");
-        assert!(pkt.retain, "Retained message must have retain flag set to true");
-        assert!(pkt.packet_id.is_some(), "QoS 1 delivery must have an assigned packet_id");
+        assert!(
+            pkt.retain,
+            "Retained message must have retain flag set to true"
+        );
+        assert!(
+            pkt.packet_id.is_some(),
+            "QoS 1 delivery must have an assigned packet_id"
+        );
     } else {
         panic!("Expected retained Publish packet, got: {:?}", delivered);
     }
@@ -277,12 +311,18 @@ async fn test_duplicate_connect_causes_disconnect() {
 
     // 1st CONNECT -> OK
     send_packet(&mut stream, conn_pkt.clone()).await;
-    assert!(matches!(read_packet(&mut stream).await, MqttPacket::ConnAck { .. }));
+    assert!(matches!(
+        read_packet(&mut stream).await,
+        MqttPacket::ConnAck { .. }
+    ));
 
     // 2nd CONNECT on same socket -> protocol violation, server closes stream!
     send_packet(&mut stream, conn_pkt).await;
 
     let mut buf = [0u8; 128];
     let n = stream.read(&mut buf).await.unwrap();
-    assert_eq!(n, 0, "Server must close connection upon receiving second CONNECT");
+    assert_eq!(
+        n, 0,
+        "Server must close connection upon receiving second CONNECT"
+    );
 }

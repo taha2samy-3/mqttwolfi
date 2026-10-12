@@ -164,7 +164,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     } else {
         if listeners_active == 0 {
-            return Err("No network listeners (TCP or TLS) were successfully initialized. Exiting.".into());
+            return Err(
+                "No network listeners (TCP or TLS) were successfully initialized. Exiting.".into(),
+            );
         }
         // Wait indefinitely if only TLS was spawned
         tokio::signal::ctrl_c().await?;

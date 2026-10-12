@@ -326,11 +326,10 @@ impl AclEngine {
 
                     let user_clone = Arc::clone(&user);
                     let pass_vec = pass_bytes.to_vec();
-                    let verified = tokio::task::spawn_blocking(move || {
-                        user_clone.verify_password(&pass_vec)
-                    })
-                    .await
-                    .unwrap_or(false);
+                    let verified =
+                        tokio::task::spawn_blocking(move || user_clone.verify_password(&pass_vec))
+                            .await
+                            .unwrap_or(false);
 
                     if !verified {
                         warn!("Authentication failed for user '{}': invalid password", u);
@@ -525,7 +524,10 @@ impl AclEngine {
                         "readwrite" => Permission::ReadWrite,
                         "deny" => Permission::Deny,
                         unknown => {
-                            warn!("Unknown permission '{}' in ACL file; ignoring invalid rule", unknown);
+                            warn!(
+                                "Unknown permission '{}' in ACL file; ignoring invalid rule",
+                                unknown
+                            );
                             continue;
                         }
                     };

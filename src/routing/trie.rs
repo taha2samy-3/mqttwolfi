@@ -279,10 +279,19 @@ mod tests {
 
         // Topic starting with $ must NOT match root '#' or root '+' (MQTT-4.7.2-1)
         let matches = trie.matches("$SYS/broker/uptime");
-        assert!(!matches.contains("root_multi"), "Root # must not match $SYS");
-        assert!(!matches.contains("root_single"), "Root + must not match $SYS");
+        assert!(
+            !matches.contains("root_multi"),
+            "Root # must not match $SYS"
+        );
+        assert!(
+            !matches.contains("root_single"),
+            "Root + must not match $SYS"
+        );
         assert!(matches.contains("sys_multi"), "Explicit $SYS/# must match");
-        assert!(matches.contains("sys_exact"), "Explicit $SYS/broker/uptime must match");
+        assert!(
+            matches.contains("sys_exact"),
+            "Explicit $SYS/broker/uptime must match"
+        );
 
         // Normal topics must match root '#' and root '+'
         let normal_matches = trie.matches("app/broker/uptime");
@@ -305,7 +314,9 @@ mod tests {
         trie.unsubscribe("a/#", &"sub3");
 
         // After unsubscribing all, all empty nodes must be pruned
-        assert!(trie.is_empty(), "Trie should be completely pruned and empty");
+        assert!(
+            trie.is_empty(),
+            "Trie should be completely pruned and empty"
+        );
     }
 }
-

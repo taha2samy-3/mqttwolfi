@@ -679,7 +679,8 @@ impl MqttPacket {
                         return Err(PacketError::MalformedHeader);
                     }
                     let props_len = decode_variable_byte_integer(&mut payload)
-                        .map_err(|_| PacketError::MalformedHeader)? as usize;
+                        .map_err(|_| PacketError::MalformedHeader)?
+                        as usize;
                     if payload.remaining() < props_len {
                         return Err(PacketError::MalformedHeader);
                     }
@@ -705,7 +706,8 @@ impl MqttPacket {
                             return Err(PacketError::MalformedHeader);
                         }
                         let will_props_len = decode_variable_byte_integer(&mut payload)
-                            .map_err(|_| PacketError::MalformedHeader)? as usize;
+                            .map_err(|_| PacketError::MalformedHeader)?
+                            as usize;
                         if payload.remaining() < will_props_len {
                             return Err(PacketError::MalformedHeader);
                         }
@@ -987,7 +989,8 @@ mod tests {
         // Even with declared remaining_len but truncated internal fields (e.g., proto "MQTT" but no version/flags)
         let truncated_fields = [
             0x10, 0x06, // Connect, remaining len = 6
-            0x00, 0x04, b'M', b'Q', b'T', b'T', // Proto name only, missing 4 bytes of flags/version/keepalive!
+            0x00, 0x04, b'M', b'Q', b'T',
+            b'T', // Proto name only, missing 4 bytes of flags/version/keepalive!
         ];
         let mut slice2 = &truncated_fields[..];
         let res2 = MqttPacket::decode(&mut slice2);
@@ -999,17 +1002,26 @@ mod tests {
         // SUBSCRIBE with remaining_len < 3
         let bad_sub1 = [0x82, 0x01, 0x00];
         let mut s1 = &bad_sub1[..];
-        assert_eq!(MqttPacket::decode(&mut s1), Err(PacketError::MalformedHeader));
+        assert_eq!(
+            MqttPacket::decode(&mut s1),
+            Err(PacketError::MalformedHeader)
+        );
 
         // SUBSCRIBE with invalid flags (not 0x02)
         let bad_flags = [0x80, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'];
         let mut s2 = &bad_flags[..];
-        assert_eq!(MqttPacket::decode(&mut s2), Err(PacketError::MalformedHeader));
+        assert_eq!(
+            MqttPacket::decode(&mut s2),
+            Err(PacketError::MalformedHeader)
+        );
 
         // SUBSCRIBE with packet_id = 0
         let zero_id = [0x82, 0x06, 0x00, 0x00, 0x00, 0x01, b'a', 0x00];
         let mut s3 = &zero_id[..];
-        assert_eq!(MqttPacket::decode(&mut s3), Err(PacketError::MalformedHeader));
+        assert_eq!(
+            MqttPacket::decode(&mut s3),
+            Err(PacketError::MalformedHeader)
+        );
     }
 
     #[test]
@@ -1020,7 +1032,10 @@ mod tests {
             0x00, 0x03, b'a', b'/', b'+', // Topic "a/+"
         ];
         let mut s1 = &wildcard_pub[..];
-        assert_eq!(MqttPacket::decode(&mut s1), Err(PacketError::MalformedHeader));
+        assert_eq!(
+            MqttPacket::decode(&mut s1),
+            Err(PacketError::MalformedHeader)
+        );
 
         // PUBLISH with remaining_len < header_len (saturating_sub vulnerability test)
         let truncated_header = [
@@ -1028,7 +1043,10 @@ mod tests {
             0x00, 0x05, b't', b'e', // Topic len declares 5 bytes, but buffer ended
         ];
         let mut s2 = &truncated_header[..];
-        assert_eq!(MqttPacket::decode(&mut s2), Err(PacketError::MalformedHeader));
+        assert_eq!(
+            MqttPacket::decode(&mut s2),
+            Err(PacketError::MalformedHeader)
+        );
     }
 
     #[test]
@@ -1054,4 +1072,3 @@ mod tests {
         assert_eq!(decoded_ack, unsuback);
     }
 }
-

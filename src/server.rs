@@ -41,7 +41,8 @@ impl BrokerContext {
         let context = self.clone();
         let start_time = std::time::Instant::now();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_sec.max(1)));
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(interval_sec.max(1)));
             loop {
                 interval.tick().await;
                 let uptime = start_time.elapsed().as_secs();
@@ -51,8 +52,14 @@ impl BrokerContext {
                 let sys_metrics: [(&str, Bytes); 4] = [
                     ("$SYS/broker/version", Bytes::from_static(b"0.1.0")),
                     ("$SYS/broker/uptime", Bytes::from(uptime.to_string())),
-                    ("$SYS/broker/clients/connected", Bytes::from(clients_count.to_string())),
-                    ("$SYS/broker/messages/retained", Bytes::from(retained_count.to_string())),
+                    (
+                        "$SYS/broker/clients/connected",
+                        Bytes::from(clients_count.to_string()),
+                    ),
+                    (
+                        "$SYS/broker/messages/retained",
+                        Bytes::from(retained_count.to_string()),
+                    ),
                 ];
 
                 for (topic, payload) in sys_metrics {
@@ -439,12 +446,10 @@ impl BrokerServer {
                                 // Deliver matching retained messages (with retain=true and assigned packet_id)
                                 for mut ret_pkt in matched_retained {
                                     ret_pkt.retain = true;
-                                    if ret_pkt.qos != QoS::AtMostOnce
-                                        && ret_pkt.packet_id.is_none()
+                                    if ret_pkt.qos != QoS::AtMostOnce && ret_pkt.packet_id.is_none()
                                     {
-                                        ret_pkt.packet_id = Some(
-                                            next_outbound_pid.fetch_add(1, Ordering::Relaxed),
-                                        );
+                                        ret_pkt.packet_id =
+                                            Some(next_outbound_pid.fetch_add(1, Ordering::Relaxed));
                                     }
                                     let mut ret_buf = BytesMut::new();
                                     let ret_packet = MqttPacket::Publish(ret_pkt);
@@ -455,10 +460,7 @@ impl BrokerServer {
                             }
                             MqttPacket::Unsubscribe { packet_id, topics } => {
                                 if !is_connected {
-                                    warn!(
-                                        "Client #{} sent UNSUBSCRIBE before CONNECT",
-                                        client_id
-                                    );
+                                    warn!("Client #{} sent UNSUBSCRIBE before CONNECT", client_id);
                                     break 'connection;
                                 }
 
