@@ -84,6 +84,8 @@ impl ClientSession {
         use_tls: bool,
         client_id: &str,
         version: ProtocolVersion,
+        username: Option<&str>,
+        password: Option<&[u8]>,
         will: Option<PublishPacket>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let stream = if use_tls {
@@ -111,8 +113,8 @@ impl ClientSession {
                 clean_start: true,
                 keep_alive_sec: 60,
                 will,
-                username: None,
-                password: None,
+                username: username.map(|u| u.to_string()),
+                password: password.map(|p| p.to_vec()),
             }))
             .await?;
 
@@ -122,9 +124,16 @@ impl ClientSession {
                 session_present,
                 reason_code,
             } => {
+                if reason_code != 0 {
+                    return Err(format!(
+                        "Broker rejected connection for client '{}' with reason code {}",
+                        client_id, reason_code
+                    )
+                    .into());
+                }
                 println!(
-                    "    \x1b[32m✔\x1b[0m [CONNACK] Client '{}' authenticated (session_present: {}, code: {})",
-                    client_id, session_present, reason_code
+                    "    \x1b[32m✔\x1b[0m [CONNACK] Client '{}' authenticated (session_present: {}, code: 0)",
+                    client_id, session_present
                 );
             }
             other => {
@@ -299,6 +308,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut port: u16 = 1883;
     let mut use_tls = false;
     let mut step_delay = 500u64;
+    let mut username: Option<String> = Some("superadmin".to_string());
+    let mut password: Option<Vec<u8>> = Some(b"admin_secret_pass".to_vec());
 
     let mut i = 1;
     while i < args.len() {
@@ -321,6 +332,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 step_delay = args[i + 1].parse().unwrap_or(500);
                 i += 1;
             }
+            "--username" | "-u" if i + 1 < args.len() => {
+                username = Some(args[i + 1].clone());
+                i += 1;
+            }
+            "--password" | "-p" if i + 1 < args.len() => {
+                password = Some(args[i + 1].as_bytes().to_vec());
+                i += 1;
+            }
+            "--anonymous" => {
+                username = None;
+                password = None;
+            }
             "--help" | "-h" => {
                 println!("Usage: cargo run --bin wolf-simulate -- [OPTIONS]");
                 println!();
@@ -331,6 +354,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 );
                 println!("  --tls             Connect via TLS 1.3 encrypted socket");
                 println!("  --delay <MS>      Delay in milliseconds between simulated steps (default: 500)");
+                println!("  --username, -u    Authentication username (default: superadmin)");
+                println!("  --password, -p    Authentication password (default: admin_secret_pass)");
+                println!("  --anonymous       Connect anonymously without credentials");
                 println!("  --help, -h        Display this help message");
                 return Ok(());
             }
@@ -349,9 +375,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "Plain TCP"
         }
     );
-    println!("  Step Interval : {} ms\n", step_delay);
+    println!("  Step Interval : {} ms", step_delay);
+    println!(
+        "  Credentials   : {}\n",
+        if let Some(ref u) = username {
+            format!("User '{}'", u)
+        } else {
+            "Anonymous".to_string()
+        }
+    );
 
     let delay = Duration::from_millis(step_delay);
+    let u_ref = username.as_deref();
+    let p_ref = password.as_deref();
 
     // -------------------------------------------------------------------------
     // Phase 1: Connect Subscriber Client
@@ -363,6 +399,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use_tls,
         "wolf-subscriber-node",
         ProtocolVersion::V500,
+        u_ref,
+        p_ref,
         None,
     )
     .await?;
@@ -432,6 +470,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use_tls,
         "wolf-publisher-node",
         ProtocolVersion::V500,
+        u_ref,
+        p_ref,
         None,
     )
     .await?;
@@ -500,6 +540,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use_tls,
         "wolf-late-joiner-node",
         ProtocolVersion::V500,
+        u_ref,
+        p_ref,
         None,
     )
     .await?;
@@ -546,6 +588,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use_tls,
         "wolf-crasher-device",
         ProtocolVersion::V500,
+        u_ref,
+        p_ref,
         Some(will_packet),
     )
     .await?;
