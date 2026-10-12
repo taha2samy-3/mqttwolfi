@@ -15,6 +15,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 bitflags = "2.6"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
+tokio-rustls = "0.26"
+rustls-pemfile = "2.2"
+rustls-pki-types = "1.10"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -22,6 +25,10 @@ tokio-test = "0.4"
 [[bin]]
 name = "wolf-broker"
 path = "src/main.rs"
+
+[[bin]]
+name = "wolf-bench-tls"
+path = "benches/bench_tls_comparison.rs"
 
 [[bench]]
 name = "wolf-bench"

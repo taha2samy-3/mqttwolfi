@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -59,7 +59,7 @@ impl BrokerServer {
 
             tokio::spawn(async move {
                 debug!("Client #{} connected from {}", client_id, peer_addr);
-                if let Err(e) = Self::handle_client(
+                if let Err(e) = Self::handle_stream(
                     stream,
                     client_id,
                     router_clone,
@@ -76,14 +76,62 @@ impl BrokerServer {
         }
     }
 
-    async fn handle_client(
-        stream: TcpStream,
+    /// Runs the server event loop with TLS encryption enabled.
+    pub async fn run_tls(self, acceptor: tokio_rustls::TlsAcceptor) -> Result<(), std::io::Error> {
+        let router = self.router;
+        let clients = self.clients;
+        let retained = self.retained;
+        info!(
+            "WolfiMQ TLS server running on {}",
+            self.listener.local_addr()?
+        );
+
+        loop {
+            let (tcp_stream, peer_addr) = self.listener.accept().await?;
+            let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+            let router_clone = Arc::clone(&router);
+            let clients_clone = Arc::clone(&clients);
+            let retained_clone = Arc::clone(&retained);
+            let acceptor_clone = acceptor.clone();
+
+            tokio::spawn(async move {
+                debug!("TLS Client #{} connecting from {}", client_id, peer_addr);
+                match acceptor_clone.accept(tcp_stream).await {
+                    Ok(tls_stream) => {
+                        debug!("TLS handshake completed successfully for client #{}", client_id);
+                        if let Err(e) = Self::handle_stream(
+                            tls_stream,
+                            client_id,
+                            router_clone,
+                            clients_clone,
+                            retained_clone,
+                        )
+                        .await
+                        {
+                            warn!("TLS Client #{} disconnected with error: {}", client_id, e);
+                        } else {
+                            debug!("TLS Client #{} disconnected cleanly", client_id);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("TLS handshake failed for peer {}: {}", peer_addr, e);
+                    }
+                }
+            });
+        }
+    }
+
+    async fn handle_stream<S>(
+        stream: S,
         client_id: u64,
         router: Arc<RwLock<TopicTrie<u64>>>,
         clients: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Bytes>>>>,
         retained: Arc<RwLock<RetainedStore>>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let (mut read_half, mut write_half) = stream.into_split();
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        let (mut read_half, mut write_half) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
 
         // Register client sender in the active clients map

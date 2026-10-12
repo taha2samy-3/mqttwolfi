@@ -48,14 +48,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if config.listeners.tcp.enabled {
-        info!(
-            "Plain TCP Listener active on {}:{}",
-            config.listeners.tcp.bind_address, config.listeners.tcp.port
+    if config.listeners.tls.enabled {
+        let tls_addr = format!(
+            "{}:{}",
+            config.listeners.tls.bind_address, config.listeners.tls.port
         );
+        let ca_path = if config.security.tls.require_client_cert {
+            Some(config.security.tls.ca_cert_file.as_str())
+        } else {
+            None
+        };
+
+        match wolf_mqtt::tls::create_tls_acceptor(
+            &config.security.tls.server_cert_file,
+            &config.security.tls.server_key_file,
+            ca_path,
+        ) {
+            Ok(acceptor) => match wolf_mqtt::server::BrokerServer::bind(&tls_addr).await {
+                Ok(tls_server) => {
+                    info!("WolfiMQ TLS listener active on {}", tls_addr);
+                    tokio::spawn(async move {
+                        let _ = tls_server.run_tls(acceptor).await;
+                    });
+                }
+                Err(e) => error!("Failed to bind TLS listener on {}: {}", tls_addr, e),
+            },
+            Err(e) => error!("Failed to initialize TLS acceptor: {}", e),
+        }
     }
 
-    info!("Initialization complete. Ready for secure connections.");
+    if config.listeners.tcp.enabled {
+        let tcp_addr = format!(
+            "{}:{}",
+            config.listeners.tcp.bind_address, config.listeners.tcp.port
+        );
+        match wolf_mqtt::server::BrokerServer::bind(&tcp_addr).await {
+            Ok(tcp_server) => {
+                info!("WolfiMQ TCP listener active on {}", tcp_addr);
+                tcp_server.run().await?;
+            }
+            Err(e) => error!("Failed to bind TCP listener on {}: {}", tcp_addr, e),
+        }
+    } else {
+        // Wait indefinitely if only TLS was spawned
+        tokio::signal::ctrl_c().await?;
+        info!("Shutdown signal received. Exiting.");
+    }
 
     Ok(())
 }
