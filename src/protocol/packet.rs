@@ -789,7 +789,6 @@ impl MqttPacket {
             _ => Err(PacketError::InvalidPacketType(packet_type_val)),
         }
     }
-    }
 }
 
 #[cfg(test)]
