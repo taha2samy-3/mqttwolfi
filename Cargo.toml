@@ -1,0 +1,26 @@
+[package]
+name = "wolf-mqtt-broker"
+version = "0.1.0"
+edition = "2021"
+authors = ["WolfMQTT Team"]
+description = "High-performance, secure MQTT v3.1.1 & v5.0 broker written in Rust with wolfSSL integration"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+bytes = "1.7"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bitflags = "2.6"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "wolf-broker"
+path = "src/main.rs"
+
+[lib]
+name = "wolf_mqtt"
+path = "src/lib.rs"

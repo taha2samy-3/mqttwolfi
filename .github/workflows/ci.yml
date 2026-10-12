@@ -1,0 +1,76 @@
+name: Continuous Integration (CI)
+
+on:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+    branches: [ "main", "master", "develop" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint-and-format:
+    name: Code Formatting & Clippy Lints
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Task Runner
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: Check Code Formatting
+        run: task fmt
+
+      - name: Run Clippy Linter
+        run: task lint
+
+  unit-and-integration-tests:
+    name: Unit & Integration Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Task Runner
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: Generate Testing Certificates (mTLS)
+        run: task certs:gen
+
+      - name: Run Unit Tests (Packet Parser & Variables)
+        run: task test:unit
+
+      - name: Run Integration Tests (Session & Topic Routing)
+        run: task test:integration
+
+  security-audit:
+    name: Security & Vulnerability Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Cargo Audit
+        uses: rustsec/audit-check@v2.0.0
+        continue-on-error: true

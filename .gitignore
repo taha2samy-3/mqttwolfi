@@ -1,0 +1,16 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+
+# Certificates and keys
+certs/*.pem
+
+# mise local state
+.mise.local.toml
+
+# Dependencies and external sources
+external/
+
+# IDE files
+.vscode/
+.idea/

@@ -1,0 +1,79 @@
+version: '3'
+
+env:
+  RUST_LOG: "info"
+
+tasks:
+  default:
+    desc: "List all available tasks"
+    cmds:
+      - task --list
+
+  check:
+    desc: "Quick type-check without full build"
+    cmds:
+      - cargo check --all-targets
+
+  lint:
+    desc: "Run Clippy linter with strict warnings"
+    cmds:
+      - cargo clippy --all-targets --all-features -- -D warnings
+
+  fmt:
+    desc: "Verify source code formatting (rustfmt)"
+    cmds:
+      - cargo fmt -- --check
+
+  fmt:fix:
+    desc: "Auto-format Rust source files"
+    cmds:
+      - cargo fmt
+
+  certs:gen:
+    desc: "Generate local test PKI/mTLS certificates (Root CA, Server, Client)"
+    cmds:
+      - bash scripts/generate_certs.sh
+
+  test:
+    desc: "Run all primary tests (Unit + Integration)"
+    deps: [test:unit, test:integration]
+
+  test:unit:
+    desc: "Run unit tests for MQTT packet parsers and protocol logic"
+    cmds:
+      - cargo test --lib -- --nocapture
+
+  test:integration:
+    desc: "Run end-to-end integration tests (Client life cycle, Pub/Sub, QoS)"
+    cmds:
+      - cargo test --test '*' -- --nocapture
+
+  test:all:
+    desc: "Run all test suites including unit and integration tests"
+    cmds:
+      - task test:unit
+      - task test:integration
+
+  test:miri:
+    desc: "Run Miri test suite to detect undefined behavior and FFI pointer safety"
+    cmds:
+      - cargo miri test --lib
+
+  build:
+    desc: "Compile binary in debug mode"
+    cmds:
+      - cargo build
+
+  build:release:
+    desc: "Compile binary in optimized release mode"
+    cmds:
+      - cargo build --release
+
+  ci:
+    desc: "Run full local CI pipeline (Format + Check + Lint + All Tests)"
+    cmds:
+      - task fmt
+      - task check
+      - task lint
+      - task test
+    silent: false

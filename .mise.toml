@@ -1,0 +1,5 @@
+[env]
+_.path = ["{{env.HOME}}/.cargo/bin"]
+
+[tools]
+task = "latest"
