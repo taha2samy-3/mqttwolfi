@@ -540,6 +540,15 @@ impl MqttPacket {
                 }
                 let ack_flags = payload.get_u8();
                 let reason_code = payload.get_u8();
+                if payload.has_remaining() {
+                    let props_len = decode_variable_byte_integer(&mut payload)
+                        .map_err(|_| PacketError::MalformedHeader)?
+                        as usize;
+                    if payload.remaining() < props_len {
+                        return Err(PacketError::MalformedHeader);
+                    }
+                    payload.advance(props_len);
+                }
                 Ok(MqttPacket::ConnAck {
                     session_present: (ack_flags & 0x01) != 0,
                     reason_code,
@@ -550,6 +559,18 @@ impl MqttPacket {
                     return Err(PacketError::MalformedHeader);
                 }
                 let packet_id = payload.get_u16();
+                if payload.has_remaining() {
+                    let _reason_code = payload.get_u8();
+                    if payload.has_remaining() {
+                        let props_len = decode_variable_byte_integer(&mut payload)
+                            .map_err(|_| PacketError::MalformedHeader)?
+                            as usize;
+                        if payload.remaining() < props_len {
+                            return Err(PacketError::MalformedHeader);
+                        }
+                        payload.advance(props_len);
+                    }
+                }
                 Ok(MqttPacket::PubAck { packet_id })
             }
             PacketType::PubRec => {
