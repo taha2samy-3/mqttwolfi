@@ -54,6 +54,7 @@ async fn test_e2e_real_tcp_pub_sub_exchange() {
             client_id: "e2e_sub_client".into(),
             clean_start: true,
             keep_alive_sec: 60,
+            will: None,
         }),
     )
     .await;
@@ -102,6 +103,7 @@ async fn test_e2e_real_tcp_pub_sub_exchange() {
             client_id: "e2e_pub_client".into(),
             clean_start: true,
             keep_alive_sec: 60,
+            will: None,
         }),
     )
     .await;
@@ -162,6 +164,7 @@ async fn test_e2e_ping_pong_and_clean_disconnect() {
             client_id: "ping_client".into(),
             clean_start: true,
             keep_alive_sec: 10,
+            will: None,
         }),
     )
     .await;
@@ -198,6 +201,7 @@ async fn test_e2e_qos1_publish_and_puback() {
             client_id: "qos1_pub_client".into(),
             clean_start: true,
             keep_alive_sec: 60,
+            will: None,
         }),
     )
     .await;

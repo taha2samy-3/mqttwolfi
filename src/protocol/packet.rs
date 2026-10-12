@@ -520,6 +520,7 @@ mod tests {
             client_id: "edge-device-42".into(),
             clean_start: true,
             keep_alive_sec: 60,
+            will: None,
         };
         let pkt = MqttPacket::Connect(conn_pkt);
 

@@ -1,6 +1,5 @@
-use crate::protocol::{PublishPacket, QoS};
+use crate::protocol::PublishPacket;
 use crate::routing::TopicTrie;
-use bytes::Bytes;
 use std::collections::HashMap;
 
 #[derive(Default, Debug, Clone)]
@@ -62,6 +61,8 @@ impl RetainedStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::QoS;
+    use bytes::Bytes;
 
     #[test]
     fn test_retained_store_and_match() {
