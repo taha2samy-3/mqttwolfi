@@ -17,6 +17,11 @@ MOSQUITTO_CONF="${MOSQUITTO_CONF_DIR}/mosquitto_tls.conf"
 MOSQUITTO_PID=""
 
 cleanup() {
+    EXIT_CODE=$?
+    if [ "${EXIT_CODE}" -ne 0 ] && [ -f "${MOSQUITTO_CONF_DIR}/mosquitto.log" ]; then
+        echo "==> Mosquitto log output on failure:"
+        cat "${MOSQUITTO_CONF_DIR}/mosquitto.log"
+    fi
     if [ -n "${MOSQUITTO_PID}" ]; then
         echo "==> Stopping Mosquitto background process (PID ${MOSQUITTO_PID})..."
         kill -9 "${MOSQUITTO_PID}" 2>/dev/null || true
@@ -41,6 +46,9 @@ certfile $(pwd)/certs/server-cert.pem
 keyfile $(pwd)/certs/server-key.pem
 require_certificate false
 allow_anonymous true
+log_type all
+log_dest file ${MOSQUITTO_CONF_DIR}/mosquitto.log
+max_queued_messages 0
 EOF
 
     echo "==> Starting Mosquitto with TLS on 127.0.0.1:${MOSQUITTO_PORT}..."

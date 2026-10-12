@@ -223,7 +223,7 @@ async fn run_tls_client_workload(
             send_packet(
                 &mut tls,
                 MqttPacket::Connect(ConnectPacket {
-                    version: ProtocolVersion::V500,
+                    version: ProtocolVersion::V311,
                     client_id,
                     clean_start: true,
                     keep_alive_sec: 60,
@@ -232,8 +232,8 @@ async fn run_tls_client_workload(
                     password: None,
                 }),
             )
-            .await;
-            let _ = read_next_packet(&mut tls, &mut buf).await;
+            .await?;
+            let _ = read_next_packet(&mut tls, &mut buf).await?;
 
             let topic = format!("bench/tls/w{}_{}", worker_id, std::process::id());
             send_packet(
@@ -243,8 +243,8 @@ async fn run_tls_client_workload(
                     topics: vec![(topic.clone(), QoS::AtMostOnce)],
                 },
             )
-            .await;
-            let _ = read_next_packet(&mut tls, &mut buf).await;
+            .await?;
+            let _ = read_next_packet(&mut tls, &mut buf).await?;
 
             Ok::<(TlsStream<TcpStream>, BytesMut, String), Box<dyn std::error::Error + Send + Sync>>(
                 (tls, buf, topic),
@@ -288,7 +288,7 @@ async fn run_tls_client_workload(
                 let mut lats = Vec::with_capacity(msgs_per_worker);
 
                 for _ in 0..msgs_per_worker {
-                    let pkt = read_next_packet(&mut read_half, &mut in_buf).await;
+                    let pkt = read_next_packet(&mut read_half, &mut in_buf).await?;
                     if let MqttPacket::Publish(pub_pkt) = pkt {
                         if pub_pkt.payload.len() >= 8 {
                             let sent_nanos =
@@ -301,7 +301,7 @@ async fn run_tls_client_workload(
                         }
                     }
                 }
-                lats
+                Ok::<Vec<f64>, Box<dyn std::error::Error + Send + Sync>>(lats)
             });
 
             // Publisher loop with nanosecond monotonic timestamp injection
@@ -320,21 +320,21 @@ async fn run_tls_client_workload(
                 });
 
                 let mut enc_buf = BytesMut::new();
-                pub_pkt.encode(&mut enc_buf).expect("Encode error");
-                write_half.write_all(&enc_buf).await.expect("Write error");
+                pub_pkt.encode(&mut enc_buf)?;
+                write_half.write_all(&enc_buf).await?;
             }
-            write_half.flush().await.expect("Flush error");
+            write_half.flush().await?;
 
-            let received_lats = recv_task.await.expect("Receiver panicked");
+            let received_lats = recv_task.await??;
             latencies.extend(received_lats);
-            latencies
+            Ok::<Vec<f64>, Box<dyn std::error::Error + Send + Sync>>(latencies)
         });
         worker_tasks.push(task);
     }
 
     let mut all_latencies = Vec::with_capacity(actual_total);
     for task in worker_tasks {
-        let lats = task.await?;
+        let lats = task.await??;
         all_latencies.extend(lats);
     }
     let total_dur = run_start.elapsed();
@@ -382,28 +382,34 @@ fn get_percentile(sorted: &[f64], pct: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-async fn send_packet<W: AsyncWriteExt + Unpin>(stream: &mut W, packet: MqttPacket) {
+async fn send_packet<W: AsyncWriteExt + Unpin>(
+    stream: &mut W,
+    packet: MqttPacket,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = BytesMut::new();
-    packet.encode(&mut buf).expect("Encode error");
-    stream.write_all(&buf).await.expect("Write error");
-    stream.flush().await.expect("Flush error");
+    packet.encode(&mut buf)?;
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 async fn read_next_packet<R: AsyncReadExt + Unpin>(
     stream: &mut R,
     buf: &mut BytesMut,
-) -> MqttPacket {
+) -> Result<MqttPacket, Box<dyn std::error::Error + Send + Sync>> {
     loop {
         if !buf.is_empty() {
             let mut slice = &buf[..];
             if let Ok(pkt) = MqttPacket::decode(&mut slice) {
                 let consumed = buf.len() - slice.len();
                 buf.advance(consumed);
-                return pkt;
+                return Ok(pkt);
             }
         }
-        let n = stream.read_buf(buf).await.expect("Socket read error");
-        assert!(n > 0, "Unexpected socket EOF");
+        let n = stream.read_buf(buf).await?;
+        if n == 0 {
+            return Err("Unexpected socket EOF while awaiting MQTT packet".into());
+        }
     }
 }
 
