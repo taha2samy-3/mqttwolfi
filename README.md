@@ -151,9 +151,22 @@ task bench:tls:compare
 # Generate mTLS test PKI certificates
 task certs:gen
 
-# Build optimized release binary
+# Build optimized release binary (standard wolfSSL TLS 1.3)
 task build:release
+
+# Build optimized release binary with wolfSSL FIPS 140-2/3 Module
+task build:release:fips
+
+# Package complete release distribution archive locally
+task package:release
 ```
+
+### 📦 Multi-Architecture Releases (AMD64 & ARM64)
+
+WolfiMQ provides automated multi-platform continuous release packaging via [`.github/workflows/release.yml`](.github/workflows/release.yml):
+- **Linux AMD64 (`x86_64`)**: Standard wolfSSL TLS 1.3 & wolfSSL FIPS 140-2/3 Validated Cryptography
+- **Linux ARM64 (`aarch64`)**: Standard wolfSSL TLS 1.3 & wolfSSL FIPS 140-2/3 Validated Cryptography
+- Every release includes verified `SHA256SUMS.txt`, standard configurations, scripts, and full documentation.
 
 ---
 

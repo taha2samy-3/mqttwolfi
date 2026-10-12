@@ -25,7 +25,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             "-v" | "--version" => {
-                println!("wolf-mqtt-broker v0.1.0 (TLS 1.3 / mTLS / wolfSSL)");
+                #[cfg(feature = "wolfssl-fips")]
+                println!("wolf-mqtt-broker v0.1.0 (wolfSSL FIPS 140-2/3 Validated Cryptographic Module - TLS 1.3 / mTLS)");
+                #[cfg(not(feature = "wolfssl-fips"))]
+                println!("wolf-mqtt-broker v0.1.0 (wolfSSL TLS 1.3 / mTLS)");
                 return Ok(());
             }
             _ => {}
@@ -53,6 +56,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info!("Starting wolf-mqtt-broker v0.1.0...");
+    #[cfg(feature = "wolfssl-fips")]
+    info!("Cryptographic Engine: wolfSSL FIPS 140-2/3 Validated Cryptographic Module");
+    #[cfg(not(feature = "wolfssl-fips"))]
+    info!("Cryptographic Engine: wolfSSL TLS 1.3 Standard Module");
     debug!("Log level initialized to: '{}'", config.logging.level);
     trace!("Verbose trace diagnostics enabled.");
 

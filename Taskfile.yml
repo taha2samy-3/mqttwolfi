@@ -91,9 +91,31 @@ tasks:
       - cargo build
 
   build:release:
-    desc: "Compile binary in optimized release mode"
+    desc: "Compile binary in optimized release mode (standard wolfSSL TLS 1.3)"
     cmds:
-      - cargo build --release
+      - cargo build --release --features wolfssl
+
+  build:release:fips:
+    desc: "Compile binary in optimized release mode with wolfSSL FIPS 140-2/3 Cryptographic Module"
+    cmds:
+      - cargo build --release --no-default-features --features wolfssl-fips
+
+  package:release:
+    desc: "Create release distribution tarball with binaries, configs, scripts, and docs"
+    cmds:
+      - task: build:release
+      - |
+        PKG="wolfimq-v0.1.0-linux-amd64-wolfssl"
+        mkdir -p "${PKG}/bin" "${PKG}/config" "${PKG}/scripts" "${PKG}/docs"
+        cp target/release/wolf-broker target/release/wolf-bench-tls "${PKG}/bin/"
+        cp config/broker.toml config/acl.conf "${PKG}/config/"
+        cp scripts/generate_certs.sh "${PKG}/scripts/"
+        cp README.md LICENSE "${PKG}/"
+        cp docs/CONFIGURATION_AND_CONTROL.md "${PKG}/docs/"
+        tar -czvf "${PKG}.tar.gz" "${PKG}"
+        sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+        rm -rf "${PKG}"
+        echo "Package created: ${PKG}.tar.gz"
 
   ci:
     desc: "Run full local CI pipeline (Format + Check + Lint + All Tests + E2E + Bench)"

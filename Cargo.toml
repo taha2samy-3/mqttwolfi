@@ -22,6 +22,11 @@ rustls-pki-types = "1.10"
 [dev-dependencies]
 tokio-test = "0.4"
 
+[features]
+default = ["wolfssl"]
+wolfssl = []
+wolfssl-fips = ["wolfssl"]
+
 [[bin]]
 name = "wolf-broker"
 path = "src/main.rs"

@@ -471,3 +471,41 @@ cargo run --release --bin wolf-bench-tls -- \
 
 > [!NOTE]
 > As concurrency increases from 1 to 16 clients, WolfiMQ scales near-linearly from **75.7K msgs/sec** to **211.8K msgs/sec** over TLS 1.3, demonstrating exceptional multi-threaded event-loop efficiency with zero dropped packets.
+
+---
+
+## 6. Multi-Architecture Release Builds & FIPS Variants
+
+WolfiMQ provides automated continuous delivery via `.github/workflows/release.yml` targeting both 64-bit x86 and ARM platforms, available in standard and FIPS-validated cryptographic flavors:
+
+### Distribution Matrix
+
+| Package Name | Architecture | Platform ABI | Cryptographic Engine | FIPS 140-2/3 |
+| :--- | :--- | :--- | :--- | :---: |
+| `wolfimq-*-linux-amd64-wolfssl.tar.gz` | `x86_64` (AMD64) | GNU / Linux | Native wolfSSL TLS 1.3 | Standard |
+| `wolfimq-*-linux-amd64-wolfssl-fips.tar.gz` | `x86_64` (AMD64) | GNU / Linux | wolfSSL FIPS 140-2/3 Module | Validated |
+| `wolfimq-*-linux-arm64-wolfssl.tar.gz` | `aarch64` (ARM64) | GNU / Linux | Native wolfSSL TLS 1.3 | Standard |
+| `wolfimq-*-linux-arm64-wolfssl-fips.tar.gz` | `aarch64` (ARM64) | GNU / Linux | wolfSSL FIPS 140-2/3 Module | Validated |
+
+### Building Locally
+
+```bash
+# Compile standard release binary (AMD64)
+task build:release
+
+# Compile FIPS 140-2/3 validated release binary
+task build:release:fips
+
+# Package complete release distribution archive locally
+task package:release
+```
+
+### Verifying Binary Cryptography
+
+Run `--version` on any deployed binary:
+```bash
+./bin/wolf-broker --version
+```
+- **Standard variant:** `wolf-mqtt-broker v0.1.0 (wolfSSL TLS 1.3 / mTLS)`
+- **FIPS variant:** `wolf-mqtt-broker v0.1.0 (wolfSSL FIPS 140-2/3 Validated Cryptographic Module - TLS 1.3 / mTLS)`
+
