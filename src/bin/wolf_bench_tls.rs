@@ -42,35 +42,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--count" => {
-                if i + 1 < args.len() {
-                    msg_count = args[i + 1].parse().unwrap_or(10_000);
-                    i += 1;
-                }
+            "--count" if i + 1 < args.len() => {
+                msg_count = args[i + 1].parse().unwrap_or(10_000);
+                i += 1;
             }
-            "--payload-size" => {
-                if i + 1 < args.len() {
-                    payload_size = args[i + 1].parse().unwrap_or(128);
-                    i += 1;
-                }
+            "--payload-size" if i + 1 < args.len() => {
+                payload_size = args[i + 1].parse().unwrap_or(128);
+                i += 1;
             }
-            "--external-port" => {
-                if i + 1 < args.len() {
-                    external_port = args[i + 1].parse().ok();
-                    i += 1;
-                }
+            "--external-port" if i + 1 < args.len() => {
+                external_port = args[i + 1].parse().ok();
+                i += 1;
             }
-            "--external-name" => {
-                if i + 1 < args.len() {
-                    external_name = args[i + 1].clone();
-                    i += 1;
-                }
+            "--external-name" if i + 1 < args.len() => {
+                external_name = args[i + 1].clone();
+                i += 1;
             }
-            "--markdown-output" => {
-                if i + 1 < args.len() {
-                    markdown_path = Some(args[i + 1].clone());
-                    i += 1;
-                }
+            "--markdown-output" if i + 1 < args.len() => {
+                markdown_path = Some(args[i + 1].clone());
+                i += 1;
             }
             _ => {}
         }
