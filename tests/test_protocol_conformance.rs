@@ -63,6 +63,8 @@ fn test_conformance_v3_and_v5_connect_handling() {
         clean_start: true,
         keep_alive_sec: 120,
         will: None,
+        username: None,
+        password: None,
     });
     let mut v3_buf = BytesMut::new();
     v3_conn.encode(&mut v3_buf).unwrap();
@@ -76,6 +78,8 @@ fn test_conformance_v3_and_v5_connect_handling() {
         clean_start: false,
         keep_alive_sec: 30,
         will: None,
+        username: None,
+        password: None,
     });
     let mut v5_buf = BytesMut::new();
     v5_conn.encode(&mut v5_buf).unwrap();

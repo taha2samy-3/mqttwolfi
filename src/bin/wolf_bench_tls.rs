@@ -228,6 +228,8 @@ async fn run_tls_client_workload(
                     clean_start: true,
                     keep_alive_sec: 60,
                     will: None,
+                    username: None,
+                    password: None,
                 }),
             )
             .await;

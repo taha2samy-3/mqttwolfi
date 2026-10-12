@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 use wolf_mqtt::config::AppConfig;
 use wolf_mqtt::logging;
@@ -83,6 +84,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let acl = Arc::new(wolf_mqtt::auth::AclEngine::new(
+        config.security.auth.allow_anonymous,
+    ));
+    if !config.security.auth.acl_file.is_empty() {
+        let acl_path = Path::new(&config.security.auth.acl_file);
+        if acl_path.exists() {
+            info!("Loading ACL rules and credentials from {:?}", acl_path);
+            if let Err(e) = acl.load_from_acl_file(acl_path).await {
+                error!("Failed to parse ACL file {:?}: {}", acl_path, e);
+            } else {
+                info!("ACL rules and credentials loaded successfully.");
+            }
+        } else {
+            warn!("Configured ACL file {:?} does not exist.", acl_path);
+        }
+    }
+
     if config.listeners.tls.enabled {
         let tls_addr = format!(
             "{}:{}",
@@ -101,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(acceptor) => match wolf_mqtt::server::BrokerServer::bind(&tls_addr).await {
                 Ok(tls_server) => {
+                    let tls_server = tls_server.with_acl(Arc::clone(&acl));
                     info!("WolfiMQ TLS listener active on {}", tls_addr);
                     tokio::spawn(async move {
                         let _ = tls_server.run_tls(acceptor).await;
@@ -119,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         match wolf_mqtt::server::BrokerServer::bind(&tcp_addr).await {
             Ok(tcp_server) => {
+                let tcp_server = tcp_server.with_acl(Arc::clone(&acl));
                 info!("WolfiMQ TCP listener active on {}", tcp_addr);
                 tcp_server.run().await?;
             }

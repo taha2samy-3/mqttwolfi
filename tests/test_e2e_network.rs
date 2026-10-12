@@ -55,6 +55,8 @@ async fn test_e2e_real_tcp_pub_sub_exchange() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;
@@ -104,6 +106,8 @@ async fn test_e2e_real_tcp_pub_sub_exchange() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;
@@ -165,6 +169,8 @@ async fn test_e2e_ping_pong_and_clean_disconnect() {
             clean_start: true,
             keep_alive_sec: 10,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;
@@ -202,6 +208,8 @@ async fn test_e2e_qos1_publish_and_puback() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;

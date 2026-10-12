@@ -110,6 +110,41 @@ pub struct ConnectPacket {
     pub clean_start: bool,
     pub keep_alive_sec: u16,
     pub will: Option<PublishPacket>,
+    pub username: Option<String>,
+    pub password: Option<Bytes>,
+}
+
+impl Default for ConnectPacket {
+    fn default() -> Self {
+        Self {
+            version: ProtocolVersion::V500,
+            client_id: String::new(),
+            clean_start: true,
+            keep_alive_sec: 60,
+            will: None,
+            username: None,
+            password: None,
+        }
+    }
+}
+
+impl ConnectPacket {
+    pub fn new(client_id: impl Into<String>) -> Self {
+        Self {
+            client_id: client_id.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_credentials(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<Bytes>,
+    ) -> Self {
+        self.username = Some(username.into());
+        self.password = Some(password.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,6 +267,12 @@ impl MqttPacket {
                         connect_flags |= 0x20; // Will Retain (bit 5)
                     }
                 }
+                if conn.password.is_some() {
+                    connect_flags |= 0x40; // Password Flag (bit 6)
+                }
+                if conn.username.is_some() {
+                    connect_flags |= 0x80; // Username Flag (bit 7)
+                }
                 var_header.put_u8(connect_flags);
                 var_header.put_u16(conn.keep_alive_sec);
 
@@ -245,6 +286,18 @@ impl MqttPacket {
                     var_header.put_slice(will.topic.as_bytes());
                     var_header.put_u16(will.payload.len() as u16);
                     var_header.put_slice(&will.payload);
+                }
+
+                // Payload: Username
+                if let Some(ref username) = conn.username {
+                    var_header.put_u16(username.len() as u16);
+                    var_header.put_slice(username.as_bytes());
+                }
+
+                // Payload: Password
+                if let Some(ref password) = conn.password {
+                    var_header.put_u16(password.len() as u16);
+                    var_header.put_slice(password);
                 }
 
                 dst.put_u8((PacketType::Connect as u8) << 4);
@@ -426,10 +479,12 @@ impl MqttPacket {
                 let version = ProtocolVersion::try_from(version_byte)?;
 
                 let connect_flags = src.get_u8();
-                let clean_start = (connect_flags & 0x02) != 0;
-                let will_flag = (connect_flags & 0x04) != 0;
-                let will_qos_val = (connect_flags >> 3) & 0x03;
+                let username_flag = (connect_flags & 0x80) != 0;
+                let password_flag = (connect_flags & 0x40) != 0;
                 let will_retain = (connect_flags & 0x20) != 0;
+                let will_qos_val = (connect_flags >> 3) & 0x03;
+                let will_flag = (connect_flags & 0x04) != 0;
+                let clean_start = (connect_flags & 0x02) != 0;
                 let keep_alive_sec = src.get_u16();
 
                 if src.remaining() < 2 {
@@ -479,12 +534,42 @@ impl MqttPacket {
                     None
                 };
 
+                let username = if username_flag {
+                    if src.remaining() < 2 {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let u_len = src.get_u16() as usize;
+                    if src.remaining() < u_len {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let mut u_bytes = vec![0u8; u_len];
+                    src.copy_to_slice(&mut u_bytes);
+                    Some(String::from_utf8(u_bytes).map_err(|_| PacketError::InvalidString)?)
+                } else {
+                    None
+                };
+
+                let password = if password_flag {
+                    if src.remaining() < 2 {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let p_len = src.get_u16() as usize;
+                    if src.remaining() < p_len {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    Some(src.copy_to_bytes(p_len))
+                } else {
+                    None
+                };
+
                 Ok(MqttPacket::Connect(ConnectPacket {
                     version,
                     client_id,
                     clean_start,
                     keep_alive_sec,
                     will,
+                    username,
+                    password,
                 }))
             }
             _ => Err(PacketError::InvalidPacketType(packet_type_val)),
@@ -580,6 +665,8 @@ mod tests {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         };
         let pkt = MqttPacket::Connect(conn_pkt);
 
@@ -607,6 +694,8 @@ mod tests {
             clean_start: true,
             keep_alive_sec: 45,
             will: Some(will),
+            username: None,
+            password: None,
         };
         let pkt = MqttPacket::Connect(conn_pkt);
 
@@ -616,6 +705,26 @@ mod tests {
         let mut read_buf = &buf[..];
         let decoded = MqttPacket::decode(&mut read_buf).unwrap();
         assert_eq!(decoded, pkt);
+    }
+
+    #[test]
+    fn test_connect_with_credentials_roundtrip() {
+        let conn_pkt = ConnectPacket::new("client_secure")
+            .with_credentials("admin_user", Bytes::from_static(b"s3cr3t_pass"));
+        let pkt = MqttPacket::Connect(conn_pkt.clone());
+
+        let mut buf = BytesMut::new();
+        pkt.encode(&mut buf).unwrap();
+
+        let mut read_buf = &buf[..];
+        let decoded = MqttPacket::decode(&mut read_buf).unwrap();
+        assert_eq!(decoded, pkt);
+        if let MqttPacket::Connect(c) = decoded {
+            assert_eq!(c.username.as_deref(), Some("admin_user"));
+            assert_eq!(c.password.as_deref(), Some(&b"s3cr3t_pass"[..]));
+        } else {
+            panic!("Expected Connect packet");
+        }
     }
 
     #[test]

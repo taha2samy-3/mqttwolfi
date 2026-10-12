@@ -56,6 +56,8 @@ async fn test_live_tcp_high_concurrency_fanout_1_to_8() {
                     clean_start: true,
                     keep_alive_sec: 60,
                     will: None,
+                    username: None,
+                    password: None,
                 }),
             )
             .await;
@@ -116,6 +118,8 @@ async fn test_live_tcp_high_concurrency_fanout_1_to_8() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;

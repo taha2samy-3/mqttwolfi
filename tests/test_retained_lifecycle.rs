@@ -46,6 +46,8 @@ async fn test_retained_message_delivered_to_late_subscribers() {
                 clean_start: true,
                 keep_alive_sec: 60,
                 will: None,
+                username: None,
+                password: None,
             }),
         )
         .await;
@@ -87,6 +89,8 @@ async fn test_retained_message_delivered_to_late_subscribers() {
                 clean_start: true,
                 keep_alive_sec: 60,
                 will: None,
+                username: None,
+                password: None,
             }),
         )
         .await;
@@ -146,6 +150,8 @@ async fn test_retained_message_erased_on_empty_payload() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;
@@ -194,6 +200,8 @@ async fn test_retained_message_erased_on_empty_payload() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;

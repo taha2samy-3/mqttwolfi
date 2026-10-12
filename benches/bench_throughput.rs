@@ -271,6 +271,8 @@ fn bench_all_packet_codecs_diversity() {
         clean_start: true,
         keep_alive_sec: 60,
         will: Some(will),
+        username: None,
+        password: None,
     });
 
     // 2. Subscribe Packet with 4 Topics
@@ -552,6 +554,8 @@ fn bench_live_tcp_loopback_throughput() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         });
         let mut enc = BytesMut::new();
         conn_pkt.encode(&mut enc).unwrap();
@@ -578,6 +582,8 @@ fn bench_live_tcp_loopback_throughput() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         });
         enc.clear();
         pub_conn.encode(&mut enc).unwrap();

@@ -45,6 +45,8 @@ async fn test_lwt_triggered_on_abrupt_disconnect() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;
@@ -86,6 +88,8 @@ async fn test_lwt_triggered_on_abrupt_disconnect() {
                 clean_start: true,
                 keep_alive_sec: 60,
                 will: Some(will),
+                username: None,
+                password: None,
             }),
         )
         .await;
@@ -129,6 +133,8 @@ async fn test_lwt_cancelled_on_clean_disconnect() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;
@@ -170,6 +176,8 @@ async fn test_lwt_cancelled_on_clean_disconnect() {
                 clean_start: true,
                 keep_alive_sec: 60,
                 will: Some(will),
+                username: None,
+                password: None,
             }),
         )
         .await;

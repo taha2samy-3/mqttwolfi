@@ -80,6 +80,8 @@ async fn test_tls13_mtls_e2e_pub_sub_exchange() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;
@@ -139,6 +141,8 @@ async fn test_tls13_mtls_e2e_pub_sub_exchange() {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+            username: None,
+            password: None,
         }),
     )
     .await;

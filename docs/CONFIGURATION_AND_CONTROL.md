@@ -509,3 +509,145 @@ Run `--version` on any deployed binary:
 - **Standard variant:** `wolf-mqtt-broker v0.1.0 (wolfSSL TLS 1.3 / mTLS)`
 - **FIPS variant:** `wolf-mqtt-broker v0.1.0 (wolfSSL FIPS 140-2/3 Validated Cryptographic Module - TLS 1.3 / mTLS)`
 
+---
+
+## 7. Dynamic Topic Patterns, Virtual Rooms & Credentials RBAC
+
+WolfiMQ includes an enterprise-grade **Credentials & Role-Based Access Control (RBAC) Engine** with native support for **dynamic topic pattern substitution** and **virtual room isolation**.
+
+### Architecture Overview
+
+```
+                      ┌──────────────────────────────────────┐
+                      │         Incoming MQTT Client         │
+                      │  (CONNECT: Username, Password, CID)  │
+                      └──────────────────┬───────────────────┘
+                                         │
+                                         ▼
+                      ┌──────────────────────────────────────┐
+                      │              AclEngine               │
+                      │   - Verifies SHA-256 Credentials     │
+                      │   - Assigns Role & Allowed Rooms     │
+                      └──────────────────┬───────────────────┘
+                                         │
+                 ┌───────────────────────┼───────────────────────┐
+                 │                       │                       │
+                 ▼                       ▼                       ▼
+      ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
+      │   Admin / Super     │ │   Room Moderator    │ │    Room Member      │
+      │   (#, $SYS/#)       │ │ (rooms/%r/# write)  │ │ (chat/presence pub) │
+      │   Full Access       │ │ (admin/control pub) │ │ (announcements sub) │
+      └─────────────────────┘ └─────────────────────┘ └─────────────────────┘
+                 │                       │                       │
+                 ▼                       ▼                       ▼
+      ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
+      │     Room Viewer     │ │     IoT Device      │ │   Custom / Anon     │
+      │ (chat/announc read) │ │ (devices/%c/telem)  │ │   Explicit Rules    │
+      │ (publish = Denied)  │ │ (devices/%c/cmd)    │ │   (Fallback / Deny) │
+      └─────────────────────┘ └─────────────────────┘ └─────────────────────┘
+```
+
+### Pattern Macro Specifications
+
+| Macro | Description | Example Expansion |
+| :--- | :--- | :--- |
+| `%u` | Authenticated client username | `users/%u/private` $\rightarrow$ `users/alice/private` |
+| `%c` | Connecting MQTT Client Identifier (`client_id`) | `devices/%c/telemetry` $\rightarrow$ `devices/sensor_01/telemetry` |
+| `%r` | Virtual Room identifier from user's `allowed_rooms` | `rooms/%r/chat` $\rightarrow$ `rooms/engineering/chat` |
+| `+` | MQTT single-level topic wildcard | `rooms/+/announcements` |
+| `#` | MQTT multi-level topic wildcard (terminal segment) | `rooms/engineering/#` |
+
+> [!TIP]
+> When a user has access to multiple rooms (e.g. `rooms: ["alpha", "beta"]`), the `%r` macro automatically evaluates against all assigned rooms. Users cannot access or eavesdrop on unassigned rooms.
+
+### Role Hierarchy & Default Permission Profiles
+
+1. **`Admin` (`UserRole::Admin`)**:
+   - Universal Read/Write permission across all topics (`#`) and broker telemetry (`$SYS/#`).
+   - Unrestricted access to all rooms (`rooms:*`).
+
+2. **`Moderator` (`UserRole::Moderator`)**:
+   - Full management (`rooms/%r/#`) and administrative command execution (`rooms/%r/admin/control`) over assigned rooms.
+   - Can publish announcements to all room members and manage room topics.
+
+3. **`Member` (`UserRole::Member`)**:
+   - Interactive messaging on `rooms/%r/chat` (Read/Write) and `rooms/%r/presence` (Read/Write).
+   - Read-only subscription to `rooms/%r/announcements`.
+   - Explicitly denied from publishing to announcements or accessing `rooms/%r/admin/#`.
+
+4. **`Viewer` (`UserRole::Viewer`)**:
+   - Read-only observer on `rooms/%r/chat` and `rooms/%r/announcements`.
+   - Publish attempts are rejected/dropped by the broker.
+
+5. **`Device` (`UserRole::Device`)**:
+   - Strictly scoped to hardware telemetry `devices/%c/telemetry` (Write-only) and command receiver `devices/%c/commands` (Read-only).
+   - Universal wildcards and room topics are strictly forbidden.
+
+6. **`Custom(String)` (`UserRole::Custom`)**:
+   - Granular permissions configured directly via `topic [read|write|readwrite|deny]` directives.
+
+### Permission Precedence & Deny Semantics
+
+Rules are evaluated in order of specificity:
+1. **Explicit `Deny` rules take immediate precedence**: If a topic matches a `Deny` rule (e.g., `rooms/%r/admin/#`), access is blocked even if a broader wildcard like `rooms/%r/#` exists.
+2. **User custom rules** override role defaults.
+3. **Fallback default rules** apply to unauthenticated or guest clients if `allow_anonymous = true`.
+4. Any unmatched subscription receives **SubAck return code `0x80` (Failure / Not Authorized)**.
+5. Any unmatched publish is dropped without forwarding.
+
+### Declarative ACL File Configuration (`config/acl.conf`)
+
+```ini
+# Administrator
+user superadmin password:admin_secret_pass role:admin rooms:*
+topic readwrite #
+topic read $SYS/#
+
+# Operations Moderator
+user ops_lead password:moderator_password role:moderator rooms:engineering,operations
+topic readwrite rooms/%r/#
+topic readwrite rooms/%r/admin/control
+
+# Engineering Room Member
+user dev_sarah password:sarah_dev_pass role:member rooms:engineering
+topic readwrite rooms/%r/chat
+topic readwrite rooms/%r/presence
+topic read rooms/%r/announcements
+topic deny rooms/%r/admin/#
+
+# Hardware IoT Device
+user sensor_node password:sensor_token_77 role:device
+topic write devices/%c/telemetry
+topic read devices/%c/commands
+topic deny #
+```
+
+### Programmatic Rust API Example
+
+```rust
+use wolf_mqtt::auth::{AclEngine, UserAccount, UserRole, AclRule, Permission};
+use wolf_mqtt::server::BrokerServer;
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let acl = Arc::new(AclEngine::new(false)); // Disallow anonymous
+
+    // Register an authenticated moderator
+    acl.add_user(UserAccount::new_moderator(
+        "lead_architect",
+        "super_secret_key",
+        vec!["architecture_room".into()],
+    )).await;
+
+    // Attach to broker and start
+    let server = BrokerServer::bind("0.0.0.0:1883")
+        .await?
+        .with_acl(acl);
+
+    server.run().await?;
+    Ok(())
+}
+```
+
+

@@ -162,7 +162,7 @@ impl UserAccount {
                 AclRule::new("rooms/%r/chat", Permission::ReadWrite),
                 AclRule::new("rooms/%r/presence", Permission::ReadWrite),
                 AclRule::new("rooms/%r/announcements", Permission::Read), // Read-only
-                AclRule::new("rooms/%r/admin/#", Permission::Deny),        // Explicit deny
+                AclRule::new("rooms/%r/admin/#", Permission::Deny),       // Explicit deny
                 AclRule::new("users/%u/private", Permission::ReadWrite),
             ],
         }
@@ -243,10 +243,25 @@ impl AclEngine {
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
             allow_anonymous,
-            default_rules: vec![
-                AclRule::new("public/#", Permission::ReadWrite),
-            ],
+            default_rules: if allow_anonymous {
+                vec![AclRule::new("#", Permission::ReadWrite)]
+            } else {
+                Vec::new()
+            },
         }
+    }
+
+    pub fn new_with_rules(allow_anonymous: bool, default_rules: Vec<AclRule>) -> Self {
+        Self {
+            users: Arc::new(RwLock::new(HashMap::new())),
+            allow_anonymous,
+            default_rules,
+        }
+    }
+
+    pub fn with_default_rules(mut self, rules: Vec<AclRule>) -> Self {
+        self.default_rules = rules;
+        self
     }
 
     pub async fn add_user(&self, account: UserAccount) {
@@ -277,7 +292,10 @@ impl AclEngine {
                 if let Some(user) = guard.get(u) {
                     let pass_bytes = password.unwrap_or(b"");
                     if user.verify_password(pass_bytes) {
-                        debug!("User '{}' authenticated successfully (role: {:?})", u, user.role);
+                        debug!(
+                            "User '{}' authenticated successfully (role: {:?})",
+                            u, user.role
+                        );
                         Ok(user.clone())
                     } else {
                         warn!("Authentication failed for user '{}': invalid password", u);
@@ -316,7 +334,10 @@ impl AclEngine {
         for rule in &user.custom_rules {
             if rule.matches_topic(user, client_id, topic) {
                 if rule.permission == Permission::Deny {
-                    debug!("Publish denied by explicit Deny rule: '{}' on '{}'", user.username, topic);
+                    debug!(
+                        "Publish denied by explicit Deny rule: '{}' on '{}'",
+                        user.username, topic
+                    );
                     return false;
                 }
                 if rule.permission.can_write() {
@@ -337,7 +358,10 @@ impl AclEngine {
             }
         }
 
-        debug!("Publish denied (no matching rule): '{}' on '{}'", user.username, topic);
+        debug!(
+            "Publish denied (no matching rule): '{}' on '{}'",
+            user.username, topic
+        );
         false
     }
 
@@ -351,7 +375,10 @@ impl AclEngine {
         for rule in &user.custom_rules {
             if rule.matches_topic(user, client_id, topic_filter) {
                 if rule.permission == Permission::Deny {
-                    debug!("Subscribe denied by explicit Deny rule: '{}' on '{}'", user.username, topic_filter);
+                    debug!(
+                        "Subscribe denied by explicit Deny rule: '{}' on '{}'",
+                        user.username, topic_filter
+                    );
                     return false;
                 }
                 if rule.permission.can_read() {
@@ -372,7 +399,10 @@ impl AclEngine {
             }
         }
 
-        debug!("Subscribe denied (no matching rule): '{}' on '{}'", user.username, topic_filter);
+        debug!(
+            "Subscribe denied (no matching rule): '{}' on '{}'",
+            user.username, topic_filter
+        );
         false
     }
 
@@ -538,7 +568,10 @@ mod tests {
     #[test]
     fn test_topic_matcher() {
         assert!(mqtt_topic_match("rooms/+/chat", "rooms/living_room/chat"));
-        assert!(!mqtt_topic_match("rooms/+/chat", "rooms/living_room/presence"));
+        assert!(!mqtt_topic_match(
+            "rooms/+/chat",
+            "rooms/living_room/presence"
+        ));
         assert!(mqtt_topic_match("rooms/#", "rooms/a/b/c"));
         assert!(mqtt_topic_match("devices/%c/data", "devices/%c/data"));
     }
@@ -560,19 +593,13 @@ mod tests {
         engine.add_user(mod_user.clone()).await;
 
         // 3. Member for Room A only
-        let member = UserAccount::new_member(
-            "charlie_member",
-            "member_secret",
-            vec!["room_alpha".into()],
-        );
+        let member =
+            UserAccount::new_member("charlie_member", "member_secret", vec!["room_alpha".into()]);
         engine.add_user(member.clone()).await;
 
         // 4. Viewer for Room A only
-        let viewer = UserAccount::new_viewer(
-            "dave_viewer",
-            "viewer_secret",
-            vec!["room_alpha".into()],
-        );
+        let viewer =
+            UserAccount::new_viewer("dave_viewer", "viewer_secret", vec!["room_alpha".into()]);
         engine.add_user(viewer.clone()).await;
 
         // 5. Device
@@ -580,8 +607,14 @@ mod tests {
         engine.add_user(device.clone()).await;
 
         // --- Authentication Verification ---
-        assert!(engine.authenticate(Some("alice_admin"), Some(b"admin_secret"), "c1").await.is_ok());
-        assert!(engine.authenticate(Some("alice_admin"), Some(b"wrong_pass"), "c1").await.is_err());
+        assert!(engine
+            .authenticate(Some("alice_admin"), Some(b"admin_secret"), "c1")
+            .await
+            .is_ok());
+        assert!(engine
+            .authenticate(Some("alice_admin"), Some(b"wrong_pass"), "c1")
+            .await
+            .is_err());
         assert!(engine.authenticate(None, None, "c1").await.is_err()); // Anon disabled
 
         // --- Room A Chat (Member vs Viewer vs Cross-Room) ---

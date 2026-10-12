@@ -101,6 +101,13 @@ task bench:tls:compare
 
 ## Features
 
+- **Dynamic Topic Patterns & Virtual Rooms:**
+  - Dynamic pattern substitution macros: `%u` (username), `%c` (ClientID), and `%r` (room expansion across authorized memberships).
+  - Virtual room scoping (`rooms/%r/chat`, `rooms/%r/presence`, `rooms/%r/announcements`, `rooms/%r/admin/control`) with total cross-room cryptographic isolation.
+  - Granular permission matrix: `Read`, `Write`, `ReadWrite`, and immediate-precedence `Deny` rules.
+- **Role-Based Access Control (RBAC) & Credential Engine:**
+  - Multi-tier roles: `Admin` (universal `#`), `Moderator` (`rooms/%r/#`), `Member` (chat/presence pub, announcement sub), `Viewer` (read-only chat/announcements), and `Device` (strictly scoped to `devices/%c/telemetry`).
+  - SHA-256 hashed password verification and declarative ACL rule loading ([`config/acl.conf`](config/acl.conf)).
 - **Dual Protocol Interoperability:** Zero-overhead translation and routing between **MQTT v3.1.1** and **MQTT v5.0** clients.
 - **Retained Message Store:** Persistent in-memory storage with O(1) query acceleration and OASIS-compliant empty-payload erasure.
 - **Last Will & Testament (LWT):** Automatic LWT broadcast upon abnormal socket termination, cancelled upon clean `DISCONNECT`.
@@ -115,7 +122,7 @@ task bench:tls:compare
 - **Structured Observability:**
   - Configurable log levels (`trace`, `debug`, `info`, `warn`, `error`).
   - Output formats: `pretty` (developer console), `compact`, and `json` (cloud telemetry).
-- **Rigorously Tested:** **40 test suites** passing across unit, integration, conformance, LWT, retained store, and live TCP socket multi-client E2E tests.
+- **Rigorously Tested:** **48 test suites** passing across unit, integration, conformance, LWT, retained store, live TCP socket multi-client E2E, and room ACL security tests.
 
 ---
 

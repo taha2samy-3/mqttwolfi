@@ -1,3 +1,4 @@
+use crate::auth::{AclEngine, UserAccount, UserRole};
 use crate::protocol::{MqttPacket, PacketError, PublishPacket, QoS};
 use crate::routing::retained::RetainedStore;
 use crate::routing::TopicTrie;
@@ -18,6 +19,7 @@ pub struct BrokerServer {
     router: Arc<RwLock<TopicTrie<u64>>>,
     clients: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Bytes>>>>,
     retained: Arc<RwLock<RetainedStore>>,
+    acl: Arc<AclEngine>,
 }
 
 impl BrokerServer {
@@ -27,12 +29,25 @@ impl BrokerServer {
         let router = Arc::new(RwLock::new(TopicTrie::new()));
         let clients = Arc::new(RwLock::new(HashMap::new()));
         let retained = Arc::new(RwLock::new(RetainedStore::new()));
+        let acl = Arc::new(AclEngine::new(true));
         Ok(Self {
             listener,
             router,
             clients,
             retained,
+            acl,
         })
+    }
+
+    /// Attaches a custom AclEngine to the broker for authentication and authorization.
+    pub fn with_acl(mut self, acl: Arc<AclEngine>) -> Self {
+        self.acl = acl;
+        self
+    }
+
+    /// Returns a reference to the broker's AclEngine.
+    pub fn acl(&self) -> &Arc<AclEngine> {
+        &self.acl
     }
 
     /// Returns the local socket address the server is listening on.
@@ -45,6 +60,7 @@ impl BrokerServer {
         let router = self.router;
         let clients = self.clients;
         let retained = self.retained;
+        let acl = self.acl;
         info!(
             "WolfiMQ TCP server running on {}",
             self.listener.local_addr()?
@@ -56,6 +72,7 @@ impl BrokerServer {
             let router_clone = Arc::clone(&router);
             let clients_clone = Arc::clone(&clients);
             let retained_clone = Arc::clone(&retained);
+            let acl_clone = Arc::clone(&acl);
 
             tokio::spawn(async move {
                 debug!("Client #{} connected from {}", client_id, peer_addr);
@@ -65,6 +82,7 @@ impl BrokerServer {
                     router_clone,
                     clients_clone,
                     retained_clone,
+                    acl_clone,
                 )
                 .await
                 {
@@ -81,6 +99,7 @@ impl BrokerServer {
         let router = self.router;
         let clients = self.clients;
         let retained = self.retained;
+        let acl = self.acl;
         info!(
             "WolfiMQ TLS server running on {}",
             self.listener.local_addr()?
@@ -92,6 +111,7 @@ impl BrokerServer {
             let router_clone = Arc::clone(&router);
             let clients_clone = Arc::clone(&clients);
             let retained_clone = Arc::clone(&retained);
+            let acl_clone = Arc::clone(&acl);
             let acceptor_clone = acceptor.clone();
 
             tokio::spawn(async move {
@@ -108,6 +128,7 @@ impl BrokerServer {
                             router_clone,
                             clients_clone,
                             retained_clone,
+                            acl_clone,
                         )
                         .await
                         {
@@ -130,6 +151,7 @@ impl BrokerServer {
         router: Arc<RwLock<TopicTrie<u64>>>,
         clients: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Bytes>>>>,
         retained: Arc<RwLock<RetainedStore>>,
+        acl: Arc<AclEngine>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -157,6 +179,8 @@ impl BrokerServer {
         let mut subscribed_topics = Vec::new();
         let mut client_will: Option<PublishPacket> = None;
         let mut clean_disconnect = false;
+        let mut current_user: Option<UserAccount> = None;
+        let mut connected_client_id: String = String::new();
 
         loop {
             let bytes_read = read_half.read_buf(&mut read_buf).await?;
@@ -179,31 +203,91 @@ impl BrokerServer {
                                     "CONNECT from client '{}' (id: {})",
                                     conn.client_id, client_id
                                 );
-                                client_will = conn.will;
-                                let connack = MqttPacket::ConnAck {
-                                    session_present: false,
-                                    reason_code: 0x00,
-                                };
-                                let mut ack_buf = BytesMut::new();
-                                connack.encode(&mut ack_buf)?;
-                                tx.send(ack_buf.freeze())?;
+                                match acl
+                                    .authenticate(
+                                        conn.username.as_deref(),
+                                        conn.password.as_deref(),
+                                        &conn.client_id,
+                                    )
+                                    .await
+                                {
+                                    Ok(user) => {
+                                        connected_client_id = conn.client_id.clone();
+                                        current_user = Some(user);
+                                        client_will = conn.will;
+                                        let connack = MqttPacket::ConnAck {
+                                            session_present: false,
+                                            reason_code: 0x00,
+                                        };
+                                        let mut ack_buf = BytesMut::new();
+                                        connack.encode(&mut ack_buf)?;
+                                        tx.send(ack_buf.freeze())?;
+                                    }
+                                    Err(auth_err) => {
+                                        warn!(
+                                            "Client '{}' failed authentication: {:?}",
+                                            conn.client_id, auth_err
+                                        );
+                                        let reason_code = if conn.version
+                                            == crate::protocol::ProtocolVersion::V311
+                                        {
+                                            0x05
+                                        } else {
+                                            0x86
+                                        };
+                                        let connack = MqttPacket::ConnAck {
+                                            session_present: false,
+                                            reason_code,
+                                        };
+                                        let mut ack_buf = BytesMut::new();
+                                        connack.encode(&mut ack_buf)?;
+                                        let _ = tx.send(ack_buf.freeze());
+                                        tokio::time::sleep(tokio::time::Duration::from_millis(10))
+                                            .await;
+                                        break;
+                                    }
+                                }
                             }
                             MqttPacket::Subscribe { packet_id, topics } => {
                                 let mut return_codes = Vec::new();
                                 let mut matched_retained = Vec::new();
+
+                                let user = current_user.clone().unwrap_or_else(|| UserAccount {
+                                    username: "anonymous".into(),
+                                    password_hash: String::new(),
+                                    role: UserRole::Custom("anonymous".into()),
+                                    allowed_rooms: Vec::new(),
+                                    custom_rules: Vec::new(),
+                                });
+
                                 {
                                     let mut router_guard = router.write().await;
                                     let retained_guard = retained.read().await;
                                     for (topic_filter, qos) in &topics {
-                                        if router_guard.subscribe(topic_filter, client_id).is_ok() {
-                                            subscribed_topics.push(topic_filter.clone());
-                                            return_codes.push(*qos as u8);
-                                            // Collect matching retained messages for this new subscription
-                                            let matches =
-                                                retained_guard.get_matches_for_filter(topic_filter);
-                                            matched_retained.extend(matches);
+                                        if acl.check_subscribe(
+                                            &user,
+                                            &connected_client_id,
+                                            topic_filter,
+                                        ) {
+                                            if router_guard
+                                                .subscribe(topic_filter, client_id)
+                                                .is_ok()
+                                            {
+                                                subscribed_topics.push(topic_filter.clone());
+                                                return_codes.push(*qos as u8);
+                                                // Collect matching retained messages for this new subscription
+                                                let matches = retained_guard
+                                                    .get_matches_for_filter(topic_filter);
+                                                matched_retained.extend(matches);
+                                            } else {
+                                                return_codes.push(0x80); // Failure
+                                            }
                                         } else {
-                                            return_codes.push(0x80); // Failure
+                                            warn!(
+                                                "Subscribe authorization denied for user '{}' on '{}'",
+                                                user.username, topic_filter
+                                            );
+                                            return_codes.push(0x80); // Unauthorized
                                         }
                                     }
                                 }
@@ -231,6 +315,22 @@ impl BrokerServer {
                                     pub_pkt.payload.len(),
                                     pub_pkt.retain
                                 );
+
+                                let user = current_user.clone().unwrap_or_else(|| UserAccount {
+                                    username: "anonymous".into(),
+                                    password_hash: String::new(),
+                                    role: UserRole::Custom("anonymous".into()),
+                                    allowed_rooms: Vec::new(),
+                                    custom_rules: Vec::new(),
+                                });
+
+                                if !acl.check_publish(&user, &connected_client_id, &pub_pkt.topic) {
+                                    warn!(
+                                        "Publish authorization denied for user '{}' on topic '{}'",
+                                        user.username, pub_pkt.topic
+                                    );
+                                    continue;
+                                }
 
                                 // If retain flag is set, update retained messages store
                                 if pub_pkt.retain {
@@ -296,32 +396,46 @@ impl BrokerServer {
         // If disconnected abnormally without a clean DISCONNECT, publish Last Will & Testament (LWT)
         if !clean_disconnect {
             if let Some(will_pkt) = client_will.take() {
-                info!(
-                    "Client #{} dropped connection without DISCONNECT. Triggering LWT on topic '{}'",
-                    client_id, will_pkt.topic
-                );
-                if will_pkt.retain {
-                    let mut retained_guard = retained.write().await;
-                    retained_guard.update(will_pkt.clone());
-                }
-
-                let matched_ids = {
-                    let router_guard = router.read().await;
-                    router_guard.matches(&will_pkt.topic)
+                let user_ref = current_user.as_ref();
+                let will_allowed = if let Some(u) = user_ref {
+                    acl.check_publish(u, &connected_client_id, &will_pkt.topic)
+                } else {
+                    true
                 };
 
-                let mut will_buf = BytesMut::new();
-                let will_packet = MqttPacket::Publish(will_pkt);
-                if will_packet.encode(&mut will_buf).is_ok() {
-                    let frozen_will = will_buf.freeze();
-                    let clients_guard = clients.read().await;
-                    for target_id in matched_ids {
-                        if target_id != client_id {
-                            if let Some(target_tx) = clients_guard.get(&target_id) {
-                                let _ = target_tx.send(frozen_will.clone());
+                if will_allowed {
+                    info!(
+                        "Client #{} dropped connection without DISCONNECT. Triggering LWT on topic '{}'",
+                        client_id, will_pkt.topic
+                    );
+                    if will_pkt.retain {
+                        let mut retained_guard = retained.write().await;
+                        retained_guard.update(will_pkt.clone());
+                    }
+
+                    let matched_ids = {
+                        let router_guard = router.read().await;
+                        router_guard.matches(&will_pkt.topic)
+                    };
+
+                    let mut will_buf = BytesMut::new();
+                    let will_packet = MqttPacket::Publish(will_pkt);
+                    if will_packet.encode(&mut will_buf).is_ok() {
+                        let frozen_will = will_buf.freeze();
+                        let clients_guard = clients.read().await;
+                        for target_id in matched_ids {
+                            if target_id != client_id {
+                                if let Some(target_tx) = clients_guard.get(&target_id) {
+                                    let _ = target_tx.send(frozen_will.clone());
+                                }
                             }
                         }
                     }
+                } else {
+                    warn!(
+                        "LWT publish authorization denied for client #{} on topic '{}'",
+                        client_id, will_pkt.topic
+                    );
                 }
             }
         }
