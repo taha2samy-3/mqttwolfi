@@ -1,21 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
   <defs>
-    <!-- Background Gradient -->
-    <linearGradient id="icon-bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#0B0F19"/>
-      <stop offset="40%" stop-color="#111827"/>
-      <stop offset="100%" stop-color="#030712"/>
-    </linearGradient>
-
     <!-- Neon Cyan & Electric Blue Gradients -->
     <linearGradient id="wolf-neon" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#00F2FE"/>
       <stop offset="100%" stop-color="#4FACFE"/>
-    </linearGradient>
-
-    <linearGradient id="wolf-accent" x1="0%" y1="100%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#38EF7D"/>
-      <stop offset="100%" stop-color="#00F2FE"/>
     </linearGradient>
 
     <!-- Glow Filters -->
@@ -25,12 +13,10 @@
     </filter>
   </defs>
 
-  <!-- Squircle Base Canvas -->
-  <rect width="512" height="512" rx="128" fill="url(#icon-bg)"/>
-  <rect width="512" height="512" rx="128" fill="none" stroke="#00F2FE" stroke-width="3" opacity="0.3"/>
+  <!-- NOTE: No Background (100% Transparent) -->
 
   <!-- Telemetry Arcs (MQTT Pub/Sub Signal) -->
-  <g opacity="0.35" stroke="#00F2FE" stroke-width="3" fill="none" filter="url(#icon-glow)">
+  <g opacity="0.45" stroke="#00F2FE" stroke-width="3" fill="none" filter="url(#icon-glow)">
     <path d="M 120,130 A 180,180 0 0,1 392,130" stroke-dasharray="8,8"/>
     <path d="M 160,170 A 130,130 0 0,1 352,170" stroke-width="3.5"/>
   </g>
@@ -38,7 +24,7 @@
   <!-- Central Emblem: Geometric Cyber Wolf -->
   <g transform="translate(256, 260)">
     <!-- Ambient Core Glow -->
-    <circle cx="0" cy="-10" r="130" fill="#00F2FE" opacity="0.12" filter="url(#icon-glow)"/>
+    <circle cx="0" cy="-10" r="130" fill="#00F2FE" opacity="0.16" filter="url(#icon-glow)"/>
 
     <!-- Left Outer Ear -->
     <polygon points="-110,-130 -40,-50 -75,-20" fill="#1e293b" stroke="#00F2FE" stroke-width="2.5" opacity="0.95"/>
