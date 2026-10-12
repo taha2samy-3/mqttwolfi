@@ -225,26 +225,23 @@ impl UserAccount {
     }
 
     /// Verifies provided candidate password against the stored credential.
-    /// Supports Argon2id, SHA-256 hashed, and raw string comparison.
+    /// Supports Argon2id and SHA-256 hashed passwords (strictly no plaintext comparison).
     pub fn verify_password(&self, candidate: &[u8]) -> bool {
+        if self.password_hash.is_empty() || candidate.is_empty() {
+            return false;
+        }
+
         if self.password_hash.starts_with("$argon2") {
             if let Ok(parsed_hash) = PasswordHash::new(&self.password_hash) {
                 return Argon2::default()
                     .verify_password(candidate, &parsed_hash)
                     .is_ok();
             }
+            return false;
         }
 
         let candidate_hash = Self::hash_password(candidate);
-        if candidate_hash == self.password_hash {
-            return true;
-        }
-        if let Ok(raw_str) = std::str::from_utf8(candidate) {
-            if raw_str == self.password_hash {
-                return true;
-            }
-        }
-        false
+        candidate_hash == self.password_hash
     }
 
     pub fn can_access_room(&self, room_id: &str) -> bool {
