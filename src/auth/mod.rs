@@ -67,8 +67,14 @@ impl AclRule {
     }
 
     /// Evaluates whether the rule pattern matches the candidate topic.
+    /// Evaluates if an MQTT topic matches this rule pattern.
     /// Supports `%u` (username), `%c` (client_id), `%r` (room_id), and MQTT wildcards (`+`, `#`).
     pub fn matches_topic(&self, user: &UserAccount, client_id: &str, topic: &str) -> bool {
+        // Sanitize client_id to prevent wildcard injection (e.g., client_id = "+" or "#" or contains "/")
+        if client_id.contains('+') || client_id.contains('#') || client_id.contains('/') {
+            return false;
+        }
+
         // If pattern contains %r, evaluate against all allowed rooms for this user
         if self.pattern.contains("%r") {
             if user.role == UserRole::Admin || user.allowed_rooms.iter().any(|r| r == "*") {
