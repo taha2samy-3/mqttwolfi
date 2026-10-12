@@ -73,8 +73,60 @@ impl BrokerServer {
     }
 
     /// Returns the local socket address the server is listening on.
-    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
-        self.listener.local_addr()
+    /// Starts the background periodic $SYS topic publisher task.
+    pub fn start_sys_publisher(&self, interval_sec: u64) {
+        let context = self.context.clone();
+        let start_time = std::time::Instant::now();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_sec.max(1)));
+            loop {
+                interval.tick().await;
+                let uptime = start_time.elapsed().as_secs();
+                let clients_count = { context.clients.read().await.len() };
+                let retained_count = { context.retained.read().await.count() };
+
+                let sys_metrics: [(&str, Bytes); 4] = [
+                    ("$SYS/broker/version", Bytes::from_static(b"0.1.0")),
+                    ("$SYS/broker/uptime", Bytes::from(uptime.to_string())),
+                    ("$SYS/broker/clients/connected", Bytes::from(clients_count.to_string())),
+                    ("$SYS/broker/messages/retained", Bytes::from(retained_count.to_string())),
+                ];
+
+                for (topic, payload) in sys_metrics {
+                    let pkt = PublishPacket {
+                        topic: topic.into(),
+                        qos: QoS::AtMostOnce,
+                        retain: true,
+                        dup: false,
+                        packet_id: None,
+                        payload,
+                    };
+
+                    {
+                        let mut ret_guard = context.retained.write().await;
+                        ret_guard.update(pkt.clone());
+                    }
+
+                    let matched_ids = {
+                        let router_guard = context.router.read().await;
+                        router_guard.matches(topic)
+                    };
+
+                    let mut fwd_pkt = pkt;
+                    fwd_pkt.retain = false;
+                    let mut buf = BytesMut::new();
+                    if MqttPacket::Publish(fwd_pkt).encode(&mut buf).is_ok() {
+                        let frozen = buf.freeze();
+                        let clients_guard = context.clients.read().await;
+                        for id in matched_ids {
+                            if let Some(tx) = clients_guard.get(&id) {
+                                let _ = tx.try_send(frozen.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Runs the server event loop accepting client connections concurrently.
