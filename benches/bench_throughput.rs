@@ -221,7 +221,10 @@ fn bench_retained_store() {
 
     println!("  Retained Entries: {} stored topics", store.count());
     println!("  Insert Speed    : {:.2} updates/sec", insert_ops_sec);
-    println!("  Query Speed     : {:.2} queries/sec (total matches: {})\n", query_ops_sec, total_matches);
+    println!(
+        "  Query Speed     : {:.2} queries/sec (total matches: {})\n",
+        query_ops_sec, total_matches
+    );
 }
 
 fn bench_latency_percentiles() {
@@ -278,12 +281,43 @@ fn bench_latency_percentiles() {
     let p999 = latencies_ns[(sample_count as f64 * 0.999) as usize];
     let max = *latencies_ns.last().unwrap();
 
-    println!("  Sample Size     : {} full decode -> route -> encode cycles", sample_count);
-    println!("  Mean Latency    : {:.2} ns  ({:.3} µs)", mean_ns, mean_ns / 1_000.0);
-    println!("  p50 (Median)    : {} ns  ({:.3} µs)", p50, (p50 as f64) / 1_000.0);
-    println!("  p90             : {} ns  ({:.3} µs)", p90, (p90 as f64) / 1_000.0);
-    println!("  p95             : {} ns  ({:.3} µs)", p95, (p95 as f64) / 1_000.0);
-    println!("  p99             : {} ns  ({:.3} µs)", p99, (p99 as f64) / 1_000.0);
-    println!("  p99.9           : {} ns  ({:.3} µs)", p999, (p999 as f64) / 1_000.0);
-    println!("  Max Latency     : {} ns  ({:.3} µs)\n", max, (max as f64) / 1_000.0);
+    println!(
+        "  Sample Size     : {} full decode -> route -> encode cycles",
+        sample_count
+    );
+    println!(
+        "  Mean Latency    : {:.2} ns  ({:.3} µs)",
+        mean_ns,
+        mean_ns / 1_000.0
+    );
+    println!(
+        "  p50 (Median)    : {} ns  ({:.3} µs)",
+        p50,
+        (p50 as f64) / 1_000.0
+    );
+    println!(
+        "  p90             : {} ns  ({:.3} µs)",
+        p90,
+        (p90 as f64) / 1_000.0
+    );
+    println!(
+        "  p95             : {} ns  ({:.3} µs)",
+        p95,
+        (p95 as f64) / 1_000.0
+    );
+    println!(
+        "  p99             : {} ns  ({:.3} µs)",
+        p99,
+        (p99 as f64) / 1_000.0
+    );
+    println!(
+        "  p99.9           : {} ns  ({:.3} µs)",
+        p999,
+        (p999 as f64) / 1_000.0
+    );
+    println!(
+        "  Max Latency     : {} ns  ({:.3} µs)\n",
+        max,
+        (max as f64) / 1_000.0
+    );
 }

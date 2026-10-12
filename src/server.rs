@@ -59,8 +59,14 @@ impl BrokerServer {
 
             tokio::spawn(async move {
                 debug!("Client #{} connected from {}", client_id, peer_addr);
-                if let Err(e) =
-                    Self::handle_client(stream, client_id, router_clone, clients_clone, retained_clone).await
+                if let Err(e) = Self::handle_client(
+                    stream,
+                    client_id,
+                    router_clone,
+                    clients_clone,
+                    retained_clone,
+                )
+                .await
                 {
                     warn!("Client #{} disconnected with error: {}", client_id, e);
                 } else {
@@ -141,7 +147,8 @@ impl BrokerServer {
                                             subscribed_topics.push(topic_filter.clone());
                                             return_codes.push(*qos as u8);
                                             // Collect matching retained messages for this new subscription
-                                            let matches = retained_guard.get_matches_for_filter(topic_filter);
+                                            let matches =
+                                                retained_guard.get_matches_for_filter(topic_filter);
                                             matched_retained.extend(matches);
                                         } else {
                                             return_codes.push(0x80); // Failure

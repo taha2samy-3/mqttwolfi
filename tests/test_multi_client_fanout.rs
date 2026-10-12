@@ -9,7 +9,10 @@ use wolf_mqtt::server::BrokerServer;
 async fn send_packet(stream: &mut TcpStream, packet: MqttPacket) {
     let mut buf = BytesMut::new();
     packet.encode(&mut buf).expect("Failed to encode packet");
-    stream.write_all(&buf).await.expect("Failed to write to stream");
+    stream
+        .write_all(&buf)
+        .await
+        .expect("Failed to write to stream");
 }
 
 async fn read_packet(stream: &mut TcpStream, buf: &mut BytesMut) -> MqttPacket {
@@ -57,9 +60,12 @@ async fn test_live_tcp_high_concurrency_fanout_1_to_8() {
             )
             .await;
 
-            let _ = timeout(Duration::from_secs(3), read_packet(&mut stream, &mut read_buf))
-                .await
-                .expect("ConnAck timeout");
+            let _ = timeout(
+                Duration::from_secs(3),
+                read_packet(&mut stream, &mut read_buf),
+            )
+            .await
+            .expect("ConnAck timeout");
 
             send_packet(
                 &mut stream,
@@ -70,16 +76,22 @@ async fn test_live_tcp_high_concurrency_fanout_1_to_8() {
             )
             .await;
 
-            let _ = timeout(Duration::from_secs(3), read_packet(&mut stream, &mut read_buf))
-                .await
-                .expect("SubAck timeout");
+            let _ = timeout(
+                Duration::from_secs(3),
+                read_packet(&mut stream, &mut read_buf),
+            )
+            .await
+            .expect("SubAck timeout");
 
             // Receive all expected messages
             let mut received_count = 0;
             for _ in 0..num_messages {
-                let pkt = timeout(Duration::from_secs(3), read_packet(&mut stream, &mut read_buf))
-                    .await
-                    .expect("Message recv timeout");
+                let pkt = timeout(
+                    Duration::from_secs(3),
+                    read_packet(&mut stream, &mut read_buf),
+                )
+                .await
+                .expect("Message recv timeout");
                 if let MqttPacket::Publish(pub_pkt) = pkt {
                     assert_eq!(pub_pkt.topic, "broadcast/metrics");
                     received_count += 1;
@@ -107,9 +119,12 @@ async fn test_live_tcp_high_concurrency_fanout_1_to_8() {
         }),
     )
     .await;
-    let _ = timeout(Duration::from_secs(3), read_packet(&mut pub_stream, &mut pub_buf))
-        .await
-        .unwrap();
+    let _ = timeout(
+        Duration::from_secs(3),
+        read_packet(&mut pub_stream, &mut pub_buf),
+    )
+    .await
+    .unwrap();
 
     for i in 0..num_messages {
         let payload = format!("payload_seq_{}", i);
@@ -130,6 +145,9 @@ async fn test_live_tcp_high_concurrency_fanout_1_to_8() {
     // Collect results from all subscribers
     for handle in sub_handles {
         let count = handle.await.unwrap();
-        assert_eq!(count, num_messages, "Each subscriber must receive all published messages");
+        assert_eq!(
+            count, num_messages,
+            "Each subscriber must receive all published messages"
+        );
     }
 }

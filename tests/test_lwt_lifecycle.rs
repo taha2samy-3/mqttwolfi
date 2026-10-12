@@ -185,7 +185,11 @@ async fn test_lwt_cancelled_on_clean_disconnect() {
     }
 
     // 3. Observer MUST NOT receive any LWT packet
-    let timeout_res = timeout(Duration::from_millis(300), read_packet(&mut observer_stream)).await;
+    let timeout_res = timeout(
+        Duration::from_millis(300),
+        read_packet(&mut observer_stream),
+    )
+    .await;
     assert!(
         timeout_res.is_err(),
         "LWT must be cancelled on clean DISCONNECT; no packet should arrive"
