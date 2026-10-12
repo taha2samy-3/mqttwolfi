@@ -1,4 +1,5 @@
-use crate::protocol::{MqttPacket, PacketError, QoS};
+use crate::protocol::{MqttPacket, PacketError, PublishPacket, QoS};
+use crate::routing::retained::RetainedStore;
 use crate::routing::TopicTrie;
 use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ pub struct BrokerServer {
     listener: TcpListener,
     router: Arc<RwLock<TopicTrie<u64>>>,
     clients: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Bytes>>>>,
+    retained: Arc<RwLock<RetainedStore>>,
 }
 
 impl BrokerServer {
@@ -24,10 +26,12 @@ impl BrokerServer {
         let listener = TcpListener::bind(addr).await?;
         let router = Arc::new(RwLock::new(TopicTrie::new()));
         let clients = Arc::new(RwLock::new(HashMap::new()));
+        let retained = Arc::new(RwLock::new(RetainedStore::new()));
         Ok(Self {
             listener,
             router,
             clients,
+            retained,
         })
     }
 
@@ -40,6 +44,7 @@ impl BrokerServer {
     pub async fn run(self) -> Result<(), std::io::Error> {
         let router = self.router;
         let clients = self.clients;
+        let retained = self.retained;
         info!(
             "WolfiMQ TCP server running on {}",
             self.listener.local_addr()?
@@ -50,11 +55,12 @@ impl BrokerServer {
             let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
             let router_clone = Arc::clone(&router);
             let clients_clone = Arc::clone(&clients);
+            let retained_clone = Arc::clone(&retained);
 
             tokio::spawn(async move {
                 debug!("Client #{} connected from {}", client_id, peer_addr);
                 if let Err(e) =
-                    Self::handle_client(stream, client_id, router_clone, clients_clone).await
+                    Self::handle_client(stream, client_id, router_clone, clients_clone, retained_clone).await
                 {
                     warn!("Client #{} disconnected with error: {}", client_id, e);
                 } else {
@@ -69,6 +75,7 @@ impl BrokerServer {
         client_id: u64,
         router: Arc<RwLock<TopicTrie<u64>>>,
         clients: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Bytes>>>>,
+        retained: Arc<RwLock<RetainedStore>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (mut read_half, mut write_half) = stream.into_split();
         let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
@@ -90,6 +97,8 @@ impl BrokerServer {
 
         let mut read_buf = BytesMut::with_capacity(4096);
         let mut subscribed_topics = Vec::new();
+        let mut client_will: Option<PublishPacket> = None;
+        let mut clean_disconnect = false;
 
         loop {
             let bytes_read = read_half.read_buf(&mut read_buf).await?;
@@ -112,6 +121,7 @@ impl BrokerServer {
                                     "CONNECT from client '{}' (id: {})",
                                     conn.client_id, client_id
                                 );
+                                client_will = conn.will;
                                 let connack = MqttPacket::ConnAck {
                                     session_present: false,
                                     reason_code: 0x00,
@@ -122,12 +132,17 @@ impl BrokerServer {
                             }
                             MqttPacket::Subscribe { packet_id, topics } => {
                                 let mut return_codes = Vec::new();
+                                let mut matched_retained = Vec::new();
                                 {
                                     let mut router_guard = router.write().await;
+                                    let retained_guard = retained.read().await;
                                     for (topic_filter, qos) in &topics {
                                         if router_guard.subscribe(topic_filter, client_id).is_ok() {
                                             subscribed_topics.push(topic_filter.clone());
                                             return_codes.push(*qos as u8);
+                                            // Collect matching retained messages for this new subscription
+                                            let matches = retained_guard.get_matches_for_filter(topic_filter);
+                                            matched_retained.extend(matches);
                                         } else {
                                             return_codes.push(0x80); // Failure
                                         }
@@ -140,13 +155,29 @@ impl BrokerServer {
                                 let mut ack_buf = BytesMut::new();
                                 suback.encode(&mut ack_buf)?;
                                 tx.send(ack_buf.freeze())?;
+
+                                // Deliver matching retained messages to the newly subscribed client
+                                for ret_pkt in matched_retained {
+                                    let mut ret_buf = BytesMut::new();
+                                    let ret_packet = MqttPacket::Publish(ret_pkt);
+                                    if ret_packet.encode(&mut ret_buf).is_ok() {
+                                        let _ = tx.send(ret_buf.freeze());
+                                    }
+                                }
                             }
                             MqttPacket::Publish(pub_pkt) => {
                                 debug!(
-                                    "PUBLISH topic '{}', len {}",
+                                    "PUBLISH topic '{}', len {}, retain {}",
                                     pub_pkt.topic,
-                                    pub_pkt.payload.len()
+                                    pub_pkt.payload.len(),
+                                    pub_pkt.retain
                                 );
+
+                                // If retain flag is set, update retained messages store
+                                if pub_pkt.retain {
+                                    let mut retained_guard = retained.write().await;
+                                    retained_guard.update(pub_pkt.clone());
+                                }
 
                                 // Forward to matching subscribers
                                 let matched_ids = {
@@ -184,6 +215,7 @@ impl BrokerServer {
                                 tx.send(ping_buf.freeze())?;
                             }
                             MqttPacket::Disconnect => {
+                                clean_disconnect = true;
                                 debug!("DISCONNECT received from client #{}", client_id);
                                 break;
                             }
@@ -197,6 +229,39 @@ impl BrokerServer {
                     Err(e) => {
                         error!("Packet decode error: {}", e);
                         return Err(Box::new(e));
+                    }
+                }
+            }
+        }
+
+        // If disconnected abnormally without a clean DISCONNECT, publish Last Will & Testament (LWT)
+        if !clean_disconnect {
+            if let Some(will_pkt) = client_will.take() {
+                info!(
+                    "Client #{} dropped connection without DISCONNECT. Triggering LWT on topic '{}'",
+                    client_id, will_pkt.topic
+                );
+                if will_pkt.retain {
+                    let mut retained_guard = retained.write().await;
+                    retained_guard.update(will_pkt.clone());
+                }
+
+                let matched_ids = {
+                    let router_guard = router.read().await;
+                    router_guard.matches(&will_pkt.topic)
+                };
+
+                let mut will_buf = BytesMut::new();
+                let will_packet = MqttPacket::Publish(will_pkt);
+                if will_packet.encode(&mut will_buf).is_ok() {
+                    let frozen_will = will_buf.freeze();
+                    let clients_guard = clients.read().await;
+                    for target_id in matched_ids {
+                        if target_id != client_id {
+                            if let Some(target_tx) = clients_guard.get(&target_id) {
+                                let _ = target_tx.send(frozen_will.clone());
+                            }
+                        }
                     }
                 }
             }

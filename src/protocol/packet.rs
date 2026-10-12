@@ -225,12 +225,27 @@ impl MqttPacket {
                 if conn.clean_start {
                     connect_flags |= 0x02;
                 }
+                if let Some(ref will) = conn.will {
+                    connect_flags |= 0x04; // Will Flag
+                    connect_flags |= (will.qos as u8) << 3; // Will QoS (bits 3 & 4)
+                    if will.retain {
+                        connect_flags |= 0x20; // Will Retain (bit 5)
+                    }
+                }
                 var_header.put_u8(connect_flags);
                 var_header.put_u16(conn.keep_alive_sec);
 
                 // Payload: Client ID
                 var_header.put_u16(conn.client_id.len() as u16);
                 var_header.put_slice(conn.client_id.as_bytes());
+
+                // Payload: Will Topic & Will Message
+                if let Some(ref will) = conn.will {
+                    var_header.put_u16(will.topic.len() as u16);
+                    var_header.put_slice(will.topic.as_bytes());
+                    var_header.put_u16(will.payload.len() as u16);
+                    var_header.put_slice(&will.payload);
+                }
 
                 dst.put_u8((PacketType::Connect as u8) << 4);
                 encode_variable_byte_integer(var_header.len() as u32, dst)
@@ -412,20 +427,64 @@ impl MqttPacket {
 
                 let connect_flags = src.get_u8();
                 let clean_start = (connect_flags & 0x02) != 0;
+                let will_flag = (connect_flags & 0x04) != 0;
+                let will_qos_val = (connect_flags >> 3) & 0x03;
+                let will_retain = (connect_flags & 0x20) != 0;
                 let keep_alive_sec = src.get_u16();
 
+                if src.remaining() < 2 {
+                    return Err(PacketError::BufferUnderflow);
+                }
                 let client_id_len = src.get_u16() as usize;
+                if src.remaining() < client_id_len {
+                    return Err(PacketError::BufferUnderflow);
+                }
                 let mut client_id_bytes = vec![0u8; client_id_len];
                 src.copy_to_slice(&mut client_id_bytes);
                 let client_id =
                     String::from_utf8(client_id_bytes).map_err(|_| PacketError::InvalidString)?;
+
+                let will = if will_flag {
+                    let will_qos = QoS::try_from(will_qos_val)?;
+                    if src.remaining() < 2 {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let topic_len = src.get_u16() as usize;
+                    if src.remaining() < topic_len {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let mut topic_bytes = vec![0u8; topic_len];
+                    src.copy_to_slice(&mut topic_bytes);
+                    let topic =
+                        String::from_utf8(topic_bytes).map_err(|_| PacketError::InvalidString)?;
+
+                    if src.remaining() < 2 {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let payload_len = src.get_u16() as usize;
+                    if src.remaining() < payload_len {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let payload = src.copy_to_bytes(payload_len);
+
+                    Some(PublishPacket {
+                        topic,
+                        qos: will_qos,
+                        retain: will_retain,
+                        dup: false,
+                        packet_id: None,
+                        payload,
+                    })
+                } else {
+                    None
+                };
 
                 Ok(MqttPacket::Connect(ConnectPacket {
                     version,
                     client_id,
                     clean_start,
                     keep_alive_sec,
-                    will: None,
+                    will,
                 }))
             }
             _ => Err(PacketError::InvalidPacketType(packet_type_val)),
@@ -521,6 +580,33 @@ mod tests {
             clean_start: true,
             keep_alive_sec: 60,
             will: None,
+        };
+        let pkt = MqttPacket::Connect(conn_pkt);
+
+        let mut buf = BytesMut::new();
+        pkt.encode(&mut buf).unwrap();
+
+        let mut read_buf = &buf[..];
+        let decoded = MqttPacket::decode(&mut read_buf).unwrap();
+        assert_eq!(decoded, pkt);
+    }
+
+    #[test]
+    fn test_connect_with_will_roundtrip() {
+        let will = PublishPacket {
+            topic: "status/client-99/lwt".into(),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"OFFLINE_UNEXPECTED"),
+        };
+        let conn_pkt = ConnectPacket {
+            version: ProtocolVersion::V500,
+            client_id: "edge-device-99".into(),
+            clean_start: true,
+            keep_alive_sec: 45,
+            will: Some(will),
         };
         let pkt = MqttPacket::Connect(conn_pkt);
 
