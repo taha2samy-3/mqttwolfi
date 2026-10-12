@@ -143,8 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match wolf_mqtt::server::BrokerServer::bind(&tcp_addr).await {
             Ok(tcp_server) => {
                 let tcp_server = tcp_server.with_context(shared_context.clone());
-                info!("WolfiMQ TCP listener active on {}", tcp_addr);
                 listeners_active += 1;
+                info!(
+                    "WolfiMQ TCP listener active on {} (active listeners: {})",
+                    tcp_addr, listeners_active
+                );
                 tcp_server.run().await?;
             }
             Err(e) => {
