@@ -27,22 +27,27 @@
 
 | Category | Capability / Feature | Status | Notes & Verification |
 | :--- | :--- | :---: | :--- |
-| **Transport** | TCP Listener (Plaintext) | ✅ Implemented | Asynchronous Tokio TCP server on configurable host/port |
-| **Transport** | TLS 1.3 / 1.2 Listener (mTLS) | ✅ Implemented | Full mutual authentication, ALPN (`mqtt`), verified in [`tests/test_tls_e2e.rs`](tests/test_tls_e2e.rs) |
-| **MQTT 3.1.1** | CONNECT, CONNACK, PINGREQ, DISCONNECT | ✅ Implemented | Conformance verified across v3.1.1 test suites |
-| **MQTT 3.1.1** | PUBLISH & PUBACK (QoS 0 & QoS 1) | ✅ Implemented | Bounded queues, client delivery, acknowledgments |
-| **MQTT 3.1.1** | Retained Messages | ✅ Implemented | O(1) exact hash match, late subscriber delivery, empty-payload deletion |
-| **MQTT 3.1.1** | Last Will & Testament (LWT) | ✅ Implemented | Triggered on abnormal socket collapse, cancelled on clean DISCONNECT |
-| **MQTT 5.0** | Basic v5 Wire Codecs & Reason Codes | ✅ Implemented | Connect protocol negotiation and v5 packet framing |
-| **MQTT 5.0** | User Properties & Session Expiry Interval | 📋 Planned | Struct fields & wire properties on active development roadmap |
-| **MQTT 5.0** | Topic Aliases & Subscription Options | 📋 Planned | Compression and `NoLocal` / `RetainAsPublished` flags on roadmap |
+| **Transport** | TCP Listener (Plaintext) | ✅ Implemented | Asynchronous Tokio TCP server on configurable host/port with unified `BrokerContext` |
+| **Transport** | TLS 1.3 / 1.2 Listener (mTLS) | ✅ Implemented | Full mutual authentication, ALPN (`mqtt`), shared routing state with TCP listener |
+| **Multi-Listener**| Unified Broker State & Cross-Routing | ✅ Implemented | TCP & TLS listeners share router, sessions, ACL, and retained store ([`tests/test_unified_listeners_and_hardening.rs`](tests/test_unified_listeners_and_hardening.rs)) |
+| **MQTT 3.1.1** | CONNECT, CONNACK, PINGREQ, DISCONNECT | ✅ Implemented | Bounds-checked DoS-hardened codecs, duplicate CONNECT rejected, duplicate ClientID replaces session |
+| **MQTT 3.1.1** | PUBLISH & PUBACK (QoS 0 & QoS 1) | ✅ Implemented | Wildcards in publish topic rejected, live delivery clears retain flag per MQTT-3.3.1-9 |
+| **MQTT 3.1.1** | SUBSCRIBE & SUBACK | ✅ Implemented | Underflow-safe decoding, reduced lock contention during ACL verification |
+| **MQTT 3.1.1** | UNSUBSCRIBE & UNSUBACK | ✅ Implemented | Live unsubscription handling with recursive Topic Trie node pruning |
+| **MQTT 3.1.1** | Retained Messages | ✅ Implemented | Retained QoS 1 outbound packet ID generation, late subscriber delivery, empty-payload erasure |
+| **MQTT 3.1.1** | Last Will & Testament (LWT) | ✅ Implemented | Triggered on socket collapse or Keep-Alive timeout, cancelled on clean DISCONNECT |
+| **MQTT 5.0** | v5 Wire Codecs, Connect & Reason Codes | ✅ Implemented | Full v5 CONNECT, CONNACK, PUBACK, DISCONNECT framing and spec-compliant reason codes |
+| **MQTT 5.0** | Properties Parsing & Will Properties | ✅ Implemented | Variable Byte Integer properties length parsing & skipping in CONNECT, Will, CONNACK, and PUBACK |
+| **MQTT 5.0** | Cross-Protocol Interoperability | ✅ Implemented | Seamless bidirectional message exchange between v3.1.1 and v5.0 clients ([`tests/test_mqtt5_conformance_and_interop.rs`](tests/test_mqtt5_conformance_and_interop.rs)) |
+| **Keep-Alive** | Keep-Alive Timeout Enforcement | ✅ Implemented | Automatic 1.5× `keep_alive_sec` activity timeout, dead session cleanup, and LWT dispatch |
 | **QoS Levels** | QoS 0 (At most once) & QoS 1 (At least once)| ✅ Implemented | Fully tested and verified |
-| **QoS Levels** | QoS 2 (Exactly once: PUBREC, PUBREL, PUBCOMP)| 📋 Planned | Multi-step handshake state machine on roadmap |
-| **Routing** | Topic Trie (`+` and `#` wildcards) | ✅ Implemented | Trie lookup matching industrial topic hierarchies |
-| **Queues** | Bounded Backpressure & Drop Policies | ✅ Implemented | Bounded message/byte queues with `drop_oldest` and `drop_newest` |
-| **Security** | Argon2id Password Hashing | ✅ Implemented | Memory-hard password verification via `argon2` crate with SHA-256 fallback |
-| **Security** | Role-Based Access Control (RBAC) & Rooms | ✅ Implemented | Dynamic macros (`%u`, `%c`, `%r`), room isolation, declarative [`config/acl.conf`](config/acl.conf) |
-| **Security** | Subject CN / SAN ClientID Binding | 📋 Planned | Strict certificate Common Name binding to MQTT `ClientID` |
+| **QoS Levels** | QoS 2 (Handshake: PUBREC, PUBREL, PUBCOMP)| 📋 Roadmap | Wire packet codecs implemented; 4-step state machine on roadmap |
+| **Routing** | Topic Trie (`+` and `#` wildcards) | ✅ Implemented | Radix trie lookup with root wildcard `$SYS/` isolation per MQTT-4.7.2-1 |
+| **Queues** | Bounded Backpressure & Drop Policies | ✅ Implemented | Bounded channels (`mpsc::channel(1024)`) with non-blocking `try_send` and slow-consumer protection |
+| **Security** | Argon2id Password Hashing | ✅ Implemented | Memory-hard verification offloaded to worker threads via `tokio::task::spawn_blocking` |
+| **Security** | Role-Based Access Control (RBAC) & Rooms | ✅ Implemented | Dynamic macros (`%u`, `%c`, `%r`), room isolation, wildcard sanitization, declarative [`config/acl.conf`](config/acl.conf) |
+| **Security** | Pass-the-Hash Elimination & Strict Auth | ✅ Implemented | Raw hash fallback eliminated, empty passwords rejected, Device accounts strictly scoped |
+| **Monitoring** | `$SYS/broker/...` System Telemetry | ✅ Implemented | Periodic emitter for uptime, version, active clients, and retained message counts |
 | **Persistence**| In-Memory Session & Retained Storage | ✅ Implemented | Concurrent `RwLock` and `Arc` data structures |
 | **Persistence**| Disk Storage (SQLite / RocksDB) | 📋 Planned | Pluggable persistence engine on architectural roadmap |
 | **Clustering** | High-Availability Distributed Clustering | 📋 Planned | Raft / Gossip clustering planned for multi-node deployments |
@@ -245,9 +250,11 @@ queue_full_policy = "drop_oldest"
 
 ## Testing & CI Suite
 
-WolfiMQ validates stability across **49 automated test cases**:
-- **29 Unit Tests:** Packet codecs, variable-byte integers, Argon2id hashing, Topic Trie matching, retained storage, and configuration validation.
+WolfiMQ validates stability across **68 automated test cases** (38 Unit Tests + 30 Integration & E2E Tests across 11 test suites):
+- **38 Unit Tests:** Packet codecs, variable-byte integers, bounds-checked CONNECT framing, Argon2id hashing, Topic Trie matching & pruning, `$SYS` topic root wildcard isolation, retained storage, and configuration validation.
+- **5 MQTT 5.0 Conformance & Interop Tests:** Live TCP pub/sub exchange, raw frame properties parsing, will properties LWT delivery, MQTT 5 reason codes (`0x86` vs `0x05`), and v3.1.1/v5.0 cross-version interoperability.
 - **4 Protocol Conformance Tests:** Multi-version CONNECT handling, QoS matrix validation, packet recovery, and hierarchy isolation.
+- **4 Unified Listeners & Hardening Tests:** Cross-listener message routing (TCP 1883 $\leftrightarrow$ TLS 8883), live UNSUBSCRIBE / UNSUBACK with trie pruning, retained QoS 1 delivery with packet IDs, and duplicate CONNECT disconnects.
 - **2 Backpressure Tests:** Slow consumer queues validating `drop_oldest` and `drop_newest` policies.
 - **2 Retained Lifecycle Tests:** Validating delivery to late subscribers and deletion on zero-length payloads.
 - **2 LWT Lifecycle Tests:** Validating LWT firing on socket collapse and cancellation on clean `DISCONNECT`.
