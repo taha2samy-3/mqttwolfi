@@ -16,24 +16,28 @@ use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector};
 struct BenchmarkResult {
     broker_name: String,
     tls_engine: String,
+    concurrency: usize,
     handshake_ms: f64,
     total_messages: usize,
     throughput_msgs_sec: f64,
     bandwidth_mb_sec: f64,
     mean_latency_us: f64,
     p50_latency_us: f64,
+    p90_latency_us: f64,
     p95_latency_us: f64,
     p99_latency_us: f64,
+    max_latency_us: f64,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("================================================================================");
-    println!("        WolfiMQ vs. Other Brokers: TLS-Activated Benchmark Suite                ");
+    println!("    WolfiMQ vs. Other Brokers: High-Load Standardized TLS Benchmark Suite       ");
     println!("================================================================================\n");
 
     let args: Vec<String> = env::args().collect();
     let mut msg_count = 10_000usize;
+    let mut concurrency = 8usize;
     let mut payload_size = 128usize;
     let mut external_port: Option<u16> = None;
     let mut external_name = "Eclipse Mosquitto (OpenSSL)".to_string();
@@ -44,6 +48,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         match args[i].as_str() {
             "--count" if i + 1 < args.len() => {
                 msg_count = args[i + 1].parse().unwrap_or(10_000);
+                i += 1;
+            }
+            "--concurrency" if i + 1 < args.len() => {
+                concurrency = args[i + 1].parse().unwrap_or(8).max(1);
                 i += 1;
             }
             "--payload-size" if i + 1 < args.len() => {
@@ -67,25 +75,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         i += 1;
     }
 
-    println!("Benchmark Settings:");
-    println!("  Messages to Send : {}", msg_count);
+    println!("Standardized Benchmark Configuration:");
+    println!("  Total Messages   : {}", msg_count);
+    println!("  Concurrency Load : {} concurrent TLS 1.3 clients", concurrency);
+    println!("  Msgs Per Client  : {}", msg_count / concurrency);
     println!("  Payload Size     : {} bytes", payload_size);
-    println!("  TLS Encryption   : Active (mTLS / TLS 1.3)\n");
+    println!("  TLS Encryption   : Active (mTLS / TLS 1.3 - RFC 8446)\n");
 
-    // 1. Benchmark WolfiMQ over TLS
-    println!("==> Running Benchmark: WolfiMQ (Rust + wolfSSL / TLS 1.3)...");
-    let wolf_res = benchmark_wolfimq(msg_count, payload_size).await?;
+    // 1. Benchmark WolfiMQ over TLS under High Concurrency
+    println!("==> [1/2] Running WolfiMQ High-Load TLS Benchmark (Rust + wolfSSL / TLS 1.3)...");
+    let wolf_res = benchmark_wolfimq(msg_count, concurrency, payload_size).await?;
     print_single_result(&wolf_res);
 
-    // 2. If an external broker is configured, benchmark it over TLS
+    // 2. If an external broker is configured, benchmark it under identical conditions
     let mut results = vec![wolf_res];
 
     if let Some(port) = external_port {
         println!(
-            "\n==> Running Benchmark: {} on port {}...",
+            "\n==> [2/2] Running External Target: {} on port {}...",
             external_name, port
         );
-        match benchmark_external_broker(&external_name, port, msg_count, payload_size).await {
+        match benchmark_external_broker(&external_name, port, msg_count, concurrency, payload_size).await {
             Ok(ext_res) => {
                 print_single_result(&ext_res);
                 results.push(ext_res);
@@ -100,15 +110,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // 3. Print Comparison Table
-    println!("\n================================================================================");
-    println!("                Side-by-Side TLS Broker Comparison Summary                      ");
-    println!("================================================================================");
+    println!("\n============================================================================================");
+    println!("                     Side-by-Side High-Load TLS Broker Comparison                           ");
+    println!("============================================================================================");
     print_comparison_table(&results);
 
     // 4. If requested, write Markdown file for GitHub Actions Summary
     if let Some(path) = markdown_path {
         write_markdown_summary(&path, &results)?;
-        println!("\n[+] Markdown comparison report saved to: {}", path);
+        println!("\n[+] Standardized Markdown report saved to: {}", path);
     }
 
     Ok(())

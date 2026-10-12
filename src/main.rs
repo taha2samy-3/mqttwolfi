@@ -5,7 +5,35 @@ use wolf_mqtt::logging;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config_path = Path::new("config/broker.toml");
+    let args: Vec<String> = std::env::args().collect();
+    let mut config_file = "config/broker.toml".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" | "--config" if i + 1 < args.len() => {
+                config_file = args[i + 1].clone();
+                i += 1;
+            }
+            "-h" | "--help" => {
+                println!("WolfiMQ - High-Performance MQTT 3.1.1 / 5.0 Broker with Native wolfSSL TLS 1.3\n");
+                println!("Usage: wolf-mqtt-broker [OPTIONS]\n");
+                println!("Options:");
+                println!("  -c, --config <FILE>    Path to TOML configuration file [default: config/broker.toml]");
+                println!("  -h, --help             Print help information and exit");
+                println!("  -v, --version          Print version information and exit");
+                return Ok(());
+            }
+            "-v" | "--version" => {
+                println!("wolf-mqtt-broker v0.1.0 (TLS 1.3 / mTLS / wolfSSL)");
+                return Ok(());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let config_path = Path::new(&config_file);
     let (config, config_loaded_from_disk) = if config_path.exists() {
         (AppConfig::load_from_file(config_path)?, true)
     } else {
