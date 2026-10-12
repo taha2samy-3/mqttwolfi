@@ -17,6 +17,7 @@ pub enum ConfigError {
 #[serde(default)]
 pub struct AppConfig {
     pub broker: BrokerSettings,
+    pub logging: LoggingConfig,
     pub listeners: ListenersConfig,
     pub security: SecurityConfig,
     pub mqtt: MqttSettings,
@@ -27,7 +28,6 @@ pub struct AppConfig {
 #[serde(default)]
 pub struct BrokerSettings {
     pub node_id: String,
-    pub log_level: String,
     pub max_connections: usize,
     pub worker_threads: usize,
 }
@@ -36,9 +36,30 @@ impl Default for BrokerSettings {
     fn default() -> Self {
         Self {
             node_id: "wolf-broker-node-01".into(),
-            log_level: "info".into(),
             max_connections: 100_000,
             worker_threads: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub format: String,
+    pub target: bool,
+    pub thread_ids: bool,
+    pub line_numbers: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".into(),
+            format: "pretty".into(),
+            target: true,
+            thread_ids: false,
+            line_numbers: false,
         }
     }
 }
@@ -103,6 +124,9 @@ pub struct WolfTlsConfig {
     pub verify_client_identity: bool,
     pub min_tls_version: String,
     pub ciphers: String,
+    pub alpn_protocols: Vec<String>,
+    pub psk_enabled: bool,
+    pub psk_identity_hint: String,
     pub session_tickets_enabled: bool,
     pub session_ticket_lifetime_sec: u32,
     pub hardware_crypto_engine: String,
@@ -117,9 +141,10 @@ impl Default for WolfTlsConfig {
             require_client_cert: true,
             verify_client_identity: false,
             min_tls_version: "TLSv1.3".into(),
-            ciphers:
-                "TLS13-AES128-GCM-SHA256,TLS13-AES256-GCM-SHA384,TLS13-CHACHA20-POLY1305-SHA256"
-                    .into(),
+            ciphers: "TLS13-AES128-GCM-SHA256,TLS13-AES256-GCM-SHA384,TLS13-CHACHA20-POLY1305-SHA256".into(),
+            alpn_protocols: vec!["mqtt".into()],
+            psk_enabled: false,
+            psk_identity_hint: "wolf-broker-psk".into(),
             session_tickets_enabled: true,
             session_ticket_lifetime_sec: 7200,
             hardware_crypto_engine: "none".into(),
@@ -233,13 +258,33 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // Validate log level
+        match self.logging.level.to_lowercase().as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" => {}
+            other => {
+                return Err(ConfigError::Validation(format!(
+                    "Invalid log level: '{other}'. Expected one of: trace, debug, info, warn, error"
+                )));
+            }
+        }
+
+        // Validate log format
+        match self.logging.format.to_lowercase().as_str() {
+            "pretty" | "compact" | "json" => {}
+            other => {
+                return Err(ConfigError::Validation(format!(
+                    "Invalid log format: '{other}'. Expected one of: pretty, compact, json"
+                )));
+            }
+        }
+
         if !self.mqtt.protocol.allow_v311 && !self.mqtt.protocol.allow_v500 {
             return Err(ConfigError::Validation(
                 "At least one MQTT protocol version (v3.1.1 or v5.0) must be enabled".into(),
             ));
         }
 
-        if self.listeners.tls.enabled {
+        if self.listeners.tls.enabled && !self.security.tls.psk_enabled {
             if self.security.tls.server_cert_file.is_empty() {
                 return Err(ConfigError::Validation(
                     "TLS listener is enabled, but server_cert_file is empty".into(),
@@ -294,11 +339,26 @@ mod tests {
         let path = "config/broker.toml";
         let config = AppConfig::load_from_file(path).expect("Failed to load broker.toml");
         assert_eq!(config.broker.node_id, "wolf-broker-node-01");
+        assert_eq!(config.logging.level, "info");
         assert!(config.listeners.tls.enabled);
         assert_eq!(config.listeners.tls.port, 8883);
         assert!(config.security.tls.require_client_cert);
         assert_eq!(config.security.tls.min_tls_version, "TLSv1.3");
         assert_eq!(config.mqtt.queues.queue_full_policy, "drop_oldest");
+    }
+
+    #[test]
+    fn test_validation_rejects_invalid_log_level() {
+        let mut config = AppConfig::default();
+        config.logging.level = "invalid_level".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_invalid_log_format() {
+        let mut config = AppConfig::default();
+        config.logging.format = "xml".into();
+        assert!(config.validate().is_err());
     }
 
     #[test]
