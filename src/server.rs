@@ -287,7 +287,7 @@ impl BrokerServer {
                                         reason_code: 0x02, // Identifier rejected
                                     };
                                     let mut ack_buf = BytesMut::new();
-                                    if connack.encode(&mut ack_buf).is_ok() {
+                                    if connack.encode_for_version(&mut ack_buf, conn.version).is_ok() {
                                         let _ = tx.send(ack_buf.freeze()).await;
                                     }
                                     break 'connection;
@@ -310,6 +310,7 @@ impl BrokerServer {
                                         is_connected = true;
                                         connected_client_id = conn.client_id.clone();
                                         client_keep_alive = conn.keep_alive_sec;
+                                        client_version = conn.version;
                                         current_user = Some(user);
                                         client_will = conn.will;
 
@@ -337,7 +338,7 @@ impl BrokerServer {
                                             reason_code: 0x00,
                                         };
                                         let mut ack_buf = BytesMut::new();
-                                        if connack.encode(&mut ack_buf).is_ok() {
+                                        if connack.encode_for_version(&mut ack_buf, client_version).is_ok() {
                                             let _ = tx.send(ack_buf.freeze()).await;
                                         }
                                     }
@@ -358,7 +359,7 @@ impl BrokerServer {
                                             reason_code,
                                         };
                                         let mut ack_buf = BytesMut::new();
-                                        if connack.encode(&mut ack_buf).is_ok() {
+                                        if connack.encode_for_version(&mut ack_buf, conn.version).is_ok() {
                                             let _ = tx.send(ack_buf.freeze()).await;
                                         }
                                         tokio::time::sleep(tokio::time::Duration::from_millis(10))
@@ -519,6 +520,24 @@ impl BrokerServer {
                                     continue;
                                 }
 
+                                // QoS 2: Prevent duplicate subscriber delivery on re-transmitted packets
+                                if pub_pkt.qos == QoS::ExactlyOnce {
+                                    if let Some(pid) = pub_pkt.packet_id {
+                                        if !inflight_qos2_pids.insert(pid) {
+                                            debug!(
+                                                "Duplicate QoS 2 packet #{} received from client #{}; acknowledging with PUBREC without re-dispatching",
+                                                pid, client_id
+                                            );
+                                            let pubrec = MqttPacket::PubRec { packet_id: pid };
+                                            let mut ack_buf = BytesMut::new();
+                                            if pubrec.encode(&mut ack_buf).is_ok() {
+                                                let _ = tx.send(ack_buf.freeze()).await;
+                                            }
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 // If retain flag is set, update retained messages store
                                 if pub_pkt.retain {
                                     let mut retained_guard = context.retained.write().await;
@@ -548,7 +567,12 @@ impl BrokerServer {
                                     let clients_guard = context.clients.read().await;
                                     for target_id in matched_ids {
                                         if let Some(target_tx) = clients_guard.get(&target_id) {
-                                            let _ = target_tx.try_send(frozen.clone());
+                                            if target_tx.try_send(frozen.clone()).is_err() {
+                                                warn!(
+                                                    "Slow consumer queue full (1024) on client #{}, dropping message on topic '{}'",
+                                                    target_id, pub_pkt.topic
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -577,6 +601,7 @@ impl BrokerServer {
                                 }
                             }
                             MqttPacket::PubRel { packet_id } => {
+                                inflight_qos2_pids.remove(&packet_id);
                                 let pubcomp = MqttPacket::PubComp { packet_id };
                                 let mut ack_buf = BytesMut::new();
                                 if pubcomp.encode(&mut ack_buf).is_ok() {
