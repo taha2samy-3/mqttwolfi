@@ -179,9 +179,28 @@ pub enum MqttPacket {
         packet_id: u16,
         return_codes: Vec<u8>,
     },
+    Unsubscribe {
+        packet_id: u16,
+        topics: Vec<String>,
+    },
+    UnsubAck {
+        packet_id: u16,
+    },
+    PubRec {
+        packet_id: u16,
+    },
+    PubRel {
+        packet_id: u16,
+    },
+    PubComp {
+        packet_id: u16,
+    },
 }
 
 impl MqttPacket {
+    /// Maximum allowed packet size (16 MB) to prevent resource exhaustion DoS
+    pub const MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
+
     /// Serializes an MQTT packet into an outgoing byte buffer.
     pub fn encode(&self, dst: &mut BytesMut) -> Result<(), PacketError> {
         match self {
@@ -213,6 +232,24 @@ impl MqttPacket {
             MqttPacket::PubAck { packet_id } => {
                 dst.put_u8(0x40); // PacketType::PubAck << 4
                 dst.put_u8(0x02); // Remaining Length = 2
+                dst.put_u16(*packet_id);
+                Ok(())
+            }
+            MqttPacket::PubRec { packet_id } => {
+                dst.put_u8(0x50); // PacketType::PubRec << 4
+                dst.put_u8(0x02);
+                dst.put_u16(*packet_id);
+                Ok(())
+            }
+            MqttPacket::PubRel { packet_id } => {
+                dst.put_u8(0x62); // PacketType::PubRel << 4, flags 0x02
+                dst.put_u8(0x02);
+                dst.put_u16(*packet_id);
+                Ok(())
+            }
+            MqttPacket::PubComp { packet_id } => {
+                dst.put_u8(0x70); // PacketType::PubComp << 4
+                dst.put_u8(0x02);
                 dst.put_u16(*packet_id);
                 Ok(())
             }
@@ -276,12 +313,20 @@ impl MqttPacket {
                 var_header.put_u8(connect_flags);
                 var_header.put_u16(conn.keep_alive_sec);
 
+                // MQTT v5.0 CONNECT variable header includes Properties (0 length here)
+                if conn.version == ProtocolVersion::V500 {
+                    var_header.put_u8(0x00);
+                }
+
                 // Payload: Client ID
                 var_header.put_u16(conn.client_id.len() as u16);
                 var_header.put_slice(conn.client_id.as_bytes());
 
                 // Payload: Will Topic & Will Message
                 if let Some(ref will) = conn.will {
+                    if conn.version == ProtocolVersion::V500 {
+                        var_header.put_u8(0x00); // 0 will properties
+                    }
                     var_header.put_u16(will.topic.len() as u16);
                     var_header.put_slice(will.topic.as_bytes());
                     var_header.put_u16(will.payload.len() as u16);
@@ -335,6 +380,28 @@ impl MqttPacket {
                 dst.put(var_header);
                 Ok(())
             }
+            MqttPacket::Unsubscribe { packet_id, topics } => {
+                let mut var_header = BytesMut::new();
+                var_header.put_u16(*packet_id);
+                for topic in topics {
+                    var_header.put_u16(topic.len() as u16);
+                    var_header.put_slice(topic.as_bytes());
+                }
+                dst.put_u8(0xA2); // Unsubscribe fixed header: type 10, reserved flags 0x02
+                encode_variable_byte_integer(var_header.len() as u32, dst)
+                    .map_err(|_| PacketError::MalformedHeader)?;
+                dst.put(var_header);
+                Ok(())
+            }
+            MqttPacket::UnsubAck { packet_id } => {
+                let mut var_header = BytesMut::new();
+                var_header.put_u16(*packet_id);
+                dst.put_u8(0xB0); // UnsubAck fixed header: type 11
+                encode_variable_byte_integer(var_header.len() as u32, dst)
+                    .map_err(|_| PacketError::MalformedHeader)?;
+                dst.put(var_header);
+                Ok(())
+            }
         }
     }
 
@@ -349,40 +416,69 @@ impl MqttPacket {
         let flags = first_byte & 0x0F;
         let packet_type = PacketType::try_from(packet_type_val)?;
 
-        let remaining_len =
-            decode_variable_byte_integer(src).map_err(|_| PacketError::MalformedHeader)? as usize;
+        let remaining_len = match decode_variable_byte_integer(src) {
+            Ok(len) => len as usize,
+            Err(crate::protocol::vbi::VbiError::IncompleteBuffer) => {
+                return Err(PacketError::BufferUnderflow);
+            }
+            Err(crate::protocol::vbi::VbiError::MalformedVbi) => {
+                return Err(PacketError::MalformedHeader);
+            }
+        };
+
+        if remaining_len > Self::MAX_PACKET_SIZE {
+            return Err(PacketError::MalformedHeader);
+        }
 
         if src.remaining() < remaining_len {
             return Err(PacketError::BufferUnderflow);
         }
 
+        // Frame the packet strictly to remaining_len bytes to prevent boundary overflows
+        let mut payload = src.copy_to_bytes(remaining_len);
+
         match packet_type {
-            PacketType::PingReq => Ok(MqttPacket::PingReq),
-            PacketType::PingResp => Ok(MqttPacket::PingResp),
-            PacketType::Disconnect => Ok(MqttPacket::Disconnect),
-            PacketType::Subscribe => {
-                if remaining_len < 3 {
+            PacketType::PingReq => {
+                if remaining_len != 0 {
                     return Err(PacketError::MalformedHeader);
                 }
-                let packet_id = src.get_u16();
+                Ok(MqttPacket::PingReq)
+            }
+            PacketType::PingResp => {
+                if remaining_len != 0 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                Ok(MqttPacket::PingResp)
+            }
+            PacketType::Disconnect => Ok(MqttPacket::Disconnect),
+            PacketType::Subscribe => {
+                if flags != 0x02 || remaining_len < 3 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = payload.get_u16();
+                if packet_id == 0 {
+                    return Err(PacketError::MalformedHeader);
+                }
                 let mut topics = Vec::new();
-                let mut bytes_left = remaining_len - 2;
 
-                while bytes_left > 0 {
-                    if src.remaining() < 2 {
-                        return Err(PacketError::BufferUnderflow);
+                while payload.has_remaining() {
+                    if payload.remaining() < 3 {
+                        return Err(PacketError::MalformedHeader);
                     }
-                    let topic_len = src.get_u16() as usize;
-                    if src.remaining() < topic_len + 1 {
-                        return Err(PacketError::BufferUnderflow);
+                    let topic_len = payload.get_u16() as usize;
+                    if payload.remaining() < topic_len + 1 {
+                        return Err(PacketError::MalformedHeader);
                     }
                     let mut topic_bytes = vec![0u8; topic_len];
-                    src.copy_to_slice(&mut topic_bytes);
+                    payload.copy_to_slice(&mut topic_bytes);
                     let topic =
                         String::from_utf8(topic_bytes).map_err(|_| PacketError::InvalidString)?;
-                    let qos = QoS::try_from(src.get_u8())?;
+                    let qos = QoS::try_from(payload.get_u8())?;
                     topics.push((topic, qos));
-                    bytes_left = bytes_left.saturating_sub(2 + topic_len + 1);
+                }
+
+                if topics.is_empty() {
+                    return Err(PacketError::MalformedHeader);
                 }
 
                 Ok(MqttPacket::Subscribe { packet_id, topics })
@@ -391,24 +487,59 @@ impl MqttPacket {
                 if remaining_len < 2 {
                     return Err(PacketError::MalformedHeader);
                 }
-                let packet_id = src.get_u16();
-                let codes_len = remaining_len - 2;
-                if src.remaining() < codes_len {
-                    return Err(PacketError::BufferUnderflow);
-                }
+                let packet_id = payload.get_u16();
+                let codes_len = payload.remaining();
                 let mut return_codes = vec![0u8; codes_len];
-                src.copy_to_slice(&mut return_codes);
+                payload.copy_to_slice(&mut return_codes);
                 Ok(MqttPacket::SubAck {
                     packet_id,
                     return_codes,
                 })
             }
+            PacketType::Unsubscribe => {
+                if flags != 0x02 || remaining_len < 3 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = payload.get_u16();
+                if packet_id == 0 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let mut topics = Vec::new();
+
+                while payload.has_remaining() {
+                    if payload.remaining() < 2 {
+                        return Err(PacketError::MalformedHeader);
+                    }
+                    let topic_len = payload.get_u16() as usize;
+                    if payload.remaining() < topic_len {
+                        return Err(PacketError::MalformedHeader);
+                    }
+                    let mut topic_bytes = vec![0u8; topic_len];
+                    payload.copy_to_slice(&mut topic_bytes);
+                    let topic =
+                        String::from_utf8(topic_bytes).map_err(|_| PacketError::InvalidString)?;
+                    topics.push(topic);
+                }
+
+                if topics.is_empty() {
+                    return Err(PacketError::MalformedHeader);
+                }
+
+                Ok(MqttPacket::Unsubscribe { packet_id, topics })
+            }
+            PacketType::UnsubAck => {
+                if remaining_len < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = payload.get_u16();
+                Ok(MqttPacket::UnsubAck { packet_id })
+            }
             PacketType::ConnAck => {
                 if remaining_len < 2 {
                     return Err(PacketError::MalformedHeader);
                 }
-                let ack_flags = src.get_u8();
-                let reason_code = src.get_u8();
+                let ack_flags = payload.get_u8();
+                let reason_code = payload.get_u8();
                 Ok(MqttPacket::ConnAck {
                     session_present: (ack_flags & 0x01) != 0,
                     reason_code,
@@ -418,39 +549,73 @@ impl MqttPacket {
                 if remaining_len < 2 {
                     return Err(PacketError::MalformedHeader);
                 }
-                let packet_id = src.get_u16();
+                let packet_id = payload.get_u16();
                 Ok(MqttPacket::PubAck { packet_id })
+            }
+            PacketType::PubRec => {
+                if remaining_len < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = payload.get_u16();
+                Ok(MqttPacket::PubRec { packet_id })
+            }
+            PacketType::PubRel => {
+                if flags != 0x02 || remaining_len < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = payload.get_u16();
+                Ok(MqttPacket::PubRel { packet_id })
+            }
+            PacketType::PubComp => {
+                if remaining_len < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = payload.get_u16();
+                Ok(MqttPacket::PubComp { packet_id })
             }
             PacketType::Publish => {
                 let dup = (flags & 0x08) != 0;
                 let qos = QoS::try_from((flags >> 1) & 0x03)?;
                 let retain = (flags & 0x01) != 0;
 
-                if src.remaining() < 2 {
-                    return Err(PacketError::BufferUnderflow);
+                if qos == QoS::AtMostOnce && dup {
+                    return Err(PacketError::MalformedHeader);
                 }
-                let topic_len = src.get_u16() as usize;
-                if src.remaining() < topic_len {
-                    return Err(PacketError::BufferUnderflow);
+
+                if payload.remaining() < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let topic_len = payload.get_u16() as usize;
+                if payload.remaining() < topic_len {
+                    return Err(PacketError::MalformedHeader);
                 }
                 let mut topic_bytes = vec![0u8; topic_len];
-                src.copy_to_slice(&mut topic_bytes);
+                payload.copy_to_slice(&mut topic_bytes);
                 let topic =
                     String::from_utf8(topic_bytes).map_err(|_| PacketError::InvalidString)?;
 
+                // Publish topic must not contain wildcard characters (+ or #)
+                if topic.contains('+') || topic.contains('#') {
+                    return Err(PacketError::MalformedHeader);
+                }
+
                 let packet_id = if qos != QoS::AtMostOnce {
-                    if src.remaining() < 2 {
-                        return Err(PacketError::BufferUnderflow);
+                    if payload.remaining() < 2 {
+                        return Err(PacketError::MalformedHeader);
                     }
-                    Some(src.get_u16())
+                    let pid = payload.get_u16();
+                    if pid == 0 {
+                        return Err(PacketError::MalformedHeader);
+                    }
+                    Some(pid)
                 } else {
                     None
                 };
 
                 let header_len = 2 + topic_len + if packet_id.is_some() { 2 } else { 0 };
-                let payload_len = remaining_len.saturating_sub(header_len);
-                let mut payload_vec = vec![0u8; payload_len];
-                src.copy_to_slice(&mut payload_vec);
+                if remaining_len < header_len {
+                    return Err(PacketError::MalformedHeader);
+                }
 
                 Ok(MqttPacket::Publish(PublishPacket {
                     topic,
@@ -458,69 +623,118 @@ impl MqttPacket {
                     retain,
                     dup,
                     packet_id,
-                    payload: Bytes::from(payload_vec),
+                    payload,
                 }))
             }
             PacketType::Connect => {
-                if src.remaining() < 2 {
-                    return Err(PacketError::BufferUnderflow);
+                if payload.remaining() < 2 {
+                    return Err(PacketError::MalformedHeader);
                 }
-                let proto_len = src.get_u16() as usize;
-                if src.remaining() < proto_len {
-                    return Err(PacketError::BufferUnderflow);
+                let proto_len = payload.get_u16() as usize;
+                if payload.remaining() < proto_len {
+                    return Err(PacketError::MalformedHeader);
                 }
                 let mut proto_name = vec![0u8; proto_len];
-                src.copy_to_slice(&mut proto_name);
+                payload.copy_to_slice(&mut proto_name);
                 if proto_name != b"MQTT" {
                     return Err(PacketError::InvalidProtocolName);
                 }
 
-                let version_byte = src.get_u8();
+                // Bounds check for protocol version (1), connect flags (1), keep_alive (2)
+                if payload.remaining() < 4 {
+                    return Err(PacketError::MalformedHeader);
+                }
+
+                let version_byte = payload.get_u8();
                 let version = ProtocolVersion::try_from(version_byte)?;
 
-                let connect_flags = src.get_u8();
+                let connect_flags = payload.get_u8();
+                if (connect_flags & 0x01) != 0 {
+                    // Reserved bit 0 must be 0
+                    return Err(PacketError::MalformedHeader);
+                }
+
                 let username_flag = (connect_flags & 0x80) != 0;
                 let password_flag = (connect_flags & 0x40) != 0;
                 let will_retain = (connect_flags & 0x20) != 0;
                 let will_qos_val = (connect_flags >> 3) & 0x03;
                 let will_flag = (connect_flags & 0x04) != 0;
                 let clean_start = (connect_flags & 0x02) != 0;
-                let keep_alive_sec = src.get_u16();
 
-                if src.remaining() < 2 {
-                    return Err(PacketError::BufferUnderflow);
+                if !will_flag && (will_retain || will_qos_val != 0) {
+                    return Err(PacketError::MalformedHeader);
                 }
-                let client_id_len = src.get_u16() as usize;
-                if src.remaining() < client_id_len {
-                    return Err(PacketError::BufferUnderflow);
+                if will_qos_val == 3 {
+                    return Err(PacketError::InvalidQoS(3));
+                }
+                if password_flag && !username_flag {
+                    return Err(PacketError::MalformedHeader);
+                }
+
+                let keep_alive_sec = payload.get_u16();
+
+                // If MQTT v5.0, parse/skip CONNECT properties
+                if version == ProtocolVersion::V500 {
+                    if !payload.has_remaining() {
+                        return Err(PacketError::MalformedHeader);
+                    }
+                    let props_len = decode_variable_byte_integer(&mut payload)
+                        .map_err(|_| PacketError::MalformedHeader)? as usize;
+                    if payload.remaining() < props_len {
+                        return Err(PacketError::MalformedHeader);
+                    }
+                    payload.advance(props_len);
+                }
+
+                if payload.remaining() < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let client_id_len = payload.get_u16() as usize;
+                if payload.remaining() < client_id_len {
+                    return Err(PacketError::MalformedHeader);
                 }
                 let mut client_id_bytes = vec![0u8; client_id_len];
-                src.copy_to_slice(&mut client_id_bytes);
+                payload.copy_to_slice(&mut client_id_bytes);
                 let client_id =
                     String::from_utf8(client_id_bytes).map_err(|_| PacketError::InvalidString)?;
 
                 let will = if will_flag {
                     let will_qos = QoS::try_from(will_qos_val)?;
-                    if src.remaining() < 2 {
-                        return Err(PacketError::BufferUnderflow);
+                    if version == ProtocolVersion::V500 {
+                        if !payload.has_remaining() {
+                            return Err(PacketError::MalformedHeader);
+                        }
+                        let will_props_len = decode_variable_byte_integer(&mut payload)
+                            .map_err(|_| PacketError::MalformedHeader)? as usize;
+                        if payload.remaining() < will_props_len {
+                            return Err(PacketError::MalformedHeader);
+                        }
+                        payload.advance(will_props_len);
                     }
-                    let topic_len = src.get_u16() as usize;
-                    if src.remaining() < topic_len {
-                        return Err(PacketError::BufferUnderflow);
+
+                    if payload.remaining() < 2 {
+                        return Err(PacketError::MalformedHeader);
+                    }
+                    let topic_len = payload.get_u16() as usize;
+                    if payload.remaining() < topic_len {
+                        return Err(PacketError::MalformedHeader);
                     }
                     let mut topic_bytes = vec![0u8; topic_len];
-                    src.copy_to_slice(&mut topic_bytes);
+                    payload.copy_to_slice(&mut topic_bytes);
                     let topic =
                         String::from_utf8(topic_bytes).map_err(|_| PacketError::InvalidString)?;
+                    if topic.contains('+') || topic.contains('#') {
+                        return Err(PacketError::MalformedHeader);
+                    }
 
-                    if src.remaining() < 2 {
-                        return Err(PacketError::BufferUnderflow);
+                    if payload.remaining() < 2 {
+                        return Err(PacketError::MalformedHeader);
                     }
-                    let payload_len = src.get_u16() as usize;
-                    if src.remaining() < payload_len {
-                        return Err(PacketError::BufferUnderflow);
+                    let will_payload_len = payload.get_u16() as usize;
+                    if payload.remaining() < will_payload_len {
+                        return Err(PacketError::MalformedHeader);
                     }
-                    let payload = src.copy_to_bytes(payload_len);
+                    let will_payload = payload.copy_to_bytes(will_payload_len);
 
                     Some(PublishPacket {
                         topic,
@@ -528,36 +742,36 @@ impl MqttPacket {
                         retain: will_retain,
                         dup: false,
                         packet_id: None,
-                        payload,
+                        payload: will_payload,
                     })
                 } else {
                     None
                 };
 
                 let username = if username_flag {
-                    if src.remaining() < 2 {
-                        return Err(PacketError::BufferUnderflow);
+                    if payload.remaining() < 2 {
+                        return Err(PacketError::MalformedHeader);
                     }
-                    let u_len = src.get_u16() as usize;
-                    if src.remaining() < u_len {
-                        return Err(PacketError::BufferUnderflow);
+                    let u_len = payload.get_u16() as usize;
+                    if payload.remaining() < u_len {
+                        return Err(PacketError::MalformedHeader);
                     }
                     let mut u_bytes = vec![0u8; u_len];
-                    src.copy_to_slice(&mut u_bytes);
+                    payload.copy_to_slice(&mut u_bytes);
                     Some(String::from_utf8(u_bytes).map_err(|_| PacketError::InvalidString)?)
                 } else {
                     None
                 };
 
                 let password = if password_flag {
-                    if src.remaining() < 2 {
-                        return Err(PacketError::BufferUnderflow);
+                    if payload.remaining() < 2 {
+                        return Err(PacketError::MalformedHeader);
                     }
-                    let p_len = src.get_u16() as usize;
-                    if src.remaining() < p_len {
-                        return Err(PacketError::BufferUnderflow);
+                    let p_len = payload.get_u16() as usize;
+                    if payload.remaining() < p_len {
+                        return Err(PacketError::MalformedHeader);
                     }
-                    Some(src.copy_to_bytes(p_len))
+                    Some(payload.copy_to_bytes(p_len))
                 } else {
                     None
                 };
@@ -574,6 +788,7 @@ impl MqttPacket {
             }
             _ => Err(PacketError::InvalidPacketType(packet_type_val)),
         }
+    }
     }
 }
 
