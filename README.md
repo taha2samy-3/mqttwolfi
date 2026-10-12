@@ -3,201 +3,220 @@
 </p>
 
 <p align="center">
-  <strong>The Guarded Pack: Ultra-Secure, High-Performance MQTT v3.1.1 & v5.0 Broker written in Rust with wolfSSL Integration</strong>
+  <strong>Lightweight, Memory-Safe MQTT v3.1.1 & v5.0 Broker written in Rust with wolfSSL / TLS 1.3 mTLS Support</strong>
 </p>
 
 <p align="center">
+  <a href="#project-status--architectural-matrix">Status Matrix</a> •
   <a href="#about-wolfimq">About</a> •
-  <a href="#features">Features</a> •
-  <a href="#benchmarks--performance">Benchmarks</a> •
-  <a href="#quick-start">Quick Start</a> •
+  <a href="#tls--cryptography-architecture">TLS Architecture</a> •
+  <a href="#benchmarks--methodology">Benchmarks</a> •
+  <a href="#security--access-control">Security & RBAC</a> •
   <a href="#configuration">Configuration</a> •
-  <a href="#testing--ci">Testing & CI</a>
+  <a href="#testing--ci">Testing & CI</a> •
+  <a href="#license--governance">License</a>
 </p>
+
+---
+
+## Project Status & Architectural Matrix
+
+> ⚠️ **Development Stage Notice:** WolfiMQ is an emerging, active-development open-source MQTT broker engine written in Rust. It provides clean protocol codecs, in-memory topic routing, bounded session queues with backpressure, role-based access control, and TLS 1.3 / mTLS mutual authentication. It is **in early-stage development** and is **not yet a distributed cluster** or disk-persistent broker like EMQX or Mosquitto with storage plugins. The matrix below outlines currently verified capabilities versus roadmap items.
+
+### Feature Implementation Matrix
+
+| Category | Capability / Feature | Status | Notes & Verification |
+| :--- | :--- | :---: | :--- |
+| **Transport** | TCP Listener (Plaintext) | ✅ Implemented | Asynchronous Tokio TCP server on configurable host/port |
+| **Transport** | TLS 1.3 / 1.2 Listener (mTLS) | ✅ Implemented | Full mutual authentication, ALPN (`mqtt`), verified in [`tests/test_tls_e2e.rs`](tests/test_tls_e2e.rs) |
+| **MQTT 3.1.1** | CONNECT, CONNACK, PINGREQ, DISCONNECT | ✅ Implemented | Conformance verified across v3.1.1 test suites |
+| **MQTT 3.1.1** | PUBLISH & PUBACK (QoS 0 & QoS 1) | ✅ Implemented | Bounded queues, client delivery, acknowledgments |
+| **MQTT 3.1.1** | Retained Messages | ✅ Implemented | O(1) exact hash match, late subscriber delivery, empty-payload deletion |
+| **MQTT 3.1.1** | Last Will & Testament (LWT) | ✅ Implemented | Triggered on abnormal socket collapse, cancelled on clean DISCONNECT |
+| **MQTT 5.0** | Basic v5 Wire Codecs & Reason Codes | ✅ Implemented | Connect protocol negotiation and v5 packet framing |
+| **MQTT 5.0** | User Properties & Session Expiry Interval | 📋 Planned | Struct fields & wire properties on active development roadmap |
+| **MQTT 5.0** | Topic Aliases & Subscription Options | 📋 Planned | Compression and `NoLocal` / `RetainAsPublished` flags on roadmap |
+| **QoS Levels** | QoS 0 (At most once) & QoS 1 (At least once)| ✅ Implemented | Fully tested and verified |
+| **QoS Levels** | QoS 2 (Exactly once: PUBREC, PUBREL, PUBCOMP)| 📋 Planned | Multi-step handshake state machine on roadmap |
+| **Routing** | Topic Trie (`+` and `#` wildcards) | ✅ Implemented | Trie lookup matching industrial topic hierarchies |
+| **Queues** | Bounded Backpressure & Drop Policies | ✅ Implemented | Bounded message/byte queues with `drop_oldest` and `drop_newest` |
+| **Security** | Argon2id Password Hashing | ✅ Implemented | Memory-hard password verification via `argon2` crate with SHA-256 fallback |
+| **Security** | Role-Based Access Control (RBAC) & Rooms | ✅ Implemented | Dynamic macros (`%u`, `%c`, `%r`), room isolation, declarative [`config/acl.conf`](config/acl.conf) |
+| **Security** | Subject CN / SAN ClientID Binding | 📋 Planned | Strict certificate Common Name binding to MQTT `ClientID` |
+| **Persistence**| In-Memory Session & Retained Storage | ✅ Implemented | Concurrent `RwLock` and `Arc` data structures |
+| **Persistence**| Disk Storage (SQLite / RocksDB) | 📋 Planned | Pluggable persistence engine on architectural roadmap |
+| **Clustering** | High-Availability Distributed Clustering | 📋 Planned | Raft / Gossip clustering planned for multi-node deployments |
 
 ---
 
 ## About WolfiMQ
 
-**WolfiMQ** is an industrial-grade, cloud & edge MQTT broker engine designed for mission-critical IoT ecosystems. By combining the zero-cost memory safety of **Rust** with the battle-tested, lightweight cryptographic rigor of **wolfSSL**, WolfiMQ delivers maximum throughput with unbreakable security.
+**WolfiMQ** (`wolf-mqtt-broker`) is a lightweight, modular MQTT broker engine engineered with **Rust** and designed for secure messaging in modern IoT and edge environments.
 
-- **Brand Motif:** *The Guarded Pack* — Like a coordinated wolfpack safeguarding its territory, WolfiMQ orchestrates distributed pub/sub messaging while defending network boundaries with strict TLS 1.3 mutual authentication (mTLS).
+- **Clean Async Core:** Built on Tokio and `bytes::Bytes` for minimal payload copying during pub/sub fan-out.
+- **Defensive Resource Controls:** Explicitly bounded client session queues with configurable drop policies to prevent out-of-memory crashes from slow consumers.
+- **Multi-Level Topic Routing:** Radix Topic Trie supporting single-level (`+`) and multi-level (`#`) wildcards.
+- **Virtual Rooms & Declarative ACLs:** Topic templating using dynamic substitution (`%u` username, `%c` client ID, `%r` room) for secure multi-tenant partitioning.
 
 ---
 
-## Benchmarks & Performance
+## TLS & Cryptography Architecture
 
-WolfiMQ includes an automated, high-precision benchmarking suite ([`benches/bench_throughput.rs`](benches/bench_throughput.rs)) running under an optimized release profile.
+WolfiMQ provides transport security designed for secure IoT deployments:
 
-### Multi-Dimensional Empirical Performance Metrics:
+1. **Rust-Native TLS Engine:**
+   - Powered by `tokio-rustls`, `rustls-pki-types`, and `rustls-pemfile`.
+   - Supports **TLS 1.3** and **TLS 1.2** with mandatory or optional Mutual TLS (mTLS).
+   - Enforces **Application-Layer Protocol Negotiation (ALPN)** for `"mqtt"`.
+   - Automated End-to-End integration test in [`tests/test_tls_e2e.rs`](tests/test_tls_e2e.rs) validates client and server certificate verification, handshake negotiation, and encrypted pub/sub exchange.
 
-WolfiMQ's performance is benchmarked across 12 distinct dimensions measuring raw packet processing, network bandwidth scaling, dynamic churn, and socket latency:
+2. **wolfSSL Feature Hooks & FIPS Packaging:**
+   - Cargo feature flags `wolfssl` and `wolfssl-fips` provide integration targets for linking against the native C wolfSSL library and FIPS 140-2/3 validated cryptographic module.
+   - Cross-compilation scripts and GitHub Actions workflows are provided in [`.github/workflows/release.yml`](.github/workflows/release.yml) for Linux AMD64 and ARM64.
 
-#### 1. Core Throughput & Routing Metrics
-| Benchmark Target | Workload Scale | Measured Throughput | Latency | Assessment |
+> ⚖️ **wolfSSL Licensing Notice:** wolfSSL is dual-licensed under GPLv2 or a commercial license. When compiling or distributing binaries linked directly with native wolfSSL C libraries, ensure compliance with the appropriate wolfSSL licensing requirements. Consult [SECURITY.md](SECURITY.md) for details.
+
+---
+
+## Benchmarks & Methodology
+
+WolfiMQ includes an automated empirical benchmark suite in [`benches/bench_throughput.rs`](benches/bench_throughput.rs).
+
+### Transparent Methodology & Nomenclature
+- **Compiler Dead-Code Prevention:** All benchmark loops pass inputs and outputs through `std::hint::black_box` to prevent LLVM from optimizing away operations in release mode.
+- **Trie Match Rate vs Network Delivery:** In-memory routing benchmarks measure **subscriber-matches/sec** within the topic trie, distinct from live socket transmissions.
+- **Lock Contention Under Active Writers:** Multi-threaded concurrency benchmarks run with **7 concurrent reader threads and 1 active writer thread** continuously updating subscriptions to measure genuine `RwLock` contention.
+- **Pipelined Loopback Streaming:** TCP loopback tests measure pipelined socket throughput over the local OS networking stack, not multi-hop WAN network RTT.
+- **Retained Store Queries:** Both direct hash fast-path lookup ($O(1)$) and linear wildcard scan are tested and disclosed below.
+
+### Empirical Micro-Benchmark Results
+
+*Hardware Environment: Linux x86_64, Rust 1.80+, Release Profile (`opt-level = 3`, `lto = "fat"`, `codegen-units = 1`):*
+
+#### 1. Core Codec & In-Memory Routing Metrics
+| Benchmark Target | Workload Scale | Throughput | Mean Latency / Op | Description & Methodology |
 | :--- | :--- | :--- | :--- | :--- |
-| **VBI Integer Encoding** | 2,000,000 iterations | **24.41M ops/sec** | **40.96 ns / op** | Ultra-fast integer compaction |
-| **VBI Integer Decoding** | 2,000,000 iterations | **> 30,000,000,000 ops/sec** | **< 1.00 ns / op** | Zero-copy in-register decode |
-| **Topic Trie Wildcard Match** | 1,000,000 queries | **4.93M queries/sec** | **202.93 ns / query** | Multi-level (`#`) & single (`+`) matching |
-| **Deep Hierarchy (10 Levels)** | 500,000 queries | **1.03M queries/sec** | **971.08 ns / query** | Extreme topic depth with multi-wildcards |
-| **Dynamic Topic Subscription** | 300,000 ops | **1.78M ops/sec** | **562.55 ns / op** | Real-time dynamic topic registration |
-| **Dynamic Topic Unsubscription** | 300,000 ops | **2.07M ops/sec** | **482.95 ns / op** | High-frequency subscription cancellation |
-| **Concurrent Fan-Out Routing** | 100 subs, 300K msgs | **213,006 msgs/sec** | — | **21.30M message deliveries/sec** |
-| **Multi-Thread Contention (8T)** | 8 threads, 400K msgs | **1.23M msgs/sec** | — | **61.48M message deliveries/sec** |
-| **Live TCP Loopback Network** | 5,000 TCP socket msgs | **85,761 msgs/sec** | **11.66 µs / msg** | Full OS socket loopback exchange |
-| **Retained Store Ingestion** | 100,000 updates | **4.59M updates/sec** | **218.06 ns / op** | Real-time retained topic indexing |
-| **Retained Store Fast Query** | 100,000 queries | **9.45M queries/sec** | **105.83 ns / op** | $O(1)$ accelerated direct hash lookup |
+| **VBI Integer Encoding** | 2,000,000 iterations | **4.62M ops/sec** | `216.43 ns / op` | Bit-packing integer compaction |
+| **VBI Integer Decoding** | 2,000,000 iterations | **12.27M ops/sec** | `81.49 ns / op` | Multi-byte decoding (`black_box` protected) |
+| **Topic Trie Wildcard Match** | 1,000,000 queries | **597.7K queries/sec** | `1,672.91 ns / query` | Multi-level (`#`) and single (`+`) hierarchy matches |
+| **Deep Topic Hierarchy (10 Levels)** | 500,000 queries | **120.2K queries/sec** | `8,319.70 ns / query` | 10-level nested hierarchy with branch exploration |
+| **Dynamic Subscription Churn** | 300,000 ops | **436.3K ops/sec** | `2,291.78 ns / op` | Real-time topic registration |
+| **Dynamic Unsubscription Churn** | 300,000 ops | **477.0K ops/sec** | `2,096.45 ns / op` | Topic cancellation & node cleanup |
+| **Fan-Out Matching Pipeline** | 100 subs, 300K msgs | **20.25K queries/sec** | — | **2.02M subscriber-matches/sec** |
+| **Multi-Thread Contention (7R + 1W)** | 8 threads, 350K ops | **112.2K queries/sec** | — | **5.61M matches/sec** under reader/writer lock stress |
+| **Retained Store Ingestion** | 5,000 stored topics | **1.59M updates/sec** | `625.85 ns / op` | In-memory retained topic indexing |
+| **Retained Store Exact Match ($O(1)$)**| 100,000 queries | **1.82M queries/sec** | `546.82 ns / op` | Direct hash lookup on exact topic path |
+| **Retained Store Wildcard Scan** | 10,000,000 matches | **95.68 queries/sec** | `10.45 ms / query` | Full store traversal matching wildcard filters |
+| **TCP Loopback Network Streaming** | 5,000 socket msgs | **42,758 msgs/sec** | `23.39 µs / msg` | Asynchronous Tokio TCP socket streaming |
 
-#### 2. Payload Scaling & Raw Data Bandwidth Throughput
-| Payload Size | Iterations | Encode Speed | Decode Speed | Bandwidth Throughput |
+#### 2. Payload Scaling & Codec Bandwidth Throughput
+| Payload Size | Iterations | Encode Speed | Decode Speed | Effective Wire Bandwidth |
 | :--- | :--- | :--- | :--- | :--- |
-| **64 Bytes** | 500,000 pkts | 3.59M pkts/sec | 4.06M pkts/sec | **219.27 MB/s** |
-| **512 Bytes** | 300,000 pkts | 1.81M pkts/sec | 2.87M pkts/sec | **883.24 MB/s** |
-| **1 KB** | 250,000 pkts | 1.29M pkts/sec | 2.46M pkts/sec | **1,259.02 MB/s (1.26 GB/s)** |
-| **16 KB** | 50,000 pkts | 101.1K pkts/sec | 531.5K pkts/sec | **1,580.60 MB/s (1.58 GB/s)** |
-| **64 KB** | 15,000 pkts | 28.0K pkts/sec | 157.5K pkts/sec | **1,752.92 MB/s (1.75 GB/s)** |
-| **256 KB** | 4,000 pkts | 7.19K pkts/sec | 36.9K pkts/sec | **1,798.30 MB/s (1.80 GB/s)** |
+| **64 Bytes** | 500,000 pkts | 1.36M pkts/sec | 2.51M pkts/sec | **83.60 MB/s** |
+| **512 Bytes** | 300,000 pkts | 1.00M pkts/sec | 1.75M pkts/sec | **489.54 MB/s** |
+| **1 KB** | 250,000 pkts | 813.4K pkts/sec | 1.61M pkts/sec | **794.35 MB/s** |
+| **16 KB** | 50,000 pkts | 121.4K pkts/sec | 631.7K pkts/sec | **1,897.51 MB/s (1.89 GB/s)** |
+| **64 KB** | 15,000 pkts | 31.1K pkts/sec | 100.2K pkts/sec | **1,948.46 MB/s (1.94 GB/s)** |
+| **256 KB** | 4,000 pkts | 8.56K pkts/sec | 45.9K pkts/sec | **2,142.47 MB/s (2.14 GB/s)** |
 
-#### 3. High-Precision Latency Distribution (100,000 Transactions):
-| Metric | Nanoseconds | Microseconds | Assessment |
-| :--- | :--- | :--- | :--- |
-| **Mean Latency** | 2,867.08 ns | **2.87 µs** | Ultra-responsive event loop |
-| **p50 (Median)** | 2,402 ns | **2.40 µs** | Half of all requests complete in ~2.4µs |
-| **p90** | 3,805 ns | **3.81 µs** | Consistent execution under sustained pressure |
-| **p95** | 5,170 ns | **5.17 µs** | Flat tail latency |
-| **p99** | 15,345 ns | **15.35 µs** | 99% of messages processed in under 16µs |
-| **p99.9** | 26,424 ns | **26.42 µs** | Three-nines predictability |
-| **Max Tail Latency** | 268,670 ns | **268.67 µs** | Deterministic sub-millisecond ceiling |
+#### 3. End-to-End Latency Percentiles (100,000 Iteration Loop)
+| Percentile | Latency (µs) | Methodology & Interpretation |
+| :--- | :--- | :--- |
+| **Mean Latency** | **30.73 µs** | Average decode $\rightarrow$ route $\rightarrow$ encode execution |
+| **p50 (Median)** | **26.69 µs** | 50% of transactions complete in under 27 µs |
+| **p90** | **41.33 µs** | 90% of transactions complete in under 42 µs |
+| **p95** | **53.93 µs** | 95% of transactions complete in under 54 µs |
+| **p99** | **80.83 µs** | 99% of transactions complete in under 81 µs |
+| **p99.9** | **171.72 µs** | Tail latency under local memory pressure |
+| **Max Latency** | **1,955.82 µs** | Maximum OS scheduling tail |
 
-To reproduce these benchmarks locally:
+To run the benchmark suite locally:
 ```bash
 task bench
 ```
 
-### 🔒 Empirical MQTT over TLS 1.3 / mTLS High-Load Benchmark
-
-WolfiMQ features automated side-by-side benchmarking against other brokers (such as Eclipse Mosquitto) with **full TLS 1.3 encryption activated** on loopback sockets across multiple concurrency profiles:
-
-| Workload Profile | Concurrency | Cryptographic Engine | TLS Handshake | Throughput (msgs/sec) | Bandwidth | Mean Latency | p99 Latency |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Single-Client Baseline** | 1 client | wolfSSL / TLS 1.3 | `64.08 ms` | **75,767 msgs/sec** | `9.25 MB/s` | `13.20 µs` | `23.76 µs` |
-| **High-Load Concurrent** | 8 clients | wolfSSL / TLS 1.3 | `64.97 ms` | **157,583 msgs/sec** | `19.24 MB/s` | `14.07 ms` | `52.78 ms` |
-| **Extreme Multi-Client** | 16 clients | wolfSSL / TLS 1.3 | `69.38 ms` | **211,883 msgs/sec** | `25.86 MB/s` | `22.91 ms` | `61.68 ms` |
-| **Mosquitto (Comparative)** | 8 clients | OpenSSL / TLS 1.3 | *Automated in CI* | *Automated in CI* | *Automated in CI* | *Automated in CI* | *Automated in CI* |
-
-To run the TLS benchmarks locally:
+To run encrypted TLS 1.3 benchmarks:
 ```bash
-# Run WolfiMQ TLS benchmark with 8 concurrent clients (10,000 messages)
 task bench:tls
-
-# Run extreme 16-client TLS stress benchmark (16,000 messages)
-task bench:tls:stress
-
-# Run comparative TLS benchmark against local Mosquitto
-task bench:tls:compare
 ```
 
 ---
 
-## Features
+## Security & Access Control
 
-- **Dynamic Topic Patterns & Virtual Rooms:**
-  - Dynamic pattern substitution macros: `%u` (username), `%c` (ClientID), and `%r` (room expansion across authorized memberships).
-  - Virtual room scoping (`rooms/%r/chat`, `rooms/%r/presence`, `rooms/%r/announcements`, `rooms/%r/admin/control`) with total cross-room cryptographic isolation.
-  - Granular permission matrix: `Read`, `Write`, `ReadWrite`, and immediate-precedence `Deny` rules.
-- **Role-Based Access Control (RBAC) & Credential Engine:**
-  - Multi-tier roles: `Admin` (universal `#`), `Moderator` (`rooms/%r/#`), `Member` (chat/presence pub, announcement sub), `Viewer` (read-only chat/announcements), and `Device` (strictly scoped to `devices/%c/telemetry`).
-  - SHA-256 hashed password verification and declarative ACL rule loading ([`config/acl.conf`](config/acl.conf)).
-- **Dual Protocol Interoperability:** Zero-overhead translation and routing between **MQTT v3.1.1** and **MQTT v5.0** clients.
-- **Retained Message Store:** Persistent in-memory storage with O(1) query acceleration and OASIS-compliant empty-payload erasure.
-- **Last Will & Testament (LWT):** Automatic LWT broadcast upon abnormal socket termination, cancelled upon clean `DISCONNECT`.
-- **wolfSSL Cryptographic Engine:**
-  - TLS 1.3 / 1.2 with strict Mutual TLS (mTLS) client certificate verification.
-  - **Pre-Shared Key (PSK):** Symmetric-key authentication for resource-constrained microcontrollers without NTP or certificate parsing.
-  - **ALPN Support:** Negotiates protocol ID `"mqtt"` over port 8883 or multiplexed port 443.
-  - **Session Tickets (0-RTT):** Low-latency reconnects without full handshake overhead.
-- **Backpressure & Slow Consumer Protection:**
-  - Bounded client session queues (`max_queued_messages`, `max_queued_bytes`).
-  - Configurable drop policies (`drop_oldest`, `drop_newest`, `reject_publisher`) preventing Out-Of-Memory crashes.
-- **Structured Observability:**
-  - Configurable log levels (`trace`, `debug`, `info`, `warn`, `error`).
-  - Output formats: `pretty` (developer console), `compact`, and `json` (cloud telemetry).
-- **Rigorously Tested:** **48 test suites** passing across unit, integration, conformance, LWT, retained store, live TCP socket multi-client E2E, and room ACL security tests.
+WolfiMQ implements multi-layered security controls:
+
+- **Argon2id Password Hashing:** Uses standard PHC format (`$argon2id$...`) with per-password OS salt generated via `rand_core::OsRng`. Legacy SHA-256 hashes are supported for low-power embedded clients.
+- **Config Validation & Numerical Sanity:** The broker checks numerical relationships on startup:
+  - `max_packet_size <= max_queued_bytes` is strictly enforced to prevent buffer overflow anomalies.
+  - Listeners and authentication algorithms are validated before opening network ports.
+- **Granular RBAC & Room Isolation:**
+  - Dynamic pattern substitution macros: `%u` (username), `%c` (ClientID), and `%r` (room membership).
+  - Virtual room scoping (`rooms/%r/chat`, `rooms/%r/presence`, `rooms/%r/announcements`, `rooms/%r/admin/control`).
+  - Precedence order: explicit `Deny` rules override general permissions immediately.
 
 ---
 
 ## Quick Start
 
-### 1. Prerequisites (Managed via `mise`)
-- Rust 1.99+
-- Go-Task (`task`)
+### 1. Prerequisites
+- **Rust:** 1.80+ (managed via `mise` or `rustup`)
+- **Task:** `task` runner (`go-task`)
 
-### 2. Available Task Commands
+### 2. Available Commands
 ```bash
-# Display all tasks
-task
-
-# Run full CI validation pipeline locally (Format + Check + Lint + 40 Tests + Benchmarks)
+# Run CI pipeline (format check, clippy lint, all tests)
 task ci
 
-# Run all test suites
-task test
+# Run all 49 test suites (unit + integration + TLS + ACL)
+task test:all
 
-# Run live TCP socket End-to-End network tests
+# Run live TCP socket E2E integration tests
 task test:e2e
 
-# Run performance benchmarks in release mode
+# Run performance benchmarks
 task bench
 
-# Run TLS 1.3 encrypted throughput and latency benchmarks
-task bench:tls
-
-# Run comparative TLS benchmark against other brokers (e.g. Mosquitto)
-task bench:tls:compare
-
-# Generate mTLS test PKI certificates
+# Generate local test PKI certificates for mTLS
 task certs:gen
 
-# Build optimized release binary (standard wolfSSL TLS 1.3)
+# Build optimized release binary
 task build:release
-
-# Build optimized release binary with wolfSSL FIPS 140-2/3 Module
-task build:release:fips
-
-# Package complete release distribution archive locally
-task package:release
 ```
 
-### 📦 Multi-Architecture Releases (AMD64 & ARM64)
+### 3. Container Deployment (Docker)
+A production multi-stage [Dockerfile](Dockerfile) is provided:
+```bash
+# Build Docker image
+docker build -t wolf-mqtt-broker:latest .
 
-WolfiMQ provides automated multi-platform continuous release packaging via [`.github/workflows/release.yml`](.github/workflows/release.yml):
-- **Linux AMD64 (`x86_64`)**: Standard wolfSSL TLS 1.3 & wolfSSL FIPS 140-2/3 Validated Cryptography
-- **Linux ARM64 (`aarch64`)**: Standard wolfSSL TLS 1.3 & wolfSSL FIPS 140-2/3 Validated Cryptography
-- Every release includes verified `SHA256SUMS.txt`, standard configurations, scripts, and full documentation.
+# Run container with mounted configuration
+docker run -d -p 1883:1883 -p 8883:8883 \
+  -v $(pwd)/config:/etc/wolf-mqtt-broker:ro \
+  wolf-mqtt-broker:latest
+```
 
 ---
 
-## Configuration & Operational Control
- 
-WolfiMQ provides declarative TOML configuration, dynamic CLI overrides, access control lists, and kernel tuning options.
- 
-> 📖 **Full Reference Manual:** For an exhaustive guide to every setting, access control list syntax, Linux production tuning, and Systemd deployment, consult the **[Configuration & Operational Control Guide](docs/CONFIGURATION_AND_CONTROL.md)**.
- 
-Edit [`config/broker.toml`](config/broker.toml) to configure runtime behavior:
- 
+## Configuration
+
+Edit [`config/broker.toml`](config/broker.toml) to configure server properties:
+
 ```toml
 [broker]
 node_id = "wolfimq-node-01"
 max_connections = 100000
- 
-[logging]
-level = "info"
-format = "pretty"
- 
+
+[listeners.tcp]
+enabled = true
+bind_address = "127.0.0.1"   # Plaintext recommended for internal loopback only
+port = 1883
+
 [listeners.tls]
 enabled = true
+bind_address = "0.0.0.0"     # TLS recommended for external interfaces
 port = 8883
- 
+
 [security.tls]
 ca_cert_file = "certs/ca-cert.pem"
 server_cert_file = "certs/server-cert.pem"
@@ -205,33 +224,42 @@ server_key_file = "certs/server-key.pem"
 require_client_cert = true
 min_tls_version = "TLSv1.3"
 alpn_protocols = ["mqtt"]
- 
+
+[security.auth]
+allow_anonymous = false
+password_hash_algorithm = "argon2id"
+acl_file = "config/acl.conf"
+
+[mqtt.protocol]
+max_packet_size = 4194304    # 4 MB
+
 [mqtt.queues]
 max_queued_messages = 5000
+max_queued_bytes = 8388608   # 8 MB (must be >= max_packet_size)
 queue_full_policy = "drop_oldest"
 ```
- 
-Launch with custom configuration:
-```bash
-# Load specific configuration file
-wolf-mqtt-broker --config /path/to/custom_broker.toml
-```
+
+> 📖 Consult the **[Configuration & Operational Control Guide](docs/CONFIGURATION_AND_CONTROL.md)** for exhaustive details on every setting, Linux kernel tuning, and Systemd service management.
 
 ---
 
 ## Testing & CI Suite
 
-WolfiMQ enforces a strict testing pipeline in GitHub Actions with **40 automated tests**:
-* **25 Unit Tests:** Parsing, variable byte integers, topic trie wildcards, unsubscriptions, retained storage, and configuration validation.
-* **4 Protocol Conformance Tests:** Multi-version CONNECT handling, QoS matrix validation, packet recovery, and hierarchy isolation.
-* **2 Backpressure Tests:** Slow consumer queues validating `drop_oldest` and `drop_newest` policies.
-* **2 Retained Lifecycle Tests:** Validating delivery to late subscribers and deletion on zero-length payloads.
-* **2 LWT Lifecycle Tests:** Validating LWT firing on socket collapse and cancellation on clean `DISCONNECT`.
-* **1 Multi-Client Fanout Test:** 8 concurrent TCP clients receiving simultaneous live broadcast messages over loopback sockets.
-* **4 Live TCP Socket E2E Tests:** Real TCP client socket message exchanges and Ping/Pong on ephemeral ports.
-
+WolfiMQ validates stability across **49 automated test cases**:
+- **29 Unit Tests:** Packet codecs, variable-byte integers, Argon2id hashing, Topic Trie matching, retained storage, and configuration validation.
+- **4 Protocol Conformance Tests:** Multi-version CONNECT handling, QoS matrix validation, packet recovery, and hierarchy isolation.
+- **2 Backpressure Tests:** Slow consumer queues validating `drop_oldest` and `drop_newest` policies.
+- **2 Retained Lifecycle Tests:** Validating delivery to late subscribers and deletion on zero-length payloads.
+- **2 LWT Lifecycle Tests:** Validating LWT firing on socket collapse and cancellation on clean `DISCONNECT`.
+- **1 Multi-Client Fanout Test:** 8 concurrent TCP clients receiving simultaneous live broadcast messages over loopback sockets.
+- **3 Live TCP Socket E2E Tests:** Real TCP client socket message exchanges and Ping/Pong on ephemeral ports.
+- **5 RBAC & Room Isolation E2E Tests:** Authenticating users, verifying dynamic macros, and ensuring strict cross-room isolation.
+- **1 TLS 1.3 / mTLS E2E Test:** Validating full mutual TLS certificate verification and encrypted message transfer.
 
 ---
 
-## License
-Licensed under Apache-2.0 or MIT.
+## License & Governance
+
+- **Source Code:** Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).
+- **Security Policy:** Vulnerability disclosure guidelines and cryptographic notices are detailed in [SECURITY.md](SECURITY.md).
+- **Docker Container:** Built with Debian Slim runtime in [Dockerfile](Dockerfile).

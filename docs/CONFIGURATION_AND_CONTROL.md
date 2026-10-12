@@ -188,14 +188,14 @@ hardware_crypto_engine = "none"
 ```toml
 [security.auth]
 allow_anonymous = false
-password_hash_algorithm = "sha256"
+password_hash_algorithm = "argon2id"
 acl_file = "config/acl.conf"
 ```
 
 | Directive | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `allow_anonymous` | Boolean | `false` | Allow clients without username/password to connect. Set to `false` in production. |
-| `password_hash_algorithm`| String | `"sha256"` | Hash algorithm: `"sha256"`, `"argon2id"`, or `"bcrypt"`. |
+| `password_hash_algorithm`| String | `"argon2id"` | Password hash algorithm: `"argon2id"` (recommended, memory-hard) or `"sha256"`. |
 | `acl_file` | Path | `"config/acl.conf"` | Path to Access Control List rules file. |
 
 ---
@@ -208,7 +208,7 @@ Fine-tunes MQTT 3.1.1 and MQTT 5.0 specifications and capabilities:
 [mqtt.protocol]
 allow_v311 = true
 allow_v500 = true
-max_packet_size = 10485760
+max_packet_size = 4194304
 receive_maximum = 65535
 topic_alias_maximum = 20
 max_keep_alive_sec = 3600
@@ -221,7 +221,7 @@ allow_shared_subscriptions = true
 | :--- | :--- | :--- | :--- |
 | `allow_v311` | Boolean | `true` | Enable support for legacy MQTT 3.1.1 clients. |
 | `allow_v500` | Boolean | `true` | Enable support for modern MQTT 5.0 clients. |
-| `max_packet_size` | Integer | `10485760` (10 MB) | Maximum allowable single packet size. Larger packets are rejected. |
+| `max_packet_size` | Integer | `4194304` (4 MB) | Maximum allowable single packet size. Must not exceed `max_queued_bytes`. Larger packets are rejected. |
 | `receive_maximum` | Integer | `65535` | Flow control quota for unacknowledged QoS 1/2 messages per client. |
 | `topic_alias_maximum` | Integer | `20` | Maximum topic aliases a client can register to compress packet headers. |
 | `max_keep_alive_sec` | Integer | `3600` (1 hr) | Maximum allowable client keep-alive interval. |
@@ -238,7 +238,7 @@ Governs slow consumer isolation and memory protection:
 ```toml
 [mqtt.queues]
 max_queued_messages = 5000
-max_queued_bytes = 5242880
+max_queued_bytes = 8388608
 queue_full_policy = "drop_oldest"
 default_message_expiry_sec = 86400
 max_session_expiry_sec = 604800
@@ -247,9 +247,9 @@ max_session_expiry_sec = 604800
 | Directive | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `max_queued_messages` | Integer | `5000` | Maximum messages buffered per disconnected or slow subscriber. |
-| `max_queued_bytes` | Integer | `5242880` (5 MB) | Maximum RAM byte quota buffered per subscriber queue. |
-| `queue_full_policy` | String | `"drop_oldest"` | Action when buffer exceeds limits: `"drop_oldest"`, `"drop_newest"`, or `"block"`. |
-| `default_message_expiry_sec` | Integer | `86400` (24 hr) | Default Message Expiry Interval TTL for buffered messages. |
+| `max_queued_bytes` | Integer | `8388608` (8 MB) | Maximum RAM byte quota buffered per subscriber queue. Always $\ge$ `max_packet_size`. |
+| `queue_full_policy` | String | `"drop_oldest"` | Action when buffer exceeds limits: `"drop_oldest"` or `"drop_newest"`. |
+| `default_message_expiry_sec` | Integer | `86400` (24 hr) | Default Message Expiry Interval TTL for buffered messages (0 = no expiry). |
 | `max_session_expiry_sec` | Integer | `604800` (7 days) | Maximum allowable Session Expiry Interval for persistent sessions. |
 
 ---

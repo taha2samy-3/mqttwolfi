@@ -223,7 +223,9 @@ impl UserAccount {
     pub fn verify_password(&self, candidate: &[u8]) -> bool {
         if self.password_hash.starts_with("$argon2") {
             if let Ok(parsed_hash) = PasswordHash::new(&self.password_hash) {
-                return Argon2::default().verify_password(candidate, &parsed_hash).is_ok();
+                return Argon2::default()
+                    .verify_password(candidate, &parsed_hash)
+                    .is_ok();
             }
         }
 

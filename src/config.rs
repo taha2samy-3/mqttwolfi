@@ -329,7 +329,13 @@ impl AppConfig {
             )));
         }
 
-        match self.security.auth.password_hash_algorithm.to_lowercase().as_str() {
+        match self
+            .security
+            .auth
+            .password_hash_algorithm
+            .to_lowercase()
+            .as_str()
+        {
             "sha256" | "argon2" | "argon2id" => {}
             other => {
                 return Err(ConfigError::Validation(format!(

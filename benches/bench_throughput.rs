@@ -531,7 +531,10 @@ fn bench_concurrent_multithreaded_routing() {
     let msgs_sec = (total_messages as f64) / duration.as_secs_f64();
     let match_rate = (total_matches_count as f64) / duration.as_secs_f64();
 
-    println!("  Reader Threads  : {} concurrent readers + 1 active writer", reader_threads);
+    println!(
+        "  Reader Threads  : {} concurrent readers + 1 active writer",
+        reader_threads
+    );
     println!("  Total Queries   : {} topic lookups", total_messages);
     println!("  Query Speed     : {:.2} queries/sec", msgs_sec);
     println!(
@@ -642,7 +645,10 @@ fn bench_live_tcp_loopback_throughput() {
         println!("  Socket Protocol : Asynchronous Tokio TCP Stream (Loopback)");
         println!("  Messages Sent   : {} messages", total_received);
         println!("  TCP Throughput  : {:.2} msgs/sec", tcp_msgs_sec);
-        println!("  Pipeline Latency: {:.2} µs / msg (pipelined streaming)\n", pipeline_us);
+        println!(
+            "  Pipeline Latency: {:.2} µs / msg (pipelined streaming)\n",
+            pipeline_us
+        );
     });
 }
 
