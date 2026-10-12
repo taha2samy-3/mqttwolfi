@@ -66,9 +66,14 @@ tasks:
       - cargo bench --bench wolf-bench
 
   bench:tls:
-    desc: "Run active TLS 1.3 / mTLS performance benchmark"
+    desc: "Run active TLS 1.3 / mTLS high-load performance benchmark (8 concurrent clients)"
     cmds:
-      - cargo run --release --bin wolf-bench-tls -- --count 5000
+      - cargo run --release --bin wolf-bench-tls -- --concurrency 8 --count 10000
+
+  bench:tls:stress:
+    desc: "Run extreme high-concurrency TLS 1.3 stress benchmark (16 concurrent clients)"
+    cmds:
+      - cargo run --release --bin wolf-bench-tls -- --concurrency 16 --count 16000
 
   bench:tls:compare:
     desc: "Run comparative TLS benchmark against other brokers (Mosquitto)"

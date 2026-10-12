@@ -77,7 +77,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("Standardized Benchmark Configuration:");
     println!("  Total Messages   : {}", msg_count);
-    println!("  Concurrency Load : {} concurrent TLS 1.3 clients", concurrency);
+    println!(
+        "  Concurrency Load : {} concurrent TLS 1.3 clients",
+        concurrency
+    );
     println!("  Msgs Per Client  : {}", msg_count / concurrency);
     println!("  Payload Size     : {} bytes", payload_size);
     println!("  TLS Encryption   : Active (mTLS / TLS 1.3 - RFC 8446)\n");
@@ -95,7 +98,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "\n==> [2/2] Running External Target: {} on port {}...",
             external_name, port
         );
-        match benchmark_external_broker(&external_name, port, msg_count, concurrency, payload_size).await {
+        match benchmark_external_broker(&external_name, port, msg_count, concurrency, payload_size)
+            .await
+        {
             Ok(ext_res) => {
                 print_single_result(&ext_res);
                 results.push(ext_res);
@@ -239,7 +244,9 @@ async fn run_tls_client_workload(
             .await;
             let _ = read_next_packet(&mut tls, &mut buf).await;
 
-            Ok::<(TlsStream<TcpStream>, BytesMut, String), Box<dyn std::error::Error + Send + Sync>>((tls, buf, topic))
+            Ok::<(TlsStream<TcpStream>, BytesMut, String), Box<dyn std::error::Error + Send + Sync>>(
+                (tls, buf, topic),
+            )
         });
         connect_handles.push(handle);
     }
@@ -380,7 +387,10 @@ async fn send_packet<W: AsyncWriteExt + Unpin>(stream: &mut W, packet: MqttPacke
     stream.flush().await.expect("Flush error");
 }
 
-async fn read_next_packet<R: AsyncReadExt + Unpin>(stream: &mut R, buf: &mut BytesMut) -> MqttPacket {
+async fn read_next_packet<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    buf: &mut BytesMut,
+) -> MqttPacket {
     loop {
         if !buf.is_empty() {
             let mut slice = &buf[..];
@@ -398,7 +408,10 @@ async fn read_next_packet<R: AsyncReadExt + Unpin>(stream: &mut R, buf: &mut Byt
 fn print_single_result(res: &BenchmarkResult) {
     println!("  Broker Target    : {}", res.broker_name);
     println!("  Crypto Engine    : {}", res.tls_engine);
-    println!("  Concurrency      : {} concurrent clients", res.concurrency);
+    println!(
+        "  Concurrency      : {} concurrent clients",
+        res.concurrency
+    );
     println!("  Total Messages   : {}", res.total_messages);
     println!("  TLS Handshake    : {:.2} ms", res.handshake_ms);
     println!(
@@ -448,7 +461,10 @@ fn write_markdown_summary(path: &str, results: &[BenchmarkResult]) -> std::io::R
         "### 🔒 Empirical MQTT over TLS 1.3 / mTLS High-Load Benchmark Comparison\n"
     )?;
     writeln!(file, "| Broker | Cryptographic Engine | Concurrency | TLS Handshake | Throughput (msgs/sec) | Bandwidth | Mean Latency | p90 Latency | p99 Latency | Max Latency |")?;
-    writeln!(file, "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |")?;
+    writeln!(
+        file,
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+    )?;
     for r in results {
         writeln!(
             file,

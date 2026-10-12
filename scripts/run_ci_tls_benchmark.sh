@@ -62,18 +62,23 @@ fi
 
 # 3. Run comparative benchmark binary
 SUMMARY_FILE="tls_benchmark_summary.md"
+CONCURRENCY="${CONCURRENCY:-8}"
+MSG_COUNT="${MSG_COUNT:-10000}"
+PAYLOAD_SIZE="${PAYLOAD_SIZE:-128}"
 
 if [ "${HAS_MOSQUITTO}" = true ]; then
     cargo run --release --bin wolf-bench-tls -- \
-        --count 5000 \
-        --payload-size 128 \
+        --concurrency "${CONCURRENCY}" \
+        --count "${MSG_COUNT}" \
+        --payload-size "${PAYLOAD_SIZE}" \
         --external-port "${MOSQUITTO_PORT}" \
         --external-name "Eclipse Mosquitto (OpenSSL)" \
         --markdown-output "${SUMMARY_FILE}"
 else
     cargo run --release --bin wolf-bench-tls -- \
-        --count 5000 \
-        --payload-size 128 \
+        --concurrency "${CONCURRENCY}" \
+        --count "${MSG_COUNT}" \
+        --payload-size "${PAYLOAD_SIZE}" \
         --markdown-output "${SUMMARY_FILE}"
 fi
 

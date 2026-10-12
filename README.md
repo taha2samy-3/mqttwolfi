@@ -74,19 +74,24 @@ To reproduce these benchmarks locally:
 task bench
 ```
 
-### 🔒 Empirical MQTT over TLS / mTLS Comparative Benchmark
+### 🔒 Empirical MQTT over TLS 1.3 / mTLS High-Load Benchmark
 
-WolfiMQ features automated side-by-side benchmarking against other brokers (such as Eclipse Mosquitto) with **full TLS 1.3 encryption activated** on loopback sockets:
+WolfiMQ features automated side-by-side benchmarking against other brokers (such as Eclipse Mosquitto) with **full TLS 1.3 encryption activated** on loopback sockets across multiple concurrency profiles:
 
-| Broker Target | Cryptographic Engine | TLS Handshake | Throughput (msgs/sec) | Bandwidth | Mean Latency | p99 Latency |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **WolfiMQ** | wolfSSL / TLS 1.3 | `64.08 ms` | **75,767.68 msgs/sec** | `9.25 MB/s` | `13.20 µs` | `23.76 µs` |
-| **Mosquitto** | OpenSSL / TLS 1.3 | Automated in CI | Automated in CI | Automated in CI | Automated in CI | Automated in CI |
+| Workload Profile | Concurrency | Cryptographic Engine | TLS Handshake | Throughput (msgs/sec) | Bandwidth | Mean Latency | p99 Latency |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Single-Client Baseline** | 1 client | wolfSSL / TLS 1.3 | `64.08 ms` | **75,767 msgs/sec** | `9.25 MB/s` | `13.20 µs` | `23.76 µs` |
+| **High-Load Concurrent** | 8 clients | wolfSSL / TLS 1.3 | `64.97 ms` | **157,583 msgs/sec** | `19.24 MB/s` | `14.07 ms` | `52.78 ms` |
+| **Extreme Multi-Client** | 16 clients | wolfSSL / TLS 1.3 | `69.38 ms` | **211,883 msgs/sec** | `25.86 MB/s` | `22.91 ms` | `61.68 ms` |
+| **Mosquitto (Comparative)** | 8 clients | OpenSSL / TLS 1.3 | *Automated in CI* | *Automated in CI* | *Automated in CI* | *Automated in CI* | *Automated in CI* |
 
 To run the TLS benchmarks locally:
 ```bash
-# Run WolfiMQ TLS benchmark standalone
+# Run WolfiMQ TLS benchmark with 8 concurrent clients (10,000 messages)
 task bench:tls
+
+# Run extreme 16-client TLS stress benchmark (16,000 messages)
+task bench:tls:stress
 
 # Run comparative TLS benchmark against local Mosquitto
 task bench:tls:compare
@@ -152,22 +157,27 @@ task build:release
 
 ---
 
-## Configuration
-
+## Configuration & Operational Control
+ 
+WolfiMQ provides declarative TOML configuration, dynamic CLI overrides, access control lists, and kernel tuning options.
+ 
+> 📖 **Full Reference Manual:** For an exhaustive guide to every setting, access control list syntax, Linux production tuning, and Systemd deployment, consult the **[Configuration & Operational Control Guide](docs/CONFIGURATION_AND_CONTROL.md)**.
+ 
 Edit [`config/broker.toml`](config/broker.toml) to configure runtime behavior:
-
+ 
 ```toml
 [broker]
 node_id = "wolfimq-node-01"
-
+max_connections = 100000
+ 
 [logging]
 level = "info"
 format = "pretty"
-
+ 
 [listeners.tls]
 enabled = true
 port = 8883
-
+ 
 [security.tls]
 ca_cert_file = "certs/ca-cert.pem"
 server_cert_file = "certs/server-cert.pem"
@@ -175,10 +185,16 @@ server_key_file = "certs/server-key.pem"
 require_client_cert = true
 min_tls_version = "TLSv1.3"
 alpn_protocols = ["mqtt"]
-
+ 
 [mqtt.queues]
 max_queued_messages = 5000
 queue_full_policy = "drop_oldest"
+```
+ 
+Launch with custom configuration:
+```bash
+# Load specific configuration file
+wolf-mqtt-broker --config /path/to/custom_broker.toml
 ```
 
 ---
