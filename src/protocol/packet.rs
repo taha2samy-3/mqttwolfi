@@ -135,6 +135,14 @@ pub enum MqttPacket {
     PingReq,
     PingResp,
     Disconnect,
+    Subscribe {
+        packet_id: u16,
+        topics: Vec<(String, QoS)>,
+    },
+    SubAck {
+        packet_id: u16,
+        return_codes: Vec<u8>,
+    },
 }
 
 impl MqttPacket {
@@ -229,6 +237,35 @@ impl MqttPacket {
                 dst.put(var_header);
                 Ok(())
             }
+            MqttPacket::Subscribe { packet_id, topics } => {
+                let mut var_header = BytesMut::new();
+                var_header.put_u16(*packet_id);
+                for (topic, qos) in topics {
+                    var_header.put_u16(topic.len() as u16);
+                    var_header.put_slice(topic.as_bytes());
+                    var_header.put_u8(*qos as u8);
+                }
+                dst.put_u8(0x82); // Subscribe fixed header: type 8, reserved flags 0x02
+                encode_variable_byte_integer(var_header.len() as u32, dst)
+                    .map_err(|_| PacketError::MalformedHeader)?;
+                dst.put(var_header);
+                Ok(())
+            }
+            MqttPacket::SubAck {
+                packet_id,
+                return_codes,
+            } => {
+                let mut var_header = BytesMut::new();
+                var_header.put_u16(*packet_id);
+                for code in return_codes {
+                    var_header.put_u8(*code);
+                }
+                dst.put_u8(0x90); // SubAck fixed header: type 9
+                encode_variable_byte_integer(var_header.len() as u32, dst)
+                    .map_err(|_| PacketError::MalformedHeader)?;
+                dst.put(var_header);
+                Ok(())
+            }
         }
     }
 
@@ -254,6 +291,49 @@ impl MqttPacket {
             PacketType::PingReq => Ok(MqttPacket::PingReq),
             PacketType::PingResp => Ok(MqttPacket::PingResp),
             PacketType::Disconnect => Ok(MqttPacket::Disconnect),
+            PacketType::Subscribe => {
+                if remaining_len < 3 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = src.get_u16();
+                let mut topics = Vec::new();
+                let mut bytes_left = remaining_len - 2;
+
+                while bytes_left > 0 {
+                    if src.remaining() < 2 {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let topic_len = src.get_u16() as usize;
+                    if src.remaining() < topic_len + 1 {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    let mut topic_bytes = vec![0u8; topic_len];
+                    src.copy_to_slice(&mut topic_bytes);
+                    let topic = String::from_utf8(topic_bytes)
+                        .map_err(|_| PacketError::InvalidString)?;
+                    let qos = QoS::try_from(src.get_u8())?;
+                    topics.push((topic, qos));
+                    bytes_left = bytes_left.saturating_sub(2 + topic_len + 1);
+                }
+
+                Ok(MqttPacket::Subscribe { packet_id, topics })
+            }
+            PacketType::SubAck => {
+                if remaining_len < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = src.get_u16();
+                let codes_len = remaining_len - 2;
+                if src.remaining() < codes_len {
+                    return Err(PacketError::BufferUnderflow);
+                }
+                let mut return_codes = vec![0u8; codes_len];
+                src.copy_to_slice(&mut return_codes);
+                Ok(MqttPacket::SubAck {
+                    packet_id,
+                    return_codes,
+                })
+            }
             PacketType::ConnAck => {
                 if remaining_len < 2 {
                     return Err(PacketError::MalformedHeader);
@@ -368,6 +448,33 @@ mod tests {
         let mut resp_buf = BytesMut::new();
         MqttPacket::PingResp.encode(&mut resp_buf).unwrap();
         assert_eq!(&resp_buf[..], &[0xD0, 0x00]);
+    }
+
+    #[test]
+    fn test_subscribe_and_suback_roundtrip() {
+        let sub = MqttPacket::Subscribe {
+            packet_id: 42,
+            topics: vec![
+                ("sensors/temperature".into(), QoS::AtLeastOnce),
+                ("sensors/pressure".into(), QoS::AtMostOnce),
+            ],
+        };
+
+        let mut buf = BytesMut::new();
+        sub.encode(&mut buf).unwrap();
+        let mut read_buf = &buf[..];
+        let decoded = MqttPacket::decode(&mut read_buf).unwrap();
+        assert_eq!(decoded, sub);
+
+        let suback = MqttPacket::SubAck {
+            packet_id: 42,
+            return_codes: vec![0x01, 0x00],
+        };
+        let mut ack_buf = BytesMut::new();
+        suback.encode(&mut ack_buf).unwrap();
+        let mut read_ack = &ack_buf[..];
+        let decoded_ack = MqttPacket::decode(&mut read_ack).unwrap();
+        assert_eq!(decoded_ack, suback);
     }
 
     #[test]
