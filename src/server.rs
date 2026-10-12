@@ -229,7 +229,6 @@ impl BrokerServer {
         let mut connected_client_id: String = String::new();
         let mut is_connected = false;
         let mut client_keep_alive: u16 = 60;
-        let mut client_version = crate::protocol::ProtocolVersion::V311;
         let mut inflight_qos2_pids: std::collections::HashSet<u16> =
             std::collections::HashSet::new();
         let next_outbound_pid = Arc::new(AtomicU16::new(1));
@@ -287,7 +286,10 @@ impl BrokerServer {
                                         reason_code: 0x02, // Identifier rejected
                                     };
                                     let mut ack_buf = BytesMut::new();
-                                    if connack.encode_for_version(&mut ack_buf, conn.version).is_ok() {
+                                    if connack
+                                        .encode_for_version(&mut ack_buf, conn.version)
+                                        .is_ok()
+                                    {
                                         let _ = tx.send(ack_buf.freeze()).await;
                                     }
                                     break 'connection;
@@ -310,7 +312,6 @@ impl BrokerServer {
                                         is_connected = true;
                                         connected_client_id = conn.client_id.clone();
                                         client_keep_alive = conn.keep_alive_sec;
-                                        client_version = conn.version;
                                         current_user = Some(user);
                                         client_will = conn.will;
 
@@ -338,7 +339,10 @@ impl BrokerServer {
                                             reason_code: 0x00,
                                         };
                                         let mut ack_buf = BytesMut::new();
-                                        if connack.encode_for_version(&mut ack_buf, client_version).is_ok() {
+                                        if connack
+                                            .encode_for_version(&mut ack_buf, conn.version)
+                                            .is_ok()
+                                        {
                                             let _ = tx.send(ack_buf.freeze()).await;
                                         }
                                     }
@@ -359,7 +363,10 @@ impl BrokerServer {
                                             reason_code,
                                         };
                                         let mut ack_buf = BytesMut::new();
-                                        if connack.encode_for_version(&mut ack_buf, conn.version).is_ok() {
+                                        if connack
+                                            .encode_for_version(&mut ack_buf, conn.version)
+                                            .is_ok()
+                                        {
                                             let _ = tx.send(ack_buf.freeze()).await;
                                         }
                                         tokio::time::sleep(tokio::time::Duration::from_millis(10))
@@ -661,15 +668,27 @@ impl BrokerServer {
                         router_guard.matches(&will_pkt.topic)
                     };
 
+                    let mut forward_will = will_pkt.clone();
+                    forward_will.retain = false;
+                    if forward_will.qos != QoS::AtMostOnce && forward_will.packet_id.is_none() {
+                        forward_will.packet_id =
+                            Some(next_outbound_pid.fetch_add(1, Ordering::Relaxed));
+                    }
+
                     let mut will_buf = BytesMut::new();
-                    let will_packet = MqttPacket::Publish(will_pkt);
+                    let will_packet = MqttPacket::Publish(forward_will);
                     if will_packet.encode(&mut will_buf).is_ok() {
                         let frozen_will = will_buf.freeze();
                         let clients_guard = context.clients.read().await;
                         for target_id in matched_ids {
                             if target_id != client_id {
                                 if let Some(target_tx) = clients_guard.get(&target_id) {
-                                    let _ = target_tx.try_send(frozen_will.clone());
+                                    if target_tx.try_send(frozen_will.clone()).is_err() {
+                                        warn!(
+                                            "Slow consumer queue full on client #{}, dropping LWT message",
+                                            target_id
+                                        );
+                                    }
                                 }
                             }
                         }

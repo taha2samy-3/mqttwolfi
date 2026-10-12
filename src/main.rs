@@ -138,7 +138,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => {
                     error!("Failed to bind TLS listener on {}: {}", tls_addr, e);
-                    return Err(format!("Failed to bind TLS listener on {}: {}", tls_addr, e).into());
+                    return Err(
+                        format!("Failed to bind TLS listener on {}: {}", tls_addr, e).into(),
+                    );
                 }
             },
             Err(e) => {
