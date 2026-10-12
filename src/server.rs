@@ -407,10 +407,10 @@ impl BrokerServer {
                                 {
                                     let mut router_guard = context.router.write().await;
                                     for (topic_filter, _) in &authorized_filters {
-                                        if router_guard.subscribe(topic_filter, client_id).is_ok() {
-                                            if !subscribed_topics.contains(topic_filter) {
-                                                subscribed_topics.push(topic_filter.clone());
-                                            }
+                                        if router_guard.subscribe(topic_filter, client_id).is_ok()
+                                            && !subscribed_topics.contains(topic_filter)
+                                        {
+                                            subscribed_topics.push(topic_filter.clone());
                                         }
                                     }
                                 }
