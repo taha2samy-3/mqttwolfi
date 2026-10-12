@@ -3,6 +3,7 @@ use std::time::Instant;
 use wolf_mqtt::protocol::{
     decode_variable_byte_integer, encode_variable_byte_integer, MqttPacket, PublishPacket, QoS,
 };
+use wolf_mqtt::routing::retained::RetainedStore;
 use wolf_mqtt::routing::TopicTrie;
 
 fn main() {
@@ -14,6 +15,8 @@ fn main() {
     bench_topic_trie_routing();
     bench_packet_serialization();
     bench_end_to_end_routing_pipeline();
+    bench_retained_store();
+    bench_latency_percentiles();
 
     println!("================================================================================");
     println!("All benchmarks executed successfully under optimized release profile.");
@@ -181,4 +184,106 @@ fn bench_end_to_end_routing_pipeline() {
         "  Fan-out Throughput: {:.2} message-deliveries/sec\n",
         deliveries_sec
     );
+}
+
+fn bench_retained_store() {
+    println!("--- 5. Retained Messages Store Insertion & Query Benchmark ---");
+    let mut store = RetainedStore::new();
+    let iterations = 100_000;
+
+    // 1. Benchmark Retained Store Updates
+    let start_insert = Instant::now();
+    for i in 0..iterations {
+        let topic = format!("devices/unit_{}/telemetry", i % 5000);
+        let packet = PublishPacket {
+            topic,
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"ACTIVE_ONLINE"),
+        };
+        store.update(packet);
+    }
+    let insert_dur = start_insert.elapsed();
+    let insert_ops_sec = (iterations as f64) / insert_dur.as_secs_f64();
+
+    // 2. Benchmark Retained Query with Wildcard Filter
+    let query_iterations = 20_000;
+    let start_query = Instant::now();
+    let mut total_matches = 0;
+    for _ in 0..query_iterations {
+        let matches = store.get_matches_for_filter("devices/unit_42/telemetry");
+        total_matches += matches.len();
+    }
+    let query_dur = start_query.elapsed();
+    let query_ops_sec = (query_iterations as f64) / query_dur.as_secs_f64();
+
+    println!("  Retained Entries: {} stored topics", store.count());
+    println!("  Insert Speed    : {:.2} updates/sec", insert_ops_sec);
+    println!("  Query Speed     : {:.2} queries/sec (total matches: {})\n", query_ops_sec, total_matches);
+}
+
+fn bench_latency_percentiles() {
+    println!("--- 6. High-Precision Latency Distribution (p50 / p90 / p99 / p99.9 / max) ---");
+    let mut trie = TopicTrie::new();
+    for i in 0..50 {
+        trie.subscribe("iot/sensors/+/temp", i).unwrap();
+    }
+
+    let sample_count = 100_000;
+    let mut latencies_ns = Vec::with_capacity(sample_count);
+
+    let pub_pkt = MqttPacket::Publish(PublishPacket {
+        topic: "iot/sensors/zoneA/temp".into(),
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        dup: false,
+        packet_id: Some(101),
+        payload: Bytes::from_static(b"26.8"),
+    });
+
+    let mut encode_buf = BytesMut::with_capacity(128);
+    pub_pkt.encode(&mut encode_buf).unwrap();
+    let frozen_bytes = encode_buf.freeze();
+
+    for _ in 0..sample_count {
+        let start = Instant::now();
+
+        // 1. Packet Decode
+        let mut slice = &frozen_bytes[..];
+        let decoded = MqttPacket::decode(&mut slice).unwrap();
+
+        // 2. Trie Route Lookup
+        if let MqttPacket::Publish(ref p) = decoded {
+            let _ = trie.matches(&p.topic);
+        }
+
+        // 3. Packet Re-encode (fanout preparation)
+        let mut out_buf = BytesMut::with_capacity(64);
+        decoded.encode(&mut out_buf).unwrap();
+
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        latencies_ns.push(elapsed_ns);
+    }
+
+    latencies_ns.sort_unstable();
+
+    let sum: u64 = latencies_ns.iter().sum();
+    let mean_ns = (sum as f64) / (sample_count as f64);
+    let p50 = latencies_ns[(sample_count as f64 * 0.50) as usize];
+    let p90 = latencies_ns[(sample_count as f64 * 0.90) as usize];
+    let p95 = latencies_ns[(sample_count as f64 * 0.95) as usize];
+    let p99 = latencies_ns[(sample_count as f64 * 0.99) as usize];
+    let p999 = latencies_ns[(sample_count as f64 * 0.999) as usize];
+    let max = *latencies_ns.last().unwrap();
+
+    println!("  Sample Size     : {} full decode -> route -> encode cycles", sample_count);
+    println!("  Mean Latency    : {:.2} ns  ({:.3} µs)", mean_ns, mean_ns / 1_000.0);
+    println!("  p50 (Median)    : {} ns  ({:.3} µs)", p50, (p50 as f64) / 1_000.0);
+    println!("  p90             : {} ns  ({:.3} µs)", p90, (p90 as f64) / 1_000.0);
+    println!("  p95             : {} ns  ({:.3} µs)", p95, (p95 as f64) / 1_000.0);
+    println!("  p99             : {} ns  ({:.3} µs)", p99, (p99 as f64) / 1_000.0);
+    println!("  p99.9           : {} ns  ({:.3} µs)", p999, (p999 as f64) / 1_000.0);
+    println!("  Max Latency     : {} ns  ({:.3} µs)\n", max, (max as f64) / 1_000.0);
 }
