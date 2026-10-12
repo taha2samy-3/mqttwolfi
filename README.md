@@ -250,11 +250,11 @@ queue_full_policy = "drop_oldest"
 
 ## Testing & CI Suite
 
-WolfiMQ validates stability across **68 automated test cases** (38 Unit Tests + 30 Integration & E2E Tests across 11 test suites):
-- **38 Unit Tests:** Packet codecs, variable-byte integers, bounds-checked CONNECT framing, Argon2id hashing, Topic Trie matching & pruning, `$SYS` topic root wildcard isolation, retained storage, and configuration validation.
+WolfiMQ validates stability across **72 automated test cases** (39 Unit Tests + 33 Integration & E2E Tests across 11 test suites):
+- **39 Unit Tests:** Packet codecs, variable-byte integers, bounds-checked CONNECT framing, Argon2id hashing, Topic Trie matching & pruning, `$SYS` topic root wildcard isolation, retained store quota limit, and configuration validation.
 - **5 MQTT 5.0 Conformance & Interop Tests:** Live TCP pub/sub exchange, raw frame properties parsing, will properties LWT delivery, MQTT 5 reason codes (`0x86` vs `0x05`), and v3.1.1/v5.0 cross-version interoperability.
 - **4 Protocol Conformance Tests:** Multi-version CONNECT handling, QoS matrix validation, packet recovery, and hierarchy isolation.
-- **4 Unified Listeners & Hardening Tests:** Cross-listener message routing (TCP 1883 $\leftrightarrow$ TLS 8883), live UNSUBSCRIBE / UNSUBACK with trie pruning, retained QoS 1 delivery with packet IDs, and duplicate CONNECT disconnects.
+- **7 Unified Listeners & Hardening Tests:** Cross-listener message routing (TCP 1883 $\leftrightarrow$ TLS 8883), live UNSUBSCRIBE / UNSUBACK with trie pruning, retained QoS 1 delivery with packet IDs, duplicate CONNECT disconnects, QoS 2 deduplication, QoS 1 LWT delivery, and MQTT 5.0 CONNACK raw wire properties verification.
 - **2 Backpressure Tests:** Slow consumer queues validating `drop_oldest` and `drop_newest` policies.
 - **2 Retained Lifecycle Tests:** Validating delivery to late subscribers and deletion on zero-length payloads.
 - **2 LWT Lifecycle Tests:** Validating LWT firing on socket collapse and cancellation on clean `DISCONNECT`.
