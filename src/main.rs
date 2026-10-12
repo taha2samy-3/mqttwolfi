@@ -101,6 +101,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let shared_context = wolf_mqtt::server::BrokerContext::new(Arc::clone(&acl));
+    let mut listeners_active = 0;
+
     if config.listeners.tls.enabled {
         let tls_addr = format!(
             "{}:{}",
@@ -119,8 +122,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             Ok(acceptor) => match wolf_mqtt::server::BrokerServer::bind(&tls_addr).await {
                 Ok(tls_server) => {
-                    let tls_server = tls_server.with_acl(Arc::clone(&acl));
+                    let tls_server = tls_server.with_context(shared_context.clone());
                     info!("WolfiMQ TLS listener active on {}", tls_addr);
+                    listeners_active += 1;
                     tokio::spawn(async move {
                         let _ = tls_server.run_tls(acceptor).await;
                     });
@@ -138,13 +142,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         match wolf_mqtt::server::BrokerServer::bind(&tcp_addr).await {
             Ok(tcp_server) => {
-                let tcp_server = tcp_server.with_acl(Arc::clone(&acl));
+                let tcp_server = tcp_server.with_context(shared_context.clone());
                 info!("WolfiMQ TCP listener active on {}", tcp_addr);
+                listeners_active += 1;
                 tcp_server.run().await?;
             }
-            Err(e) => error!("Failed to bind TCP listener on {}: {}", tcp_addr, e),
+            Err(e) => {
+                error!("Failed to bind TCP listener on {}: {}", tcp_addr, e);
+                return Err(Box::new(e));
+            }
         }
     } else {
+        if listeners_active == 0 {
+            return Err("No network listeners (TCP or TLS) were successfully initialized. Exiting.".into());
+        }
         // Wait indefinitely if only TLS was spawned
         tokio::signal::ctrl_c().await?;
         info!("Shutdown signal received. Exiting.");
