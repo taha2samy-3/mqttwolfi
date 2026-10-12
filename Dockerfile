@@ -1,5 +1,5 @@
 # Multi-Stage Production Build for WolfiMQ
-FROM rust:1.80-bullseye AS builder
+FROM rust:1.84-bookworm AS builder
 
 WORKDIR /usr/src/wolfimq
 
@@ -13,17 +13,22 @@ COPY . .
 RUN cargo build --release --bin wolf-broker
 
 # Runtime Stage
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Run as non-root user
+RUN useradd -u 10001 -U -s /bin/false wolfi
+
 WORKDIR /app
 
 COPY --from=builder /usr/src/wolfimq/target/release/wolf-broker /usr/local/bin/wolf-broker
 COPY --from=builder /usr/src/wolfimq/config /app/config
-COPY --from=builder /usr/src/wolfimq/certs /app/certs
+RUN mkdir -p /app/certs && chown -R wolfi:wolfi /app
+
+USER wolfi
 
 EXPOSE 1883 8883
 
