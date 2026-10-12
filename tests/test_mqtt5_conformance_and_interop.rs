@@ -289,13 +289,13 @@ async fn test_mqtt5_lwt_delivery_with_will_properties() {
     payload.put_u8(0x18);
     payload.put_u32(1);
 
-    // Will topic
-    payload.put_u16(22);
-    payload.put_slice(b"cluster/nodes/01/lwt");
+    let will_topic = b"cluster/nodes/01/lwt";
+    payload.put_u16(will_topic.len() as u16);
+    payload.put_slice(will_topic);
 
-    // Will payload
-    payload.put_u16(11);
-    payload.put_slice(b"UNEXPECTED");
+    let will_msg = b"UNEXPECTED";
+    payload.put_u16(will_msg.len() as u16);
+    payload.put_slice(will_msg);
 
     encode_variable_byte_integer(payload.len() as u32, &mut raw).unwrap();
     raw.put(payload);
@@ -326,12 +326,13 @@ async fn test_mqtt5_lwt_delivery_with_will_properties() {
 
 #[tokio::test]
 async fn test_mqtt5_and_mqtt311_auth_reason_codes() {
-    let mut acl = AclEngine::new(false);
-    acl.create_user(
+    let acl = std::sync::Arc::new(AclEngine::new(false));
+    acl.add_user(wolf_mqtt::auth::UserAccount::new_member(
         "alice",
         "correct_horse_battery_staple",
-        wolf_mqtt::auth::UserRole::Member,
-    );
+        vec!["lobby".into()],
+    ))
+    .await;
 
     let server = BrokerServer::bind("127.0.0.1:0")
         .await
