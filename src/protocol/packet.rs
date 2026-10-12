@@ -201,6 +201,29 @@ impl MqttPacket {
     /// Maximum allowed packet size (16 MB) to prevent resource exhaustion DoS
     pub const MAX_PACKET_SIZE: usize = 16 * 1024 * 1024;
 
+    /// Serializes an MQTT packet tailored to the client's protocol version (e.g. MQTT v5 CONNACK properties).
+    pub fn encode_for_version(
+        &self,
+        dst: &mut BytesMut,
+        version: ProtocolVersion,
+    ) -> Result<(), PacketError> {
+        if version == ProtocolVersion::V500 {
+            if let MqttPacket::ConnAck {
+                session_present,
+                reason_code,
+            } = self
+            {
+                dst.put_u8(0x20); // PacketType::ConnAck << 4
+                dst.put_u8(0x03); // Remaining Length = 3 (Flags + ReasonCode + PropertyLength)
+                dst.put_u8(if *session_present { 0x01 } else { 0x00 });
+                dst.put_u8(*reason_code);
+                dst.put_u8(0x00); // 0 Properties length (MQTT 5.0 Section 3.2.2.3 compliant)
+                return Ok(());
+            }
+        }
+        self.encode(dst)
+    }
+
     /// Serializes an MQTT packet into an outgoing byte buffer.
     pub fn encode(&self, dst: &mut BytesMut) -> Result<(), PacketError> {
         match self {

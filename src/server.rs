@@ -229,6 +229,9 @@ impl BrokerServer {
         let mut connected_client_id: String = String::new();
         let mut is_connected = false;
         let mut client_keep_alive: u16 = 60;
+        let mut client_version = crate::protocol::ProtocolVersion::V311;
+        let mut inflight_qos2_pids: std::collections::HashSet<u16> =
+            std::collections::HashSet::new();
         let next_outbound_pid = Arc::new(AtomicU16::new(1));
 
         'connection: loop {
