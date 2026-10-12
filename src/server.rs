@@ -146,6 +146,7 @@ impl BrokerServer {
                 if write_half.write_all(&msg).await.is_err() {
                     break;
                 }
+                let _ = write_half.flush().await;
             }
         });
 

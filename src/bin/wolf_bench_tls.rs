@@ -11,6 +11,7 @@ use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPac
 use wolf_mqtt::server::BrokerServer;
 use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector};
 
+#[allow(dead_code)]
 #[derive(Default, Debug, Clone)]
 struct BenchmarkResult {
     broker_name: String,
@@ -243,6 +244,7 @@ async fn run_tls_client_workload(
     for _ in 0..msg_count {
         tls_pub.write_all(&frozen_msg).await?;
     }
+    tls_pub.flush().await?;
 
     let received = recv_task.await?;
     let total_dur = start.elapsed();
@@ -274,6 +276,7 @@ async fn send_packet(stream: &mut TlsStream<TcpStream>, packet: MqttPacket) {
     let mut buf = BytesMut::new();
     packet.encode(&mut buf).expect("Encode error");
     stream.write_all(&buf).await.expect("Write error");
+    stream.flush().await.expect("Flush error");
 }
 
 async fn read_next_packet(stream: &mut TlsStream<TcpStream>, buf: &mut BytesMut) -> MqttPacket {
