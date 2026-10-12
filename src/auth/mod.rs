@@ -515,9 +515,7 @@ impl AclEngine {
                             custom_rules: Vec::new(),
                         },
                     };
-                    if !password_hash.is_empty() {
-                        account.password_hash = password_hash;
-                    }
+                    account.password_hash = password_hash;
                     current_user = Some(account);
                 }
                 "topic" | "pattern" if parts.len() >= 3 => {
@@ -526,13 +524,17 @@ impl AclEngine {
                         "write" => Permission::Write,
                         "readwrite" => Permission::ReadWrite,
                         "deny" => Permission::Deny,
-                        _ => Permission::Read,
+                        unknown => {
+                            warn!("Unknown permission '{}' in ACL file; ignoring invalid rule", unknown);
+                            continue;
+                        }
                     };
                     let pattern = parts[2].to_string();
                     let rule = AclRule::new(pattern, perm);
 
                     if let Some(ref mut user) = current_user {
-                        user.custom_rules.push(rule);
+                        // Prepend custom file rules so explicit file rules take priority over default role rules
+                        user.custom_rules.insert(0, rule);
                     }
                 }
                 _ => {}
