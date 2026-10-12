@@ -265,7 +265,7 @@ sys_update_interval_sec = 30
 ```
 
 Topics emitted every `sys_update_interval_sec`:
-- `$SYS/broker/version`: `"WolfiMQ v0.2.0 (TLS 1.3)"`
+- `$SYS/broker/version`: `"WolfiMQ v0.2.1 (TLS 1.3)"`
 - `$SYS/broker/uptime`: Uptime in seconds.
 - `$SYS/broker/clients/connected`: Current number of active TCP & TLS sessions.
 - `$SYS/broker/messages/received`: Total messages ingested.
