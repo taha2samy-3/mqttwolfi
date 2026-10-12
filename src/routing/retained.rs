@@ -30,6 +30,14 @@ impl RetainedStore {
 
     /// Queries all retained messages that match a newly subscribed topic filter (supports wildcards).
     pub fn get_matches_for_filter(&self, topic_filter: &str) -> Vec<PublishPacket> {
+        // Fast-path: O(1) direct lookup if no wildcards are present
+        if !topic_filter.contains('+') && !topic_filter.contains('#') {
+            return match self.messages.get(topic_filter) {
+                Some(pkt) => vec![pkt.clone()],
+                None => Vec::new(),
+            };
+        }
+
         let mut matching_packets = Vec::new();
 
         // Create a transient trie node to match the incoming filter against stored concrete topics
