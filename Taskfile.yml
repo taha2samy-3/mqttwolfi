@@ -105,7 +105,7 @@ tasks:
     cmds:
       - task: build:release
       - |
-        PKG="wolfimq-v0.1.0-linux-amd64-wolfssl"
+        PKG="wolfimq-v0.2.0-linux-amd64-wolfssl"
         mkdir -p "${PKG}/bin" "${PKG}/config" "${PKG}/scripts" "${PKG}/docs"
         cp target/release/wolf-broker target/release/wolf-bench-tls "${PKG}/bin/"
         cp config/broker.toml config/acl.conf "${PKG}/config/"
