@@ -141,7 +141,9 @@ impl Default for WolfTlsConfig {
             require_client_cert: true,
             verify_client_identity: false,
             min_tls_version: "TLSv1.3".into(),
-            ciphers: "TLS13-AES128-GCM-SHA256,TLS13-AES256-GCM-SHA384,TLS13-CHACHA20-POLY1305-SHA256".into(),
+            ciphers:
+                "TLS13-AES128-GCM-SHA256,TLS13-AES256-GCM-SHA384,TLS13-CHACHA20-POLY1305-SHA256"
+                    .into(),
             alpn_protocols: vec!["mqtt".into()],
             psk_enabled: false,
             psk_identity_hint: "wolf-broker-psk".into(),
