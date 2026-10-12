@@ -109,6 +109,7 @@ pub struct ConnectPacket {
     pub client_id: String,
     pub clean_start: bool,
     pub keep_alive_sec: u16,
+    pub will: Option<PublishPacket>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -424,6 +425,7 @@ impl MqttPacket {
                     client_id,
                     clean_start,
                     keep_alive_sec,
+                    will: None,
                 }))
             }
             _ => Err(PacketError::InvalidPacketType(packet_type_val)),
