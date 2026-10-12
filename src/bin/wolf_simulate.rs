@@ -22,7 +22,7 @@ fn next_pid() -> u16 {
 
 enum AnyStream {
     Tcp(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 impl AsyncRead for AnyStream {
@@ -33,7 +33,7 @@ impl AsyncRead for AnyStream {
     ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             AnyStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            AnyStream::Tls(s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            AnyStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -46,7 +46,7 @@ impl AsyncWrite for AnyStream {
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
         match self.get_mut() {
             AnyStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            AnyStream::Tls(s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            AnyStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -56,7 +56,7 @@ impl AsyncWrite for AnyStream {
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             AnyStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
-            AnyStream::Tls(s) => std::pin::Pin::new(s).poll_flush(cx),
+            AnyStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
 
@@ -66,7 +66,7 @@ impl AsyncWrite for AnyStream {
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         match self.get_mut() {
             AnyStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            AnyStream::Tls(s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            AnyStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -92,7 +92,7 @@ impl ClientSession {
             let tcp = TcpStream::connect((host, port)).await?;
             let server_name = ServerName::try_from("localhost")?.to_owned();
             let tls = connector.connect(server_name, tcp).await?;
-            AnyStream::Tls(tls)
+            AnyStream::Tls(Box::new(tls))
         } else {
             let tcp = TcpStream::connect((host, port)).await?;
             AnyStream::Tcp(tcp)
