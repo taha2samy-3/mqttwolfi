@@ -65,6 +65,16 @@ tasks:
     cmds:
       - cargo bench --bench wolf-bench
 
+  bench:tls:
+    desc: "Run active TLS 1.3 / mTLS performance benchmark"
+    cmds:
+      - cargo run --release --bin wolf-bench-tls -- --count 5000
+
+  bench:tls:compare:
+    desc: "Run comparative TLS benchmark against other brokers (Mosquitto)"
+    cmds:
+      - bash scripts/run_ci_tls_benchmark.sh
+
   test:miri:
     desc: "Run Miri test suite to detect undefined behavior and FFI pointer safety"
     cmds:

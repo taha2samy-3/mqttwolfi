@@ -12,7 +12,10 @@ use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector};
 async fn send_packet(stream: &mut TlsStream<TcpStream>, packet: MqttPacket) {
     let mut buf = BytesMut::new();
     packet.encode(&mut buf).expect("Packet encode failed");
-    stream.write_all(&buf).await.expect("TLS socket write failed");
+    stream
+        .write_all(&buf)
+        .await
+        .expect("TLS socket write failed");
 }
 
 async fn read_packet(stream: &mut TlsStream<TcpStream>, buf: &mut BytesMut) -> MqttPacket {
@@ -81,9 +84,12 @@ async fn test_tls13_mtls_e2e_pub_sub_exchange() {
     )
     .await;
 
-    let connack = timeout(Duration::from_secs(3), read_packet(&mut tls_sub, &mut sub_buf))
-        .await
-        .expect("ConnAck timeout");
+    let connack = timeout(
+        Duration::from_secs(3),
+        read_packet(&mut tls_sub, &mut sub_buf),
+    )
+    .await
+    .expect("ConnAck timeout");
     assert_eq!(
         connack,
         MqttPacket::ConnAck {
@@ -102,9 +108,12 @@ async fn test_tls13_mtls_e2e_pub_sub_exchange() {
     )
     .await;
 
-    let suback = timeout(Duration::from_secs(3), read_packet(&mut tls_sub, &mut sub_buf))
-        .await
-        .expect("SubAck timeout");
+    let suback = timeout(
+        Duration::from_secs(3),
+        read_packet(&mut tls_sub, &mut sub_buf),
+    )
+    .await
+    .expect("SubAck timeout");
     assert_eq!(
         suback,
         MqttPacket::SubAck {
@@ -134,9 +143,12 @@ async fn test_tls13_mtls_e2e_pub_sub_exchange() {
     )
     .await;
 
-    let pub_connack = timeout(Duration::from_secs(3), read_packet(&mut tls_pub, &mut pub_buf))
-        .await
-        .expect("Publisher ConnAck timeout");
+    let pub_connack = timeout(
+        Duration::from_secs(3),
+        read_packet(&mut tls_pub, &mut pub_buf),
+    )
+    .await
+    .expect("Publisher ConnAck timeout");
     assert!(matches!(pub_connack, MqttPacket::ConnAck { .. }));
 
     // Send QoS 1 Publish over TLS
@@ -154,27 +166,39 @@ async fn test_tls13_mtls_e2e_pub_sub_exchange() {
     .await;
 
     // Publisher receives PUBACK over TLS
-    let puback = timeout(Duration::from_secs(3), read_packet(&mut tls_pub, &mut pub_buf))
-        .await
-        .expect("PubAck timeout");
+    let puback = timeout(
+        Duration::from_secs(3),
+        read_packet(&mut tls_pub, &mut pub_buf),
+    )
+    .await
+    .expect("PubAck timeout");
     assert_eq!(puback, MqttPacket::PubAck { packet_id: 777 });
 
     // Subscriber receives the message over TLS
-    let delivered = timeout(Duration::from_secs(3), read_packet(&mut tls_sub, &mut sub_buf))
-        .await
-        .expect("Subscriber delivery timeout");
+    let delivered = timeout(
+        Duration::from_secs(3),
+        read_packet(&mut tls_sub, &mut sub_buf),
+    )
+    .await
+    .expect("Subscriber delivery timeout");
     if let MqttPacket::Publish(p) = delivered {
         assert_eq!(p.topic, "tls/secure/alerts");
-        assert_eq!(p.payload, Bytes::from_static(b"MISSION_CRITICAL_ENCRYPTED_TELEMETRY"));
+        assert_eq!(
+            p.payload,
+            Bytes::from_static(b"MISSION_CRITICAL_ENCRYPTED_TELEMETRY")
+        );
     } else {
         panic!("Expected Publish, got {:?}", delivered);
     }
 
     // Ping / Pong over TLS
     send_packet(&mut tls_sub, MqttPacket::PingReq).await;
-    let pingresp = timeout(Duration::from_secs(3), read_packet(&mut tls_sub, &mut sub_buf))
-        .await
-        .unwrap();
+    let pingresp = timeout(
+        Duration::from_secs(3),
+        read_packet(&mut tls_sub, &mut sub_buf),
+    )
+    .await
+    .unwrap();
     assert_eq!(pingresp, MqttPacket::PingResp);
 
     // Clean disconnects

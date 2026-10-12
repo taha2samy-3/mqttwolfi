@@ -91,14 +91,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut results = vec![wolf_res];
 
     if let Some(port) = external_port {
-        println!("\n==> Running Benchmark: {} on port {}...", external_name, port);
+        println!(
+            "\n==> Running Benchmark: {} on port {}...",
+            external_name, port
+        );
         match benchmark_external_broker(&external_name, port, msg_count, payload_size).await {
             Ok(ext_res) => {
                 print_single_result(&ext_res);
                 results.push(ext_res);
             }
             Err(e) => {
-                eprintln!("Warning: Failed to benchmark external broker {}: {}", external_name, e);
+                eprintln!(
+                    "Warning: Failed to benchmark external broker {}: {}",
+                    external_name, e
+                );
             }
         }
     }
@@ -137,7 +143,14 @@ async fn benchmark_wolfimq(
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    run_tls_client_workload("WolfiMQ", "wolfSSL Native / TLS 1.3", addr.port(), msg_count, payload_size).await
+    run_tls_client_workload(
+        "WolfiMQ",
+        "wolfSSL Native / TLS 1.3",
+        addr.port(),
+        msg_count,
+        payload_size,
+    )
+    .await
 }
 
 async fn benchmark_external_broker(
@@ -298,29 +311,48 @@ fn print_single_result(res: &BenchmarkResult) {
     println!("  Broker Target    : {}", res.broker_name);
     println!("  Crypto Engine    : {}", res.tls_engine);
     println!("  TLS Handshake    : {:.2} ms", res.handshake_ms);
-    println!("  TLS Throughput   : {:.2} msgs/sec", res.throughput_msgs_sec);
+    println!(
+        "  TLS Throughput   : {:.2} msgs/sec",
+        res.throughput_msgs_sec
+    );
     println!("  TLS Bandwidth    : {:.2} MB/s", res.bandwidth_mb_sec);
     println!("  Mean RTT Latency : {:.2} µs / msg", res.mean_latency_us);
-    println!("  p50 / p95 / p99  : {:.2} µs / {:.2} µs / {:.2} µs", res.p50_latency_us, res.p95_latency_us, res.p99_latency_us);
+    println!(
+        "  p50 / p95 / p99  : {:.2} µs / {:.2} µs / {:.2} µs",
+        res.p50_latency_us, res.p95_latency_us, res.p99_latency_us
+    );
 }
 
 fn print_comparison_table(results: &[BenchmarkResult]) {
     println!(
         "| {:<24} | {:<22} | {:<12} | {:<16} | {:<14} | {:<10} |",
-        "Broker Target", "Crypto Engine", "Handshake", "TLS Throughput", "Bandwidth", "Mean Latency"
+        "Broker Target",
+        "Crypto Engine",
+        "Handshake",
+        "TLS Throughput",
+        "Bandwidth",
+        "Mean Latency"
     );
     println!("|:-------------------------|:-----------------------|:-------------|:-----------------|:---------------|:-----------|");
     for r in results {
         println!(
             "| {:<24} | {:<22} | {:<9.2} ms | {:<10.2} msg/s | {:<9.2} MB/s | {:<7.2} µs |",
-            r.broker_name, r.tls_engine, r.handshake_ms, r.throughput_msgs_sec, r.bandwidth_mb_sec, r.mean_latency_us
+            r.broker_name,
+            r.tls_engine,
+            r.handshake_ms,
+            r.throughput_msgs_sec,
+            r.bandwidth_mb_sec,
+            r.mean_latency_us
         );
     }
 }
 
 fn write_markdown_summary(path: &str, results: &[BenchmarkResult]) -> std::io::Result<()> {
     let mut file = File::create(path)?;
-    writeln!(file, "### 🔒 Empirical MQTT over TLS / mTLS Benchmark Comparison\n")?;
+    writeln!(
+        file,
+        "### 🔒 Empirical MQTT over TLS / mTLS Benchmark Comparison\n"
+    )?;
     writeln!(file, "| Broker | Cryptographic Engine | TLS Handshake | Throughput (msgs/sec) | Bandwidth | Mean Latency | p99 Latency |")?;
     writeln!(file, "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")?;
     for r in results {
@@ -330,6 +362,9 @@ fn write_markdown_summary(path: &str, results: &[BenchmarkResult]) -> std::io::R
             r.broker_name, r.tls_engine, r.handshake_ms, r.throughput_msgs_sec, r.bandwidth_mb_sec, r.mean_latency_us, r.p99_latency_us
         )?;
     }
-    writeln!(file, "\n*All metrics measured under active TLS 1.3 / mTLS mutual certificate authentication.*")?;
+    writeln!(
+        file,
+        "\n*All metrics measured under active TLS 1.3 / mTLS mutual certificate authentication.*"
+    )?;
     Ok(())
 }

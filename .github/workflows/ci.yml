@@ -98,3 +98,33 @@ jobs:
       - name: Run Cargo Audit
         uses: rustsec/audit-check@v2.0.0
         continue-on-error: true
+
+  comparative-tls-benchmarks:
+    name: Comparative TLS Benchmarks (WolfiMQ vs Mosquitto)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Task Runner
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: Install Eclipse Mosquitto & OpenSSL
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mosquitto mosquitto-clients openssl
+
+      - name: Generate mTLS Test Certificates
+        run: task certs:gen
+
+      - name: Execute Comparative TLS Benchmark (WolfiMQ vs Mosquitto)
+        run: task bench:tls:compare
+

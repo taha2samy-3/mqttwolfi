@@ -98,7 +98,10 @@ impl BrokerServer {
                 debug!("TLS Client #{} connecting from {}", client_id, peer_addr);
                 match acceptor_clone.accept(tcp_stream).await {
                     Ok(tls_stream) => {
-                        debug!("TLS handshake completed successfully for client #{}", client_id);
+                        debug!(
+                            "TLS handshake completed successfully for client #{}",
+                            client_id
+                        );
                         if let Err(e) = Self::handle_stream(
                             tls_stream,
                             client_id,
