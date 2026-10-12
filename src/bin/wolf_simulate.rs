@@ -6,9 +6,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
-use wolf_mqtt::protocol::{
-    ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS,
-};
+use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS};
 use wolf_mqtt::tls::create_tls_connector;
 
 static PID_GEN: AtomicU16 = AtomicU16::new(1);
@@ -172,8 +170,10 @@ impl ClientSession {
         topics: Vec<(&str, QoS)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let pid = next_pid();
-        let topic_pairs: Vec<(String, QoS)> =
-            topics.into_iter().map(|(t, q)| (t.to_string(), q)).collect();
+        let topic_pairs: Vec<(String, QoS)> = topics
+            .into_iter()
+            .map(|(t, q)| (t.to_string(), q))
+            .collect();
         self.send_packet(MqttPacket::Subscribe {
             packet_id: pid,
             topics: topic_pairs.clone(),
@@ -326,7 +326,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!();
                 println!("Options:");
                 println!("  --host <HOST>     Target broker hostname/IP (default: 127.0.0.1)");
-                println!("  --port <PORT>     Target broker port (default: 1883 for TCP, 8883 for TLS)");
+                println!(
+                    "  --port <PORT>     Target broker port (default: 1883 for TCP, 8883 for TLS)"
+                );
                 println!("  --tls             Connect via TLS 1.3 encrypted socket");
                 println!("  --delay <MS>      Delay in milliseconds between simulated steps (default: 500)");
                 println!("  --help, -h        Display this help message");
@@ -339,7 +341,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     println!("\x1b[1mSimulator Settings:\x1b[0m");
     println!("  Target Broker : {}:{}", host, port);
-    println!("  Encryption    : {}", if use_tls { "TLS 1.3 / mTLS (Active)" } else { "Plain TCP" });
+    println!(
+        "  Encryption    : {}",
+        if use_tls {
+            "TLS 1.3 / mTLS (Active)"
+        } else {
+            "Plain TCP"
+        }
+    );
     println!("  Step Interval : {} ms\n", step_delay);
 
     let delay = Duration::from_millis(step_delay);
