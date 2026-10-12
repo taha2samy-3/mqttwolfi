@@ -73,6 +73,10 @@ impl BrokerServer {
     }
 
     /// Returns the local socket address the server is listening on.
+    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
+        self.listener.local_addr()
+    }
+
     /// Starts the background periodic $SYS topic publisher task.
     pub fn start_sys_publisher(&self, interval_sec: u64) {
         let context = self.context.clone();
