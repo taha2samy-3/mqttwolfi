@@ -114,7 +114,7 @@ impl ClientSession {
                 keep_alive_sec: 60,
                 will,
                 username: username.map(|u| u.to_string()),
-                password: password.map(|p| p.to_vec()),
+                password: password.map(Bytes::copy_from_slice),
             }))
             .await?;
 

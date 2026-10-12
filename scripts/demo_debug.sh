@@ -40,6 +40,7 @@ trap cleanup EXIT INT TERM
 # 2. Check if ports 1883 or 8883 are already occupied
 if command -v fuser >/dev/null 2>&1; then
     fuser -k 1883/tcp 2>/dev/null || true
+    fuser -k 8883/tcp 2>/dev/null || true
 fi
 
 # 3. Start WolfiMQ Broker in DEBUG mode in the background
