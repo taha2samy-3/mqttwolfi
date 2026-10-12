@@ -127,3 +127,23 @@ tasks:
       - task test:e2e
       - task bench
     silent: false
+
+  run:debug:
+    desc: "Run WolfiMQ broker with verbose DEBUG tracing logs"
+    cmds:
+      - RUST_LOG="wolf_mqtt=debug,wolf_broker=debug,info" cargo run --bin wolf-broker -- --config config/broker.toml
+
+  simulate:
+    desc: "Run live traffic simulator against local broker (TCP port 1883)"
+    cmds:
+      - cargo run --bin wolf-simulate
+
+  simulate:tls:
+    desc: "Run live traffic simulator over TLS 1.3 encrypted connection (port 8883)"
+    cmds:
+      - cargo run --bin wolf-simulate -- --tls
+
+  demo:
+    desc: "Run end-to-end interactive demo (Broker with DEBUG logs + Live Simulator)"
+    cmds:
+      - bash scripts/demo_debug.sh
