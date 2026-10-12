@@ -1,3 +1,8 @@
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -203,9 +208,25 @@ impl UserAccount {
         }
     }
 
+    /// Computes Argon2id PHC string of input password using random salt.
+    pub fn hash_password_argon2(password: &[u8]) -> Result<String, String> {
+        let salt = SaltString::generate(&mut OsRng);
+        let argon2 = Argon2::default();
+        argon2
+            .hash_password(password, &salt)
+            .map(|h| h.to_string())
+            .map_err(|e| e.to_string())
+    }
+
     /// Verifies provided candidate password against the stored credential.
-    /// Supports both SHA-256 hashed and raw string comparison.
+    /// Supports Argon2id, SHA-256 hashed, and raw string comparison.
     pub fn verify_password(&self, candidate: &[u8]) -> bool {
+        if self.password_hash.starts_with("$argon2") {
+            if let Ok(parsed_hash) = PasswordHash::new(&self.password_hash) {
+                return Argon2::default().verify_password(candidate, &parsed_hash).is_ok();
+            }
+        }
+
         let candidate_hash = Self::hash_password(candidate);
         if candidate_hash == self.password_hash {
             return true;
@@ -654,5 +675,25 @@ mod tests {
         assert!(engine.check_publish(&admin, "c_alice", "rooms/room_alpha/chat"));
         assert!(engine.check_publish(&admin, "c_alice", "rooms/room_beta/chat"));
         assert!(engine.check_publish(&admin, "c_alice", "$SYS/broker/uptime"));
+    }
+
+    #[test]
+    fn test_argon2id_password_hashing() {
+        let password = b"complex_secret_passphrase_42!";
+        let argon2_hash = UserAccount::hash_password_argon2(password).unwrap();
+        assert!(argon2_hash.starts_with("$argon2id$"));
+
+        let account = UserAccount {
+            username: "sec_user".into(),
+            password_hash: argon2_hash,
+            role: UserRole::Member,
+            allowed_rooms: vec!["lobby".into()],
+            custom_rules: Vec::new(),
+        };
+
+        // Correct password verifies successfully
+        assert!(account.verify_password(password));
+        // Wrong password fails
+        assert!(!account.verify_password(b"wrong_passphrase"));
     }
 }

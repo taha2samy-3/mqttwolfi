@@ -45,8 +45,8 @@ fn bench_vbi_codec() {
     let mut buf = BytesMut::with_capacity(iterations * 4);
     let start_encode = Instant::now();
     for i in 0..iterations {
-        let val = values[i % values.len()];
-        let _ = encode_variable_byte_integer(val, &mut buf);
+        let val = std::hint::black_box(values[i % values.len()]);
+        let _ = std::hint::black_box(encode_variable_byte_integer(val, &mut buf));
     }
     let encode_duration = start_encode.elapsed();
     let encode_ops_sec = (iterations as f64) / encode_duration.as_secs_f64();
@@ -55,7 +55,8 @@ fn bench_vbi_codec() {
     let mut read_slice = &buf[..];
     let start_decode = Instant::now();
     for _ in 0..iterations {
-        let _ = decode_variable_byte_integer(&mut read_slice);
+        let decoded = decode_variable_byte_integer(&mut read_slice);
+        let _ = std::hint::black_box(decoded);
     }
     let decode_duration = start_decode.elapsed();
     let decode_ops_sec = (iterations as f64) / decode_duration.as_secs_f64();
@@ -402,17 +403,17 @@ fn bench_end_to_end_routing_pipeline() {
 
     let duration = start.elapsed();
     let msgs_sec = (iterations as f64) / duration.as_secs_f64();
-    let deliveries_sec = (total_routed as f64) / duration.as_secs_f64();
+    let match_rate = (total_routed as f64) / duration.as_secs_f64();
 
     println!(
         "  Subscribers     : {} active topic listeners",
         subscriber_count
     );
     println!("  Messages Process: {} messages", iterations);
-    println!("  Routing Speed   : {:.2} msgs/sec", msgs_sec);
+    println!("  Routing Speed   : {:.2} queries/sec", msgs_sec);
     println!(
-        "  Fan-out Throughput: {:.2} message-deliveries/sec\n",
-        deliveries_sec
+        "  Trie Match Rate : {:.2} subscriber-matches/sec\n",
+        match_rate
     );
 }
 
@@ -476,7 +477,7 @@ fn bench_retained_store() {
 /// 10. Concurrent Multi-Threaded Contention Routing Benchmark
 fn bench_concurrent_multithreaded_routing() {
     println!("--- 10. Concurrent Multi-Threaded Worker Lock Contention Routing ---");
-    let thread_count = 8;
+    let reader_threads = 7;
     let per_thread_messages = 50_000;
 
     let trie = Arc::new(std::sync::RwLock::new(TopicTrie::new()));
@@ -491,7 +492,18 @@ fn bench_concurrent_multithreaded_routing() {
     let mut handles = Vec::new();
     let total_matches = Arc::new(AtomicUsize::new(0));
 
-    for thread_idx in 0..thread_count {
+    // Active writer thread causing real read-write lock contention
+    let writer_trie = Arc::clone(&trie);
+    let writer_handle = thread::spawn(move || {
+        for i in 0..5_000 {
+            let filter = format!("fleet/churn_{}/telemetry", i % 10);
+            let mut guard = writer_trie.write().unwrap();
+            let _ = guard.subscribe(&filter, 999);
+            let _ = guard.unsubscribe(&filter, &999);
+        }
+    });
+
+    for thread_idx in 0..reader_threads {
         let trie_clone = Arc::clone(&trie);
         let matches_acc = Arc::clone(&total_matches);
 
@@ -508,22 +520,23 @@ fn bench_concurrent_multithreaded_routing() {
         handles.push(handle);
     }
 
+    writer_handle.join().unwrap();
     for h in handles {
         h.join().unwrap();
     }
 
     let duration = start.elapsed();
-    let total_messages = thread_count * per_thread_messages;
-    let total_deliveries = total_matches.load(Ordering::Relaxed);
+    let total_messages = reader_threads * per_thread_messages;
+    let total_matches_count = total_matches.load(Ordering::Relaxed);
     let msgs_sec = (total_messages as f64) / duration.as_secs_f64();
-    let deliveries_sec = (total_deliveries as f64) / duration.as_secs_f64();
+    let match_rate = (total_matches_count as f64) / duration.as_secs_f64();
 
-    println!("  Worker Threads  : {} concurrent OS threads", thread_count);
-    println!("  Total Messages  : {} messages", total_messages);
-    println!("  Throughput      : {:.2} msgs/sec", msgs_sec);
+    println!("  Reader Threads  : {} concurrent readers + 1 active writer", reader_threads);
+    println!("  Total Queries   : {} topic lookups", total_messages);
+    println!("  Query Speed     : {:.2} queries/sec", msgs_sec);
     println!(
-        "  Deliveries Speed: {:.2} message-deliveries/sec\n",
-        deliveries_sec
+        "  Trie Match Rate : {:.2} subscriber-matches/sec\n",
+        match_rate
     );
 }
 
@@ -624,12 +637,12 @@ fn bench_live_tcp_loopback_throughput() {
         let total_received = recv_task.await.unwrap();
         let duration = start.elapsed();
         let tcp_msgs_sec = (num_messages as f64) / duration.as_secs_f64();
-        let rtt_per_msg_us = (duration.as_micros() as f64) / (num_messages as f64);
+        let pipeline_us = (duration.as_micros() as f64) / (num_messages as f64);
 
         println!("  Socket Protocol : Asynchronous Tokio TCP Stream (Loopback)");
         println!("  Messages Sent   : {} messages", total_received);
         println!("  TCP Throughput  : {:.2} msgs/sec", tcp_msgs_sec);
-        println!("  Avg Socket RTT  : {:.2} µs / message\n", rtt_per_msg_us);
+        println!("  Pipeline Latency: {:.2} µs / msg (pipelined streaming)\n", pipeline_us);
     });
 }
 

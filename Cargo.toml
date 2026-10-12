@@ -6,6 +6,8 @@ authors = ["WolfMQTT Team"]
 description = "High-performance, secure MQTT v3.1.1 & v5.0 broker written in Rust with wolfSSL integration"
 license = "MIT OR Apache-2.0"
 
+rust-version = "1.80"
+
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
 bytes = "1.7"
@@ -19,6 +21,14 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2.2"
 rustls-pki-types = "1.10"
 sha2 = "0.10"
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 
 [dev-dependencies]
 tokio-test = "0.4"

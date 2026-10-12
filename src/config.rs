@@ -198,7 +198,7 @@ impl Default for ProtocolSettings {
         Self {
             allow_v311: true,
             allow_v500: true,
-            max_packet_size: 10_485_760, // 10 MB
+            max_packet_size: 4_194_304, // 4 MB
             receive_maximum: 65_535,
             topic_alias_maximum: 20,
             max_keep_alive_sec: 3600,
@@ -223,7 +223,7 @@ impl Default for QueueSettings {
     fn default() -> Self {
         Self {
             max_queued_messages: 5000,
-            max_queued_bytes: 5_242_880, // 5 MB
+            max_queued_bytes: 8_388_608, // 8 MB
             queue_full_policy: "drop_oldest".into(),
             default_message_expiry_sec: 86400,
             max_session_expiry_sec: 604800,
@@ -318,6 +318,22 @@ impl AppConfig {
             other => {
                 return Err(ConfigError::Validation(format!(
                     "Unsupported queue_full_policy: {other}. Expected drop_oldest, drop_newest, or reject_publisher"
+                )));
+            }
+        }
+
+        if (self.mqtt.protocol.max_packet_size as usize) > self.mqtt.queues.max_queued_bytes {
+            return Err(ConfigError::Validation(format!(
+                "Configuration conflict: max_packet_size ({} bytes) cannot exceed per-client max_queued_bytes ({} bytes)",
+                self.mqtt.protocol.max_packet_size, self.mqtt.queues.max_queued_bytes
+            )));
+        }
+
+        match self.security.auth.password_hash_algorithm.to_lowercase().as_str() {
+            "sha256" | "argon2" | "argon2id" => {}
+            other => {
+                return Err(ConfigError::Validation(format!(
+                    "Unsupported password_hash_algorithm: {other}. Expected sha256, argon2, or argon2id"
                 )));
             }
         }

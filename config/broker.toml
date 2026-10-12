@@ -100,8 +100,8 @@ allow_v311 = true
 # Enable support for MQTT v5.0 clients
 allow_v500 = true
 
-# Maximum allowable packet size in bytes (10 MB = 10485760 bytes)
-max_packet_size = 10485760
+# Maximum allowable packet size in bytes (4 MB = 4194304 bytes)
+max_packet_size = 4194304
 
 # Maximum in-flight unacknowledged QoS 1 and QoS 2 messages per client (Flow Control)
 receive_maximum = 65535
@@ -128,14 +128,14 @@ allow_shared_subscriptions = true
 # Maximum offline/in-flight message queue size per client (prevents OOM crashes)
 max_queued_messages = 5000
 
-# Maximum memory buffer allocation in bytes per client session (5 MB)
-max_queued_bytes = 5242880
+# Maximum memory buffer allocation in bytes per client session (8 MB = 8388608 bytes)
+max_queued_bytes = 8388608
 
 # Drop policy when a slow consumer's queue is full:
 # Options: "drop_oldest", "drop_newest", "reject_publisher"
 queue_full_policy = "drop_oldest"
 
-# Default message expiration time in seconds if not specified by publisher (0 = no expiry)
+# Default message expiration time in seconds if not specified by publisher (86400 = 24h, 0 = no expiry)
 default_message_expiry_sec = 86400
 
 # Maximum session expiry interval for offline persistent sessions in seconds (7 days)
