@@ -46,6 +46,10 @@ path = "src/main.rs"
 name = "wolf-bench-tls"
 path = "src/bin/wolf_bench_tls.rs"
 
+[[bin]]
+name = "wolf-simulate"
+path = "src/bin/wolf_simulate.rs"
+
 [[bench]]
 name = "wolf-bench"
 path = "benches/bench_throughput.rs"

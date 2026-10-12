@@ -27,9 +27,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "-v" | "--version" => {
                 #[cfg(feature = "wolfssl-fips")]
-                println!("wolf-mqtt-broker v0.1.0 (wolfSSL FIPS 140-2/3 Validated Cryptographic Module - TLS 1.3 / mTLS)");
+                println!("wolf-mqtt-broker v{} (wolfSSL FIPS 140-2/3 Validated Cryptographic Module - TLS 1.3 / mTLS)", env!("CARGO_PKG_VERSION"));
                 #[cfg(not(feature = "wolfssl-fips"))]
-                println!("wolf-mqtt-broker v0.1.0 (wolfSSL TLS 1.3 / mTLS)");
+                println!("wolf-mqtt-broker v{} (wolfSSL TLS 1.3 / mTLS)", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             _ => {}
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    info!("Starting wolf-mqtt-broker v0.1.0...");
+    info!("Starting wolf-mqtt-broker v{}...", env!("CARGO_PKG_VERSION"));
     #[cfg(feature = "wolfssl-fips")]
     info!("Cryptographic Engine: wolfSSL FIPS 140-2/3 Validated Cryptographic Module");
     #[cfg(not(feature = "wolfssl-fips"))]
