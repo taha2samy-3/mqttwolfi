@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(e) => {
                 error!("Failed to bind TCP listener on {}: {}", tcp_addr, e);
-                return Err(Box::new(e));
+                return Err(e.into());
             }
         }
     } else {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 const CLIENT_CHANNEL_CAPACITY: usize = 1024;
