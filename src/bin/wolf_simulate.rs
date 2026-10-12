@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use wolf_mqtt::protocol::{
-    ConnectPacket, MqttPacket, PacketType, ProtocolVersion, PublishPacket, QoS,
+    ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS,
 };
 use wolf_mqtt::tls::create_tls_connector;
 
@@ -90,7 +90,7 @@ impl ClientSession {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let stream = if use_tls {
             let ca_file = "certs/ca-cert.pem";
-            let connector = create_tls_connector(Some(ca_file), None, None)?;
+            let connector = create_tls_connector(ca_file, None)?;
             let tcp = TcpStream::connect((host, port)).await?;
             let server_name = ServerName::try_from("localhost")?.to_owned();
             let tls = connector.connect(server_name, tcp).await?;
@@ -122,11 +122,11 @@ impl ClientSession {
         match resp {
             MqttPacket::ConnAck {
                 session_present,
-                return_code,
+                reason_code,
             } => {
                 println!(
                     "    \x1b[32m✔\x1b[0m [CONNACK] Client '{}' authenticated (session_present: {}, code: {})",
-                    client_id, session_present, return_code
+                    client_id, session_present, reason_code
                 );
             }
             other => {
@@ -400,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         Ok(other) => {
                             println!("    \x1b[34mℹ\x1b[0m [Subscriber Event]: {:?}", other);
                         }
-                        Err(e) => {
+                        Err(_) => {
                             break;
                         }
                     }
