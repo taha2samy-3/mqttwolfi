@@ -253,7 +253,7 @@ impl UserAccount {
 }
 
 pub struct AclEngine {
-    users: Arc<RwLock<HashMap<String, UserAccount>>>,
+    users: Arc<RwLock<HashMap<String, Arc<UserAccount>>>>,
     allow_anonymous: bool,
     default_rules: Vec<AclRule>,
 }
@@ -292,7 +292,7 @@ impl AclEngine {
 
     pub async fn add_user(&self, account: UserAccount) {
         let mut guard = self.users.write().await;
-        guard.insert(account.username.clone(), account);
+        guard.insert(account.username.clone(), Arc::new(account));
     }
 
     pub async fn remove_user(&self, username: &str) -> bool {
@@ -300,7 +300,7 @@ impl AclEngine {
         guard.remove(username).is_some()
     }
 
-    pub async fn get_user(&self, username: &str) -> Option<UserAccount> {
+    pub async fn get_user(&self, username: &str) -> Option<Arc<UserAccount>> {
         let guard = self.users.read().await;
         guard.get(username).cloned()
     }
@@ -311,22 +311,45 @@ impl AclEngine {
         username: Option<&str>,
         password: Option<&[u8]>,
         client_id: &str,
-    ) -> Result<UserAccount, AuthError> {
+    ) -> Result<Arc<UserAccount>, AuthError> {
         match username {
             Some(u) => {
-                let guard = self.users.read().await;
-                if let Some(user) = guard.get(u) {
-                    let pass_bytes = password.unwrap_or(b"");
-                    if user.verify_password(pass_bytes) {
-                        debug!(
-                            "User '{}' authenticated successfully (role: {:?})",
-                            u, user.role
-                        );
-                        Ok(user.clone())
-                    } else {
+                let user_opt = {
+                    let guard = self.users.read().await;
+                    guard.get(u).cloned()
+                };
+                if let Some(user) = user_opt {
+                    let pass_bytes = match password {
+                        Some(p) if !p.is_empty() => p,
+                        _ => return Err(AuthError::BadCredentials),
+                    };
+
+                    let user_clone = Arc::clone(&user);
+                    let pass_vec = pass_bytes.to_vec();
+                    let verified = tokio::task::spawn_blocking(move || {
+                        user_clone.verify_password(&pass_vec)
+                    })
+                    .await
+                    .unwrap_or(false);
+
+                    if !verified {
                         warn!("Authentication failed for user '{}': invalid password", u);
-                        Err(AuthError::BadCredentials)
+                        return Err(AuthError::BadCredentials);
                     }
+
+                    if user.role == UserRole::Device && user.username != client_id {
+                        warn!(
+                            "Device '{}' attempted to connect with mismatched client ID '{}'",
+                            user.username, client_id
+                        );
+                        return Err(AuthError::BadCredentials);
+                    }
+
+                    debug!(
+                        "User '{}' authenticated successfully (role: {:?})",
+                        u, user.role
+                    );
+                    Ok(user)
                 } else {
                     warn!("Authentication failed: user '{}' does not exist", u);
                     Err(AuthError::UserNotFound(u.to_string()))
@@ -335,13 +358,13 @@ impl AclEngine {
             None => {
                 if self.allow_anonymous {
                     debug!("Anonymous connection accepted for client '{}'", client_id);
-                    Ok(UserAccount {
+                    Ok(Arc::new(UserAccount {
                         username: "anonymous".into(),
                         password_hash: String::new(),
                         role: UserRole::Custom("anonymous".into()),
                         allowed_rooms: Vec::new(),
                         custom_rules: self.default_rules.clone(),
-                    })
+                    }))
                 } else {
                     warn!("Anonymous connection rejected for client '{}'", client_id);
                     Err(AuthError::AnonymousNotAllowed)
