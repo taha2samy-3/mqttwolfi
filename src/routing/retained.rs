@@ -2,15 +2,27 @@ use crate::protocol::PublishPacket;
 use crate::routing::TopicTrie;
 use std::collections::HashMap;
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct RetainedStore {
     messages: HashMap<String, PublishPacket>,
+    max_messages: usize,
+}
+
+impl Default for RetainedStore {
+    fn default() -> Self {
+        Self::with_max_messages(100_000)
+    }
 }
 
 impl RetainedStore {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_max_messages(max_messages: usize) -> Self {
         Self {
             messages: HashMap::new(),
+            max_messages,
         }
     }
 
@@ -23,6 +35,17 @@ impl RetainedStore {
         } else {
             // Ensure retain flag is true in the stored message
             packet.retain = true;
+            if self.messages.len() >= self.max_messages
+                && !self.messages.contains_key(&packet.topic)
+            {
+                tracing::warn!(
+                    "Retained store quota exceeded ({}/{}). Rejecting new topic '{}'",
+                    self.messages.len(),
+                    self.max_messages,
+                    packet.topic
+                );
+                return false;
+            }
             self.messages.insert(packet.topic.clone(), packet);
             true
         }
