@@ -23,6 +23,11 @@ tokio-test = "0.4"
 name = "wolf-broker"
 path = "src/main.rs"
 
+[[bench]]
+name = "wolf-bench"
+path = "benches/bench_throughput.rs"
+harness = false
+
 [lib]
 name = "wolf_mqtt"
 path = "src/lib.rs"

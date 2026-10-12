@@ -3,9 +3,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use wolf_mqtt::protocol::{
-    ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS,
-};
+use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS};
 use wolf_mqtt::server::BrokerServer;
 
 async fn read_packet(stream: &mut TcpStream) -> MqttPacket {
@@ -24,7 +22,9 @@ async fn read_packet(stream: &mut TcpStream) -> MqttPacket {
 
 async fn send_packet(stream: &mut TcpStream, packet: MqttPacket) {
     let mut buf = BytesMut::new();
-    packet.encode(&mut buf).expect("Encoding packet must succeed");
+    packet
+        .encode(&mut buf)
+        .expect("Encoding packet must succeed");
     stream.write_all(&buf).await.expect("Write must succeed");
 }
 
@@ -55,7 +55,8 @@ async fn test_e2e_real_tcp_pub_sub_exchange() {
             clean_start: true,
             keep_alive_sec: 60,
         }),
-    ).await;
+    )
+    .await;
 
     let connack = timeout(Duration::from_secs(2), read_packet(&mut sub_stream))
         .await
@@ -75,7 +76,8 @@ async fn test_e2e_real_tcp_pub_sub_exchange() {
             packet_id: 1,
             topics: vec![("factory/+/temperature".into(), QoS::AtMostOnce)],
         },
-    ).await;
+    )
+    .await;
 
     let suback = timeout(Duration::from_secs(2), read_packet(&mut sub_stream))
         .await
@@ -101,7 +103,8 @@ async fn test_e2e_real_tcp_pub_sub_exchange() {
             clean_start: true,
             keep_alive_sec: 60,
         }),
-    ).await;
+    )
+    .await;
 
     let pub_connack = timeout(Duration::from_secs(2), read_packet(&mut pub_stream))
         .await
@@ -126,7 +129,8 @@ async fn test_e2e_real_tcp_pub_sub_exchange() {
             packet_id: None,
             payload: test_payload.clone(),
         }),
-    ).await;
+    )
+    .await;
 
     // 4. Subscriber receives forwarded message over TCP
     let received_pkt = timeout(Duration::from_secs(2), read_packet(&mut sub_stream))
@@ -159,13 +163,18 @@ async fn test_e2e_ping_pong_and_clean_disconnect() {
             clean_start: true,
             keep_alive_sec: 10,
         }),
-    ).await;
+    )
+    .await;
 
-    let _ = timeout(Duration::from_secs(2), read_packet(&mut stream)).await.unwrap();
+    let _ = timeout(Duration::from_secs(2), read_packet(&mut stream))
+        .await
+        .unwrap();
 
     // Send PINGREQ
     send_packet(&mut stream, MqttPacket::PingReq).await;
-    let pingresp = timeout(Duration::from_secs(2), read_packet(&mut stream)).await.unwrap();
+    let pingresp = timeout(Duration::from_secs(2), read_packet(&mut stream))
+        .await
+        .unwrap();
     assert_eq!(pingresp, MqttPacket::PingResp);
 
     // Send DISCONNECT
@@ -190,9 +199,12 @@ async fn test_e2e_qos1_publish_and_puback() {
             clean_start: true,
             keep_alive_sec: 60,
         }),
-    ).await;
+    )
+    .await;
 
-    let _ = timeout(Duration::from_secs(2), read_packet(&mut stream)).await.unwrap();
+    let _ = timeout(Duration::from_secs(2), read_packet(&mut stream))
+        .await
+        .unwrap();
 
     // Send QoS 1 Publish with PacketID 777
     send_packet(
@@ -205,9 +217,12 @@ async fn test_e2e_qos1_publish_and_puback() {
             packet_id: Some(777),
             payload: Bytes::from_static(b"CRITICAL_ALERT"),
         }),
-    ).await;
+    )
+    .await;
 
     // Expect PubAck with matching packet_id 777
-    let ack = timeout(Duration::from_secs(2), read_packet(&mut stream)).await.unwrap();
+    let ack = timeout(Duration::from_secs(2), read_packet(&mut stream))
+        .await
+        .unwrap();
     assert_eq!(ack, MqttPacket::PubAck { packet_id: 777 });
 }

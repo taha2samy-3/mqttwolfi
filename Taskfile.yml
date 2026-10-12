@@ -44,15 +44,26 @@ tasks:
       - cargo test --lib -- --nocapture
 
   test:integration:
-    desc: "Run end-to-end integration tests (Client life cycle, Pub/Sub, QoS)"
+    desc: "Run integration tests (Client life cycle, Pub/Sub, QoS)"
     cmds:
       - cargo test --test '*' -- --nocapture
 
+  test:e2e:
+    desc: "Run live TCP network end-to-end socket communication tests"
+    cmds:
+      - cargo test --test test_e2e_network -- --nocapture
+
   test:all:
-    desc: "Run all test suites including unit and integration tests"
+    desc: "Run all test suites including unit, integration, and E2E tests"
     cmds:
       - task test:unit
       - task test:integration
+      - task test:e2e
+
+  bench:
+    desc: "Run high-precision performance benchmarks in release mode"
+    cmds:
+      - cargo bench --bench wolf-bench
 
   test:miri:
     desc: "Run Miri test suite to detect undefined behavior and FFI pointer safety"
@@ -70,10 +81,12 @@ tasks:
       - cargo build --release
 
   ci:
-    desc: "Run full local CI pipeline (Format + Check + Lint + All Tests)"
+    desc: "Run full local CI pipeline (Format + Check + Lint + All Tests + E2E + Bench)"
     cmds:
       - task fmt
       - task check
       - task lint
       - task test
+      - task test:e2e
+      - task bench
     silent: false

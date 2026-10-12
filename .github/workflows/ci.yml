@@ -37,8 +37,8 @@ jobs:
       - name: Run Clippy Linter
         run: task lint
 
-  unit-and-integration-tests:
-    name: Unit & Integration Test Suite
+  test-suite:
+    name: Unit, Integration & E2E Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -63,6 +63,30 @@ jobs:
 
       - name: Run Integration Tests (Session & Topic Routing)
         run: task test:integration
+
+      - name: Run Live TCP Socket E2E Network Tests
+        run: task test:e2e
+
+  benchmarks:
+    name: Release Performance Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Task Runner
+        uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: Execute High-Precision Benchmarks
+        run: task bench
 
   security-audit:
     name: Security & Vulnerability Audit

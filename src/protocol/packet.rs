@@ -309,8 +309,8 @@ impl MqttPacket {
                     }
                     let mut topic_bytes = vec![0u8; topic_len];
                     src.copy_to_slice(&mut topic_bytes);
-                    let topic = String::from_utf8(topic_bytes)
-                        .map_err(|_| PacketError::InvalidString)?;
+                    let topic =
+                        String::from_utf8(topic_bytes).map_err(|_| PacketError::InvalidString)?;
                     let qos = QoS::try_from(src.get_u8())?;
                     topics.push((topic, qos));
                     bytes_left = bytes_left.saturating_sub(2 + topic_len + 1);

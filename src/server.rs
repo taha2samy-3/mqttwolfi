@@ -53,7 +53,9 @@ impl BrokerServer {
 
             tokio::spawn(async move {
                 debug!("Client #{} connected from {}", client_id, peer_addr);
-                if let Err(e) = Self::handle_client(stream, client_id, router_clone, clients_clone).await {
+                if let Err(e) =
+                    Self::handle_client(stream, client_id, router_clone, clients_clone).await
+                {
                     warn!("Client #{} disconnected with error: {}", client_id, e);
                 } else {
                     debug!("Client #{} disconnected cleanly", client_id);
@@ -106,7 +108,10 @@ impl BrokerServer {
 
                         match packet {
                             MqttPacket::Connect(conn) => {
-                                debug!("CONNECT from client '{}' (id: {})", conn.client_id, client_id);
+                                debug!(
+                                    "CONNECT from client '{}' (id: {})",
+                                    conn.client_id, client_id
+                                );
                                 let connack = MqttPacket::ConnAck {
                                     session_present: false,
                                     reason_code: 0x00,
