@@ -5,7 +5,7 @@ use crate::routing::TopicTrie;
 use bytes::{Buf, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -13,41 +13,63 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+const CLIENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Shared broker state across all network listeners (TCP, TLS, etc.)
+#[derive(Clone)]
+pub struct BrokerContext {
+    pub router: Arc<RwLock<TopicTrie<u64>>>,
+    pub clients: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
+    pub retained: Arc<RwLock<RetainedStore>>,
+    pub acl: Arc<AclEngine>,
+    pub client_sessions: Arc<RwLock<HashMap<String, u64>>>,
+}
+
+impl BrokerContext {
+    pub fn new(acl: Arc<AclEngine>) -> Self {
+        Self {
+            router: Arc::new(RwLock::new(TopicTrie::new())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            retained: Arc::new(RwLock::new(RetainedStore::new())),
+            acl,
+            client_sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
 
 pub struct BrokerServer {
     listener: TcpListener,
-    router: Arc<RwLock<TopicTrie<u64>>>,
-    clients: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Bytes>>>>,
-    retained: Arc<RwLock<RetainedStore>>,
-    acl: Arc<AclEngine>,
+    context: BrokerContext,
 }
 
 impl BrokerServer {
     /// Binds the broker to a specific socket address (e.g., "127.0.0.1:0" for an ephemeral port).
     pub async fn bind(addr: &str) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind(addr).await?;
-        let router = Arc::new(RwLock::new(TopicTrie::new()));
-        let clients = Arc::new(RwLock::new(HashMap::new()));
-        let retained = Arc::new(RwLock::new(RetainedStore::new()));
-        let acl = Arc::new(AclEngine::new(true));
-        Ok(Self {
-            listener,
-            router,
-            clients,
-            retained,
-            acl,
-        })
+        let context = BrokerContext::new(Arc::new(AclEngine::new(true)));
+        Ok(Self { listener, context })
+    }
+
+    /// Attaches an existing shared BrokerContext to this server instance.
+    pub fn with_context(mut self, context: BrokerContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Returns a reference to the shared BrokerContext.
+    pub fn context(&self) -> &BrokerContext {
+        &self.context
     }
 
     /// Attaches a custom AclEngine to the broker for authentication and authorization.
     pub fn with_acl(mut self, acl: Arc<AclEngine>) -> Self {
-        self.acl = acl;
+        self.context.acl = acl;
         self
     }
 
     /// Returns a reference to the broker's AclEngine.
     pub fn acl(&self) -> &Arc<AclEngine> {
-        &self.acl
+        &self.context.acl
     }
 
     /// Returns the local socket address the server is listening on.
@@ -57,10 +79,7 @@ impl BrokerServer {
 
     /// Runs the server event loop accepting client connections concurrently.
     pub async fn run(self) -> Result<(), std::io::Error> {
-        let router = self.router;
-        let clients = self.clients;
-        let retained = self.retained;
-        let acl = self.acl;
+        let context = self.context;
         info!(
             "WolfiMQ TCP server running on {}",
             self.listener.local_addr()?
@@ -69,37 +88,19 @@ impl BrokerServer {
         loop {
             let (stream, peer_addr) = self.listener.accept().await?;
             let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
-            let router_clone = Arc::clone(&router);
-            let clients_clone = Arc::clone(&clients);
-            let retained_clone = Arc::clone(&retained);
-            let acl_clone = Arc::clone(&acl);
+            let ctx = context.clone();
 
             tokio::spawn(async move {
                 debug!("Client #{} connected from {}", client_id, peer_addr);
-                if let Err(e) = Self::handle_stream(
-                    stream,
-                    client_id,
-                    router_clone,
-                    clients_clone,
-                    retained_clone,
-                    acl_clone,
-                )
-                .await
-                {
-                    warn!("Client #{} disconnected with error: {}", client_id, e);
-                } else {
-                    debug!("Client #{} disconnected cleanly", client_id);
-                }
+                Self::handle_stream(stream, client_id, ctx).await;
+                debug!("Client #{} connection handler closed", client_id);
             });
         }
     }
 
     /// Runs the server event loop with TLS encryption enabled.
     pub async fn run_tls(self, acceptor: tokio_rustls::TlsAcceptor) -> Result<(), std::io::Error> {
-        let router = self.router;
-        let clients = self.clients;
-        let retained = self.retained;
-        let acl = self.acl;
+        let context = self.context;
         info!(
             "WolfiMQ TLS server running on {}",
             self.listener.local_addr()?
@@ -108,10 +109,7 @@ impl BrokerServer {
         loop {
             let (tcp_stream, peer_addr) = self.listener.accept().await?;
             let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
-            let router_clone = Arc::clone(&router);
-            let clients_clone = Arc::clone(&clients);
-            let retained_clone = Arc::clone(&retained);
-            let acl_clone = Arc::clone(&acl);
+            let ctx = context.clone();
             let acceptor_clone = acceptor.clone();
 
             tokio::spawn(async move {
@@ -122,20 +120,7 @@ impl BrokerServer {
                             "TLS handshake completed successfully for client #{}",
                             client_id
                         );
-                        if let Err(e) = Self::handle_stream(
-                            tls_stream,
-                            client_id,
-                            router_clone,
-                            clients_clone,
-                            retained_clone,
-                            acl_clone,
-                        )
-                        .await
-                        {
-                            warn!("TLS Client #{} disconnected with error: {}", client_id, e);
-                        } else {
-                            debug!("TLS Client #{} disconnected cleanly", client_id);
-                        }
+                        Self::handle_stream(tls_stream, client_id, ctx).await;
                     }
                     Err(e) => {
                         warn!("TLS handshake failed for peer {}: {}", peer_addr, e);
@@ -145,27 +130,20 @@ impl BrokerServer {
         }
     }
 
-    async fn handle_stream<S>(
-        stream: S,
-        client_id: u64,
-        router: Arc<RwLock<TopicTrie<u64>>>,
-        clients: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Bytes>>>>,
-        retained: Arc<RwLock<RetainedStore>>,
-        acl: Arc<AclEngine>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    async fn handle_stream<S>(stream: S, client_id: u64, context: BrokerContext)
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static,
     {
         let (mut read_half, mut write_half) = tokio::io::split(stream);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_CAPACITY);
 
         // Register client sender in the active clients map
         {
-            let mut clients_guard = clients.write().await;
+            let mut clients_guard = context.clients.write().await;
             clients_guard.insert(client_id, tx.clone());
         }
 
-        // Spawn a background task to flush outbound messages from the channel to the TCP socket
+        // Background task to flush outbound messages from channel to TCP stream
         let write_task = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if write_half.write_all(&msg).await.is_err() {
@@ -179,15 +157,39 @@ impl BrokerServer {
         let mut subscribed_topics = Vec::new();
         let mut client_will: Option<PublishPacket> = None;
         let mut clean_disconnect = false;
-        let mut current_user: Option<UserAccount> = None;
+        let mut current_user: Option<Arc<UserAccount>> = None;
         let mut connected_client_id: String = String::new();
+        let mut is_connected = false;
+        let mut client_keep_alive: u16 = 60;
+        let next_outbound_pid = Arc::new(AtomicU16::new(1));
 
-        loop {
-            let bytes_read = read_half.read_buf(&mut read_buf).await?;
-            if bytes_read == 0 {
-                // Client closed socket (EOF)
-                break;
-            }
+        'connection: loop {
+            let keep_alive_duration = if is_connected && client_keep_alive > 0 {
+                std::time::Duration::from_millis((client_keep_alive as u64) * 1500)
+            } else {
+                std::time::Duration::from_secs(60) // initial connect timeout
+            };
+
+            let read_result =
+                tokio::time::timeout(keep_alive_duration, read_half.read_buf(&mut read_buf)).await;
+
+            let bytes_read = match read_result {
+                Ok(Ok(0)) => break 'connection, // EOF
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    warn!("Client #{} I/O error: {}", client_id, e);
+                    break 'connection;
+                }
+                Err(_) => {
+                    warn!(
+                        "Client #{} keep-alive timeout exceeded ({}s)",
+                        client_id, client_keep_alive
+                    );
+                    break 'connection;
+                }
+            };
+
+            let _ = bytes_read;
 
             // Process all complete MQTT packets in buffer
             while !read_buf.is_empty() {
@@ -199,11 +201,33 @@ impl BrokerServer {
 
                         match packet {
                             MqttPacket::Connect(conn) => {
+                                if is_connected {
+                                    warn!(
+                                        "Client #{} sent second CONNECT; disconnecting (protocol violation)",
+                                        client_id
+                                    );
+                                    break 'connection;
+                                }
+
+                                if conn.client_id.is_empty() && !conn.clean_start {
+                                    // MQTT-3.1.3-1: 0-byte client ID with CleanSession=0 rejected
+                                    let connack = MqttPacket::ConnAck {
+                                        session_present: false,
+                                        reason_code: 0x02, // Identifier rejected
+                                    };
+                                    let mut ack_buf = BytesMut::new();
+                                    if connack.encode(&mut ack_buf).is_ok() {
+                                        let _ = tx.send(ack_buf.freeze()).await;
+                                    }
+                                    break 'connection;
+                                }
+
                                 debug!(
                                     "CONNECT from client '{}' (id: {})",
                                     conn.client_id, client_id
                                 );
-                                match acl
+                                match context
+                                    .acl
                                     .authenticate(
                                         conn.username.as_deref(),
                                         conn.password.as_deref(),
@@ -212,16 +236,39 @@ impl BrokerServer {
                                     .await
                                 {
                                     Ok(user) => {
+                                        is_connected = true;
                                         connected_client_id = conn.client_id.clone();
+                                        client_keep_alive = conn.keep_alive_sec;
                                         current_user = Some(user);
                                         client_will = conn.will;
+
+                                        // Duplicate Client ID handling (disconnect old session)
+                                        if !connected_client_id.is_empty() {
+                                            let mut sessions_guard =
+                                                context.client_sessions.write().await;
+                                            if let Some(old_id) = sessions_guard
+                                                .insert(connected_client_id.clone(), client_id)
+                                            {
+                                                if old_id != client_id {
+                                                    warn!(
+                                                        "Client ID '{}' reconnected; disconnecting old session #{}",
+                                                        connected_client_id, old_id
+                                                    );
+                                                    let mut clients_guard =
+                                                        context.clients.write().await;
+                                                    clients_guard.remove(&old_id);
+                                                }
+                                            }
+                                        }
+
                                         let connack = MqttPacket::ConnAck {
                                             session_present: false,
                                             reason_code: 0x00,
                                         };
                                         let mut ack_buf = BytesMut::new();
-                                        connack.encode(&mut ack_buf)?;
-                                        tx.send(ack_buf.freeze())?;
+                                        if connack.encode(&mut ack_buf).is_ok() {
+                                            let _ = tx.send(ack_buf.freeze()).await;
+                                        }
                                     }
                                     Err(auth_err) => {
                                         warn!(
@@ -240,75 +287,143 @@ impl BrokerServer {
                                             reason_code,
                                         };
                                         let mut ack_buf = BytesMut::new();
-                                        connack.encode(&mut ack_buf)?;
-                                        let _ = tx.send(ack_buf.freeze());
+                                        if connack.encode(&mut ack_buf).is_ok() {
+                                            let _ = tx.send(ack_buf.freeze()).await;
+                                        }
                                         tokio::time::sleep(tokio::time::Duration::from_millis(10))
                                             .await;
-                                        break;
+                                        break 'connection;
                                     }
                                 }
                             }
                             MqttPacket::Subscribe { packet_id, topics } => {
-                                let mut return_codes = Vec::new();
-                                let mut matched_retained = Vec::new();
+                                if !is_connected {
+                                    warn!(
+                                        "Client #{} sent SUBSCRIBE before CONNECT; disconnecting",
+                                        client_id
+                                    );
+                                    break 'connection;
+                                }
 
-                                let user = current_user.clone().unwrap_or_else(|| UserAccount {
-                                    username: "anonymous".into(),
-                                    password_hash: String::new(),
-                                    role: UserRole::Custom("anonymous".into()),
-                                    allowed_rooms: Vec::new(),
-                                    custom_rules: Vec::new(),
+                                let mut return_codes = Vec::new();
+                                let mut authorized_filters = Vec::new();
+
+                                let user = current_user.clone().unwrap_or_else(|| {
+                                    Arc::new(UserAccount {
+                                        username: "anonymous".into(),
+                                        password_hash: String::new(),
+                                        role: UserRole::Custom("anonymous".into()),
+                                        allowed_rooms: Vec::new(),
+                                        custom_rules: Vec::new(),
+                                    })
                                 });
 
-                                {
-                                    let mut router_guard = router.write().await;
-                                    let retained_guard = retained.read().await;
-                                    for (topic_filter, qos) in &topics {
-                                        if acl.check_subscribe(
-                                            &user,
-                                            &connected_client_id,
-                                            topic_filter,
-                                        ) {
-                                            if router_guard
-                                                .subscribe(topic_filter, client_id)
-                                                .is_ok()
-                                            {
-                                                subscribed_topics.push(topic_filter.clone());
-                                                return_codes.push(*qos as u8);
-                                                // Collect matching retained messages for this new subscription
-                                                let matches = retained_guard
-                                                    .get_matches_for_filter(topic_filter);
-                                                matched_retained.extend(matches);
-                                            } else {
-                                                return_codes.push(0x80); // Failure
-                                            }
+                                // Step 1: Authorization check outside router write lock
+                                for (topic_filter, qos) in &topics {
+                                    if context.acl.check_subscribe(
+                                        &user,
+                                        &connected_client_id,
+                                        topic_filter,
+                                    ) {
+                                        let granted_qos = if *qos == QoS::ExactlyOnce {
+                                            QoS::AtLeastOnce
                                         } else {
-                                            warn!(
-                                                "Subscribe authorization denied for user '{}' on '{}'",
-                                                user.username, topic_filter
-                                            );
-                                            return_codes.push(0x80); // Unauthorized
+                                            *qos
+                                        };
+                                        authorized_filters
+                                            .push((topic_filter.clone(), granted_qos));
+                                        return_codes.push(granted_qos as u8);
+                                    } else {
+                                        warn!(
+                                            "Subscribe authorization denied for user '{}' on '{}'",
+                                            user.username, topic_filter
+                                        );
+                                        return_codes.push(0x80); // Unauthorized
+                                    }
+                                }
+
+                                // Step 2: Minimal router write lock to register subscriptions
+                                {
+                                    let mut router_guard = context.router.write().await;
+                                    for (topic_filter, _) in &authorized_filters {
+                                        if router_guard.subscribe(topic_filter, client_id).is_ok() {
+                                            if !subscribed_topics.contains(topic_filter) {
+                                                subscribed_topics.push(topic_filter.clone());
+                                            }
                                         }
                                     }
                                 }
+
+                                // Step 3: Respond with SubAck
                                 let suback = MqttPacket::SubAck {
                                     packet_id,
                                     return_codes,
                                 };
                                 let mut ack_buf = BytesMut::new();
-                                suback.encode(&mut ack_buf)?;
-                                tx.send(ack_buf.freeze())?;
+                                if suback.encode(&mut ack_buf).is_ok() {
+                                    let _ = tx.send(ack_buf.freeze()).await;
+                                }
 
-                                // Deliver matching retained messages to the newly subscribed client
-                                for ret_pkt in matched_retained {
+                                // Step 4: Retained message queries with read lock
+                                let mut matched_retained = Vec::new();
+                                {
+                                    let retained_guard = context.retained.read().await;
+                                    for (topic_filter, _) in &authorized_filters {
+                                        let matches =
+                                            retained_guard.get_matches_for_filter(topic_filter);
+                                        matched_retained.extend(matches);
+                                    }
+                                }
+
+                                // Deliver matching retained messages (with retain=true and assigned packet_id)
+                                for mut ret_pkt in matched_retained {
+                                    ret_pkt.retain = true;
+                                    if ret_pkt.qos != QoS::AtMostOnce
+                                        && ret_pkt.packet_id.is_none()
+                                    {
+                                        ret_pkt.packet_id = Some(
+                                            next_outbound_pid.fetch_add(1, Ordering::Relaxed),
+                                        );
+                                    }
                                     let mut ret_buf = BytesMut::new();
                                     let ret_packet = MqttPacket::Publish(ret_pkt);
                                     if ret_packet.encode(&mut ret_buf).is_ok() {
-                                        let _ = tx.send(ret_buf.freeze());
+                                        let _ = tx.send(ret_buf.freeze()).await;
                                     }
                                 }
                             }
+                            MqttPacket::Unsubscribe { packet_id, topics } => {
+                                if !is_connected {
+                                    warn!(
+                                        "Client #{} sent UNSUBSCRIBE before CONNECT",
+                                        client_id
+                                    );
+                                    break 'connection;
+                                }
+
+                                {
+                                    let mut router_guard = context.router.write().await;
+                                    for topic in &topics {
+                                        router_guard.unsubscribe(topic, &client_id);
+                                        subscribed_topics.retain(|t| t != topic);
+                                    }
+                                }
+
+                                let unsuback = MqttPacket::UnsubAck { packet_id };
+                                let mut ack_buf = BytesMut::new();
+                                if unsuback.encode(&mut ack_buf).is_ok() {
+                                    let _ = tx.send(ack_buf.freeze()).await;
+                                }
+                            }
                             MqttPacket::Publish(pub_pkt) => {
+                                if !is_connected {
+                                    warn!(
+                                        "Client #{} sent PUBLISH before CONNECT; disconnecting",
+                                        client_id
+                                    );
+                                    break 'connection;
+                                }
+
                                 debug!(
                                     "PUBLISH topic '{}', len {}, retain {}",
                                     pub_pkt.topic,
@@ -316,15 +431,21 @@ impl BrokerServer {
                                     pub_pkt.retain
                                 );
 
-                                let user = current_user.clone().unwrap_or_else(|| UserAccount {
-                                    username: "anonymous".into(),
-                                    password_hash: String::new(),
-                                    role: UserRole::Custom("anonymous".into()),
-                                    allowed_rooms: Vec::new(),
-                                    custom_rules: Vec::new(),
+                                let user = current_user.clone().unwrap_or_else(|| {
+                                    Arc::new(UserAccount {
+                                        username: "anonymous".into(),
+                                        password_hash: String::new(),
+                                        role: UserRole::Custom("anonymous".into()),
+                                        allowed_rooms: Vec::new(),
+                                        custom_rules: Vec::new(),
+                                    })
                                 });
 
-                                if !acl.check_publish(&user, &connected_client_id, &pub_pkt.topic) {
+                                if !context.acl.check_publish(
+                                    &user,
+                                    &connected_client_id,
+                                    &pub_pkt.topic,
+                                ) {
                                     warn!(
                                         "Publish authorization denied for user '{}' on topic '{}'",
                                         user.username, pub_pkt.topic
@@ -334,71 +455,102 @@ impl BrokerServer {
 
                                 // If retain flag is set, update retained messages store
                                 if pub_pkt.retain {
-                                    let mut retained_guard = retained.write().await;
+                                    let mut retained_guard = context.retained.write().await;
                                     retained_guard.update(pub_pkt.clone());
                                 }
 
                                 // Forward to matching subscribers
                                 let matched_ids = {
-                                    let router_guard = router.read().await;
+                                    let router_guard = context.router.read().await;
                                     router_guard.matches(&pub_pkt.topic)
                                 };
 
-                                let mut forward_buf = BytesMut::new();
-                                let forward_packet = MqttPacket::Publish(pub_pkt.clone());
-                                forward_packet.encode(&mut forward_buf)?;
-                                let frozen = forward_buf.freeze();
-
+                                let mut forward_pkt = pub_pkt.clone();
+                                // MQTT-3.3.1-9: Retain flag is cleared when forwarding to existing subscribers
+                                forward_pkt.retain = false;
+                                if forward_pkt.qos != QoS::AtMostOnce
+                                    && forward_pkt.packet_id.is_none()
                                 {
-                                    let clients_guard = clients.read().await;
+                                    forward_pkt.packet_id =
+                                        Some(next_outbound_pid.fetch_add(1, Ordering::Relaxed));
+                                }
+
+                                let mut forward_buf = BytesMut::new();
+                                let forward_packet = MqttPacket::Publish(forward_pkt);
+                                if forward_packet.encode(&mut forward_buf).is_ok() {
+                                    let frozen = forward_buf.freeze();
+                                    let clients_guard = context.clients.read().await;
                                     for target_id in matched_ids {
                                         if let Some(target_tx) = clients_guard.get(&target_id) {
-                                            let _ = target_tx.send(frozen.clone());
+                                            let _ = target_tx.try_send(frozen.clone());
                                         }
                                     }
                                 }
 
-                                // If QoS 1, respond with PUBACK to the publisher
-                                if pub_pkt.qos == QoS::AtLeastOnce {
-                                    if let Some(pid) = pub_pkt.packet_id {
-                                        let puback = MqttPacket::PubAck { packet_id: pid };
-                                        let mut ack_buf = BytesMut::new();
-                                        puback.encode(&mut ack_buf)?;
-                                        tx.send(ack_buf.freeze())?;
+                                // Acknowledge publisher according to QoS
+                                match pub_pkt.qos {
+                                    QoS::AtLeastOnce => {
+                                        if let Some(pid) = pub_pkt.packet_id {
+                                            let puback = MqttPacket::PubAck { packet_id: pid };
+                                            let mut ack_buf = BytesMut::new();
+                                            if puback.encode(&mut ack_buf).is_ok() {
+                                                let _ = tx.send(ack_buf.freeze()).await;
+                                            }
+                                        }
                                     }
+                                    QoS::ExactlyOnce => {
+                                        if let Some(pid) = pub_pkt.packet_id {
+                                            let pubrec = MqttPacket::PubRec { packet_id: pid };
+                                            let mut ack_buf = BytesMut::new();
+                                            if pubrec.encode(&mut ack_buf).is_ok() {
+                                                let _ = tx.send(ack_buf.freeze()).await;
+                                            }
+                                        }
+                                    }
+                                    QoS::AtMostOnce => {}
+                                }
+                            }
+                            MqttPacket::PubRel { packet_id } => {
+                                let pubcomp = MqttPacket::PubComp { packet_id };
+                                let mut ack_buf = BytesMut::new();
+                                if pubcomp.encode(&mut ack_buf).is_ok() {
+                                    let _ = tx.send(ack_buf.freeze()).await;
                                 }
                             }
                             MqttPacket::PingReq => {
                                 let mut ping_buf = BytesMut::new();
-                                MqttPacket::PingResp.encode(&mut ping_buf)?;
-                                tx.send(ping_buf.freeze())?;
+                                if MqttPacket::PingResp.encode(&mut ping_buf).is_ok() {
+                                    let _ = tx.send(ping_buf.freeze()).await;
+                                }
                             }
                             MqttPacket::Disconnect => {
                                 clean_disconnect = true;
                                 debug!("DISCONNECT received from client #{}", client_id);
-                                break;
+                                break 'connection;
                             }
                             _ => {}
                         }
                     }
                     Err(PacketError::BufferUnderflow) => {
-                        // Incomplete packet, wait for next TCP read
+                        // Incomplete packet in buffer; wait for next network read
                         break;
                     }
                     Err(e) => {
-                        error!("Packet decode error: {}", e);
-                        return Err(Box::new(e));
+                        warn!("Client #{} packet decode error: {}", client_id, e);
+                        break 'connection;
                     }
                 }
             }
         }
 
-        // If disconnected abnormally without a clean DISCONNECT, publish Last Will & Testament (LWT)
+        // Guaranteed cleanup & Last Will and Testament (LWT) execution on connection exit
         if !clean_disconnect {
             if let Some(will_pkt) = client_will.take() {
                 let user_ref = current_user.as_ref();
                 let will_allowed = if let Some(u) = user_ref {
-                    acl.check_publish(u, &connected_client_id, &will_pkt.topic)
+                    context
+                        .acl
+                        .check_publish(u.as_ref(), &connected_client_id, &will_pkt.topic)
                 } else {
                     true
                 };
@@ -409,12 +561,12 @@ impl BrokerServer {
                         client_id, will_pkt.topic
                     );
                     if will_pkt.retain {
-                        let mut retained_guard = retained.write().await;
+                        let mut retained_guard = context.retained.write().await;
                         retained_guard.update(will_pkt.clone());
                     }
 
                     let matched_ids = {
-                        let router_guard = router.read().await;
+                        let router_guard = context.router.read().await;
                         router_guard.matches(&will_pkt.topic)
                     };
 
@@ -422,11 +574,11 @@ impl BrokerServer {
                     let will_packet = MqttPacket::Publish(will_pkt);
                     if will_packet.encode(&mut will_buf).is_ok() {
                         let frozen_will = will_buf.freeze();
-                        let clients_guard = clients.read().await;
+                        let clients_guard = context.clients.read().await;
                         for target_id in matched_ids {
                             if target_id != client_id {
                                 if let Some(target_tx) = clients_guard.get(&target_id) {
-                                    let _ = target_tx.send(frozen_will.clone());
+                                    let _ = target_tx.try_send(frozen_will.clone());
                                 }
                             }
                         }
@@ -440,19 +592,28 @@ impl BrokerServer {
             }
         }
 
-        // Clean up subscriptions and connection
+        // Clean up subscriptions from router
         {
-            let mut router_guard = router.write().await;
+            let mut router_guard = context.router.write().await;
             for topic in subscribed_topics {
                 router_guard.unsubscribe(&topic, &client_id);
             }
         }
+
+        // Clean up active client sender
         {
-            let mut clients_guard = clients.write().await;
+            let mut clients_guard = context.clients.write().await;
             clients_guard.remove(&client_id);
         }
 
+        // Clean up client session map
+        if !connected_client_id.is_empty() {
+            let mut sessions_guard = context.client_sessions.write().await;
+            if sessions_guard.get(&connected_client_id) == Some(&client_id) {
+                sessions_guard.remove(&connected_client_id);
+            }
+        }
+
         write_task.abort();
-        Ok(())
     }
 }
