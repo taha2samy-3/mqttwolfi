@@ -961,4 +961,97 @@ mod tests {
             Err(PacketError::InvalidProtocolName)
         );
     }
+
+    #[test]
+    fn test_truncated_connect_does_not_panic() {
+        // Test truncated CONNECT packets at every byte offset to ensure no panic occurs
+        let full_connect = [
+            0x10, 0x12, // Connect, remaining len = 18
+            0x00, 0x04, b'M', b'Q', b'T', b'T', // Proto name
+            0x04, // Version 3.1.1
+            0x02, // Clean session
+            0x00, 0x3C, // Keep alive 60
+            0x00, 0x06, b'c', b'l', b'i', b'e', b'n', b't', // Client ID
+        ];
+
+        for len in 1..full_connect.len() {
+            let mut slice = &full_connect[..len];
+            let res = MqttPacket::decode(&mut slice);
+            assert!(
+                res == Err(PacketError::BufferUnderflow)
+                    || res == Err(PacketError::MalformedHeader),
+                "Failed at len {len}: got {res:?}"
+            );
+        }
+
+        // Even with declared remaining_len but truncated internal fields (e.g., proto "MQTT" but no version/flags)
+        let truncated_fields = [
+            0x10, 0x06, // Connect, remaining len = 6
+            0x00, 0x04, b'M', b'Q', b'T', b'T', // Proto name only, missing 4 bytes of flags/version/keepalive!
+        ];
+        let mut slice2 = &truncated_fields[..];
+        let res2 = MqttPacket::decode(&mut slice2);
+        assert_eq!(res2, Err(PacketError::MalformedHeader));
+    }
+
+    #[test]
+    fn test_malformed_subscribe_rejected() {
+        // SUBSCRIBE with remaining_len < 3
+        let bad_sub1 = [0x82, 0x01, 0x00];
+        let mut s1 = &bad_sub1[..];
+        assert_eq!(MqttPacket::decode(&mut s1), Err(PacketError::MalformedHeader));
+
+        // SUBSCRIBE with invalid flags (not 0x02)
+        let bad_flags = [0x80, 0x05, 0x00, 0x01, 0x00, 0x01, b'a'];
+        let mut s2 = &bad_flags[..];
+        assert_eq!(MqttPacket::decode(&mut s2), Err(PacketError::MalformedHeader));
+
+        // SUBSCRIBE with packet_id = 0
+        let zero_id = [0x82, 0x06, 0x00, 0x00, 0x00, 0x01, b'a', 0x00];
+        let mut s3 = &zero_id[..];
+        assert_eq!(MqttPacket::decode(&mut s3), Err(PacketError::MalformedHeader));
+    }
+
+    #[test]
+    fn test_malformed_publish_rejected() {
+        // PUBLISH with wildcard in topic
+        let wildcard_pub = [
+            0x30, 0x05, // Publish QoS 0, remaining len = 5
+            0x00, 0x03, b'a', b'/', b'+', // Topic "a/+"
+        ];
+        let mut s1 = &wildcard_pub[..];
+        assert_eq!(MqttPacket::decode(&mut s1), Err(PacketError::MalformedHeader));
+
+        // PUBLISH with remaining_len < header_len (saturating_sub vulnerability test)
+        let truncated_header = [
+            0x30, 0x02, // Remaining len = 2
+            0x00, 0x05, b't', b'e', // Topic len declares 5 bytes, but buffer ended
+        ];
+        let mut s2 = &truncated_header[..];
+        assert_eq!(MqttPacket::decode(&mut s2), Err(PacketError::MalformedHeader));
+    }
+
+    #[test]
+    fn test_unsubscribe_and_unsuback_roundtrip() {
+        let unsub = MqttPacket::Unsubscribe {
+            packet_id: 101,
+            topics: vec!["sensors/temp".into(), "rooms/chat".into()],
+        };
+
+        let mut buf = BytesMut::new();
+        unsub.encode(&mut buf).unwrap();
+
+        let mut read_buf = &buf[..];
+        let decoded = MqttPacket::decode(&mut read_buf).unwrap();
+        assert_eq!(decoded, unsub);
+
+        let unsuback = MqttPacket::UnsubAck { packet_id: 101 };
+        let mut ack_buf = BytesMut::new();
+        unsuback.encode(&mut ack_buf).unwrap();
+
+        let mut read_ack = &ack_buf[..];
+        let decoded_ack = MqttPacket::decode(&mut read_ack).unwrap();
+        assert_eq!(decoded_ack, unsuback);
+    }
 }
+

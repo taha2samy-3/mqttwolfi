@@ -87,6 +87,14 @@ impl<T: Clone + Eq + std::hash::Hash> TopicTrie<T> {
         }
     }
 
+    /// Returns true if this trie node and all its subtrees have no subscribers.
+    pub fn is_empty(&self) -> bool {
+        self.subscribers.is_empty()
+            && self.multi_wildcard_subscribers.is_empty()
+            && self.single_wildcard.is_none()
+            && self.children.is_empty()
+    }
+
     /// Unsubscribes a subscriber from a specific topic filter.
     pub fn unsubscribe(&mut self, topic_filter: &str, subscriber: &T) -> bool {
         if Self::validate_filter(topic_filter).is_err() {
@@ -105,17 +113,26 @@ impl<T: Clone + Eq + std::hash::Hash> TopicTrie<T> {
             "#" => self.multi_wildcard_subscribers.remove(subscriber),
             "+" => {
                 if let Some(ref mut node) = self.single_wildcard {
-                    node.remove_recursive(&parts[1..], subscriber)
+                    let removed = node.remove_recursive(&parts[1..], subscriber);
+                    if node.is_empty() {
+                        self.single_wildcard = None;
+                    }
+                    removed
                 } else {
                     false
                 }
             }
             token => {
-                if let Some(node) = self.children.get_mut(token) {
-                    node.remove_recursive(&parts[1..], subscriber)
+                let (removed, should_clean) = if let Some(node) = self.children.get_mut(token) {
+                    let removed = node.remove_recursive(&parts[1..], subscriber);
+                    (removed, node.is_empty())
                 } else {
-                    false
+                    (false, false)
+                };
+                if should_clean {
+                    self.children.remove(token);
                 }
+                removed
             }
         }
     }
@@ -124,16 +141,11 @@ impl<T: Clone + Eq + std::hash::Hash> TopicTrie<T> {
     pub fn matches(&self, topic_name: &str) -> HashSet<T> {
         let mut result = HashSet::new();
         let parts: Vec<&str> = topic_name.split('/').collect();
-        self.match_recursive(&parts, &mut result);
+        self.match_recursive(&parts, true, &mut result);
         result
     }
 
-    fn match_recursive(&self, parts: &[&str], result: &mut HashSet<T>) {
-        // Collect all multi-wildcard subscribers matching from this level onwards
-        for sub in &self.multi_wildcard_subscribers {
-            result.insert(sub.clone());
-        }
-
+    fn match_recursive(&self, parts: &[&str], is_root: bool, result: &mut HashSet<T>) {
         if parts.is_empty() {
             for sub in &self.subscribers {
                 result.insert(sub.clone());
@@ -142,15 +154,27 @@ impl<T: Clone + Eq + std::hash::Hash> TopicTrie<T> {
         }
 
         let token = parts[0];
+        let starts_with_dollar = is_root && token.starts_with('$');
 
-        // Exact match for current path segment
-        if let Some(child) = self.children.get(token) {
-            child.match_recursive(&parts[1..], result);
+        // Multi-level wildcard '#' matches everything from this level onwards,
+        // EXCEPT when at the root level and the topic starts with '$' (MQTT-4.7.2-1).
+        if !starts_with_dollar {
+            for sub in &self.multi_wildcard_subscribers {
+                result.insert(sub.clone());
+            }
         }
 
-        // Single wildcard '+' match for current path segment
-        if let Some(ref single) = self.single_wildcard {
-            single.match_recursive(&parts[1..], result);
+        // Exact match for current path segment (e.g., "$SYS")
+        if let Some(child) = self.children.get(token) {
+            child.match_recursive(&parts[1..], false, result);
+        }
+
+        // Single wildcard '+' matches current path segment,
+        // EXCEPT when at the root level and the topic starts with '$' (MQTT-4.7.2-1).
+        if !starts_with_dollar {
+            if let Some(ref single) = self.single_wildcard {
+                single.match_recursive(&parts[1..], false, result);
+            }
         }
     }
 }
@@ -244,4 +268,44 @@ mod tests {
         assert!(TopicTrie::<String>::validate_filter("#").is_ok());
         assert!(TopicTrie::<String>::validate_filter("+").is_ok());
     }
+
+    #[test]
+    fn test_sys_topic_root_wildcard_isolation() {
+        let mut trie = TopicTrie::new();
+        trie.subscribe("#", "root_multi").unwrap();
+        trie.subscribe("+/broker/uptime", "root_single").unwrap();
+        trie.subscribe("$SYS/#", "sys_multi").unwrap();
+        trie.subscribe("$SYS/broker/uptime", "sys_exact").unwrap();
+
+        // Topic starting with $ must NOT match root '#' or root '+' (MQTT-4.7.2-1)
+        let matches = trie.matches("$SYS/broker/uptime");
+        assert!(!matches.contains("root_multi"), "Root # must not match $SYS");
+        assert!(!matches.contains("root_single"), "Root + must not match $SYS");
+        assert!(matches.contains("sys_multi"), "Explicit $SYS/# must match");
+        assert!(matches.contains("sys_exact"), "Explicit $SYS/broker/uptime must match");
+
+        // Normal topics must match root '#' and root '+'
+        let normal_matches = trie.matches("app/broker/uptime");
+        assert!(normal_matches.contains("root_multi"));
+        assert!(normal_matches.contains("root_single"));
+    }
+
+    #[test]
+    fn test_unsubscribe_pruning() {
+        let mut trie = TopicTrie::new();
+        assert!(trie.is_empty());
+
+        trie.subscribe("a/b/c", "sub1").unwrap();
+        trie.subscribe("a/+/d", "sub2").unwrap();
+        trie.subscribe("a/#", "sub3").unwrap();
+        assert!(!trie.is_empty());
+
+        trie.unsubscribe("a/b/c", &"sub1");
+        trie.unsubscribe("a/+/d", &"sub2");
+        trie.unsubscribe("a/#", &"sub3");
+
+        // After unsubscribing all, all empty nodes must be pruned
+        assert!(trie.is_empty(), "Trie should be completely pruned and empty");
+    }
 }
+
