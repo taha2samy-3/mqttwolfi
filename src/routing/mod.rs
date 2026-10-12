@@ -1,3 +1,3 @@
 pub mod trie;
 
-pub use trie::TopicTrie;
+pub use trie::{TopicError, TopicTrie};

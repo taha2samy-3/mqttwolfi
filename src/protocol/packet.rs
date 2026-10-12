@@ -1,4 +1,5 @@
-use bytes::Bytes;
+use crate::protocol::vbi::{decode_variable_byte_integer, encode_variable_byte_integer};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,8 @@ pub enum PacketError {
     InvalidString,
     #[error("Buffer underflow while decoding packet")]
     BufferUnderflow,
+    #[error("Protocol name is not 'MQTT'")]
+    InvalidProtocolName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,4 +135,311 @@ pub enum MqttPacket {
     PingReq,
     PingResp,
     Disconnect,
+}
+
+impl MqttPacket {
+    /// Serializes an MQTT packet into an outgoing byte buffer.
+    pub fn encode(&self, dst: &mut BytesMut) -> Result<(), PacketError> {
+        match self {
+            MqttPacket::PingReq => {
+                dst.put_u8(0xC0); // PacketType::PingReq << 4
+                dst.put_u8(0x00); // Remaining Length = 0
+                Ok(())
+            }
+            MqttPacket::PingResp => {
+                dst.put_u8(0xD0); // PacketType::PingResp << 4
+                dst.put_u8(0x00);
+                Ok(())
+            }
+            MqttPacket::Disconnect => {
+                dst.put_u8(0xE0); // PacketType::Disconnect << 4
+                dst.put_u8(0x00);
+                Ok(())
+            }
+            MqttPacket::ConnAck {
+                session_present,
+                reason_code,
+            } => {
+                dst.put_u8(0x20); // PacketType::ConnAck << 4
+                dst.put_u8(0x02); // Remaining Length = 2
+                dst.put_u8(if *session_present { 0x01 } else { 0x00 });
+                dst.put_u8(*reason_code);
+                Ok(())
+            }
+            MqttPacket::PubAck { packet_id } => {
+                dst.put_u8(0x40); // PacketType::PubAck << 4
+                dst.put_u8(0x02); // Remaining Length = 2
+                dst.put_u16(*packet_id);
+                Ok(())
+            }
+            MqttPacket::Publish(pub_pkt) => {
+                let mut flags = 0u8;
+                if pub_pkt.dup {
+                    flags |= 0x08;
+                }
+                flags |= (pub_pkt.qos as u8) << 1;
+                if pub_pkt.retain {
+                    flags |= 0x01;
+                }
+                let first_byte = (PacketType::Publish as u8) << 4 | flags;
+
+                let mut variable_header = BytesMut::new();
+                // Topic string length-prefixed
+                variable_header.put_u16(pub_pkt.topic.len() as u16);
+                variable_header.put_slice(pub_pkt.topic.as_bytes());
+
+                // Packet ID if QoS > 0
+                if pub_pkt.qos != QoS::AtMostOnce {
+                    if let Some(pid) = pub_pkt.packet_id {
+                        variable_header.put_u16(pid);
+                    } else {
+                        return Err(PacketError::MalformedHeader);
+                    }
+                }
+
+                let remaining_len = variable_header.len() + pub_pkt.payload.len();
+                dst.put_u8(first_byte);
+                encode_variable_byte_integer(remaining_len as u32, dst)
+                    .map_err(|_| PacketError::MalformedHeader)?;
+                dst.put(variable_header);
+                dst.put_slice(&pub_pkt.payload);
+                Ok(())
+            }
+            MqttPacket::Connect(conn) => {
+                let mut var_header = BytesMut::new();
+                // Protocol Name "MQTT"
+                var_header.put_u16(4);
+                var_header.put_slice(b"MQTT");
+                var_header.put_u8(conn.version as u8);
+
+                let mut connect_flags = 0u8;
+                if conn.clean_start {
+                    connect_flags |= 0x02;
+                }
+                var_header.put_u8(connect_flags);
+                var_header.put_u16(conn.keep_alive_sec);
+
+                // Payload: Client ID
+                var_header.put_u16(conn.client_id.len() as u16);
+                var_header.put_slice(conn.client_id.as_bytes());
+
+                dst.put_u8((PacketType::Connect as u8) << 4);
+                encode_variable_byte_integer(var_header.len() as u32, dst)
+                    .map_err(|_| PacketError::MalformedHeader)?;
+                dst.put(var_header);
+                Ok(())
+            }
+        }
+    }
+
+    /// Deserializes an MQTT packet from an incoming byte buffer.
+    pub fn decode<B: Buf>(src: &mut B) -> Result<Self, PacketError> {
+        if !src.has_remaining() {
+            return Err(PacketError::BufferUnderflow);
+        }
+
+        let first_byte = src.get_u8();
+        let packet_type_val = (first_byte >> 4) & 0x0F;
+        let flags = first_byte & 0x0F;
+        let packet_type = PacketType::try_from(packet_type_val)?;
+
+        let remaining_len =
+            decode_variable_byte_integer(src).map_err(|_| PacketError::MalformedHeader)? as usize;
+
+        if src.remaining() < remaining_len {
+            return Err(PacketError::BufferUnderflow);
+        }
+
+        match packet_type {
+            PacketType::PingReq => Ok(MqttPacket::PingReq),
+            PacketType::PingResp => Ok(MqttPacket::PingResp),
+            PacketType::Disconnect => Ok(MqttPacket::Disconnect),
+            PacketType::ConnAck => {
+                if remaining_len < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let ack_flags = src.get_u8();
+                let reason_code = src.get_u8();
+                Ok(MqttPacket::ConnAck {
+                    session_present: (ack_flags & 0x01) != 0,
+                    reason_code,
+                })
+            }
+            PacketType::PubAck => {
+                if remaining_len < 2 {
+                    return Err(PacketError::MalformedHeader);
+                }
+                let packet_id = src.get_u16();
+                Ok(MqttPacket::PubAck { packet_id })
+            }
+            PacketType::Publish => {
+                let dup = (flags & 0x08) != 0;
+                let qos = QoS::try_from((flags >> 1) & 0x03)?;
+                let retain = (flags & 0x01) != 0;
+
+                if src.remaining() < 2 {
+                    return Err(PacketError::BufferUnderflow);
+                }
+                let topic_len = src.get_u16() as usize;
+                if src.remaining() < topic_len {
+                    return Err(PacketError::BufferUnderflow);
+                }
+                let mut topic_bytes = vec![0u8; topic_len];
+                src.copy_to_slice(&mut topic_bytes);
+                let topic =
+                    String::from_utf8(topic_bytes).map_err(|_| PacketError::InvalidString)?;
+
+                let packet_id = if qos != QoS::AtMostOnce {
+                    if src.remaining() < 2 {
+                        return Err(PacketError::BufferUnderflow);
+                    }
+                    Some(src.get_u16())
+                } else {
+                    None
+                };
+
+                let header_len = 2 + topic_len + if packet_id.is_some() { 2 } else { 0 };
+                let payload_len = remaining_len.saturating_sub(header_len);
+                let mut payload_vec = vec![0u8; payload_len];
+                src.copy_to_slice(&mut payload_vec);
+
+                Ok(MqttPacket::Publish(PublishPacket {
+                    topic,
+                    qos,
+                    retain,
+                    dup,
+                    packet_id,
+                    payload: Bytes::from(payload_vec),
+                }))
+            }
+            PacketType::Connect => {
+                if src.remaining() < 2 {
+                    return Err(PacketError::BufferUnderflow);
+                }
+                let proto_len = src.get_u16() as usize;
+                if src.remaining() < proto_len {
+                    return Err(PacketError::BufferUnderflow);
+                }
+                let mut proto_name = vec![0u8; proto_len];
+                src.copy_to_slice(&mut proto_name);
+                if proto_name != b"MQTT" {
+                    return Err(PacketError::InvalidProtocolName);
+                }
+
+                let version_byte = src.get_u8();
+                let version = ProtocolVersion::try_from(version_byte)?;
+
+                let connect_flags = src.get_u8();
+                let clean_start = (connect_flags & 0x02) != 0;
+                let keep_alive_sec = src.get_u16();
+
+                let client_id_len = src.get_u16() as usize;
+                let mut client_id_bytes = vec![0u8; client_id_len];
+                src.copy_to_slice(&mut client_id_bytes);
+                let client_id =
+                    String::from_utf8(client_id_bytes).map_err(|_| PacketError::InvalidString)?;
+
+                Ok(MqttPacket::Connect(ConnectPacket {
+                    version,
+                    client_id,
+                    clean_start,
+                    keep_alive_sec,
+                }))
+            }
+            _ => Err(PacketError::InvalidPacketType(packet_type_val)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pingreq_and_pingresp_roundtrip() {
+        let mut buf = BytesMut::new();
+        MqttPacket::PingReq.encode(&mut buf).unwrap();
+        assert_eq!(&buf[..], &[0xC0, 0x00]);
+
+        let mut read_buf = &buf[..];
+        let decoded = MqttPacket::decode(&mut read_buf).unwrap();
+        assert_eq!(decoded, MqttPacket::PingReq);
+
+        let mut resp_buf = BytesMut::new();
+        MqttPacket::PingResp.encode(&mut resp_buf).unwrap();
+        assert_eq!(&resp_buf[..], &[0xD0, 0x00]);
+    }
+
+    #[test]
+    fn test_connack_roundtrip() {
+        let mut buf = BytesMut::new();
+        let pkt = MqttPacket::ConnAck {
+            session_present: true,
+            reason_code: 0x00,
+        };
+        pkt.encode(&mut buf).unwrap();
+
+        let mut read_buf = &buf[..];
+        let decoded = MqttPacket::decode(&mut read_buf).unwrap();
+        assert_eq!(decoded, pkt);
+    }
+
+    #[test]
+    fn test_publish_qos1_roundtrip() {
+        let pub_pkt = PublishPacket {
+            topic: "factory/sensor1/temp".into(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(1042),
+            payload: Bytes::from_static(b"25.4"),
+        };
+        let pkt = MqttPacket::Publish(pub_pkt);
+
+        let mut buf = BytesMut::new();
+        pkt.encode(&mut buf).unwrap();
+
+        let mut read_buf = &buf[..];
+        let decoded = MqttPacket::decode(&mut read_buf).unwrap();
+        assert_eq!(decoded, pkt);
+    }
+
+    #[test]
+    fn test_connect_v5_roundtrip() {
+        let conn_pkt = ConnectPacket {
+            version: ProtocolVersion::V500,
+            client_id: "edge-device-42".into(),
+            clean_start: true,
+            keep_alive_sec: 60,
+        };
+        let pkt = MqttPacket::Connect(conn_pkt);
+
+        let mut buf = BytesMut::new();
+        pkt.encode(&mut buf).unwrap();
+
+        let mut read_buf = &buf[..];
+        let decoded = MqttPacket::decode(&mut read_buf).unwrap();
+        assert_eq!(decoded, pkt);
+    }
+
+    #[test]
+    fn test_malformed_protocol_name_rejected() {
+        // Encode a connect packet with corrupted protocol name "XYZW" instead of "MQTT"
+        let mut buf = BytesMut::new();
+        buf.put_u8(0x10); // Connect
+        buf.put_u8(15); // Exact remaining length of 15 bytes
+        buf.put_u16(4); // Protocol name len
+        buf.put_slice(b"XYZW"); // Invalid!
+        buf.put_u8(5); // v5
+        buf.put_u8(0x02);
+        buf.put_u16(60);
+        buf.put_u16(3);
+        buf.put_slice(b"dev");
+
+        let mut read_buf = &buf[..];
+        assert_eq!(
+            MqttPacket::decode(&mut read_buf),
+            Err(PacketError::InvalidProtocolName)
+        );
+    }
 }

@@ -6,8 +6,9 @@ use wolf_mqtt::routing::TopicTrie;
 fn test_integration_routing_and_vbi() {
     // 1. Test topic router
     let mut trie = TopicTrie::new();
-    trie.subscribe("devices/+/telemetry", "client_cloud_01");
-    trie.subscribe("devices/#", "client_logger_all");
+    trie.subscribe("devices/+/telemetry", "client_cloud_01")
+        .unwrap();
+    trie.subscribe("devices/#", "client_logger_all").unwrap();
 
     let matches = trie.matches("devices/motor12/telemetry");
     assert!(matches.contains("client_cloud_01"));

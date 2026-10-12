@@ -45,10 +45,8 @@ impl<T: Clone + Eq + std::hash::Hash> TopicTrie<T> {
         let total = parts.len();
 
         for (idx, part) in parts.iter().enumerate() {
-            if part.contains('#') {
-                if *part != "#" || idx != total - 1 {
-                    return Err(TopicError::InvalidMultiWildcardPosition);
-                }
+            if part.contains('#') && (*part != "#" || idx != total - 1) {
+                return Err(TopicError::InvalidMultiWildcardPosition);
             }
             if part.contains('+') && *part != "+" {
                 return Err(TopicError::InvalidSingleWildcardPosition);
@@ -164,7 +162,8 @@ mod tests {
     #[test]
     fn test_exact_topic_match() {
         let mut trie = TopicTrie::new();
-        trie.subscribe("home/livingroom/temperature", "sub1").unwrap();
+        trie.subscribe("home/livingroom/temperature", "sub1")
+            .unwrap();
         trie.subscribe("home/bedroom/temperature", "sub2").unwrap();
 
         let matched = trie.matches("home/livingroom/temperature");
@@ -222,7 +221,10 @@ mod tests {
     #[test]
     fn test_invalid_topic_filter_validation() {
         // Empty topic filter
-        assert_eq!(TopicTrie::<String>::validate_filter(""), Err(TopicError::EmptyTopic));
+        assert_eq!(
+            TopicTrie::<String>::validate_filter(""),
+            Err(TopicError::EmptyTopic)
+        );
 
         // Multi-level wildcard '#' in middle is forbidden by MQTT spec
         assert_eq!(

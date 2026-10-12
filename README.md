@@ -1,64 +1,69 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="WolfMQTT Logo" width="480"/>
+  <img src="assets/logo.svg" alt="WolfiMQ Banner Logo" width="580"/>
 </p>
 
 <p align="center">
-  <strong>Ultra-Secure, High-Performance MQTT v3.1.1 & v5.0 Broker written in Rust with wolfSSL Integration</strong>
+  <strong>The Guarded Pack: Ultra-Secure, High-Performance MQTT v3.1.1 & v5.0 Broker written in Rust with wolfSSL Integration</strong>
 </p>
 
 <p align="center">
+  <a href="#about-wolfimq">About WolfiMQ</a> •
   <a href="#features">Features</a> •
   <a href="#architecture">Architecture</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#configuration">Configuration</a> •
-  <a href="#testing--ci">Testing & CI</a>
+  <a href="#testing--rigor">Testing & CI</a>
 </p>
+
+---
+
+## About WolfiMQ
+
+**WolfiMQ** is an industrial-grade, cloud & edge MQTT broker engine designed for mission-critical IoT ecosystems. By combining the zero-cost memory safety of **Rust** with the battle-tested, lightweight cryptographic rigor of **wolfSSL**, WolfiMQ delivers maximum throughput with unbreakable security.
+
+- **Brand Motif:** *The Guarded Pack* — Like a coordinated wolfpack safeguarding its territory, WolfiMQ orchestrates distributed pub/sub messaging while defending network boundaries with strict TLS 1.3 mutual authentication (mTLS).
 
 ---
 
 ## Features
 
-- **Dual Protocol Support:** Native cross-version routing between **MQTT v3.1.1** and **MQTT v5.0** clients.
+- **Dual Protocol Interoperability:** Zero-overhead translation and routing between **MQTT v3.1.1** and **MQTT v5.0** clients.
 - **wolfSSL Cryptographic Engine:**
   - TLS 1.3 / 1.2 with strict Mutual TLS (mTLS) client certificate verification.
-  - Pre-Shared Key (PSK) support for ultra-constrained IoT nodes without certificate parsing.
-  - ALPN (Application-Layer Protocol Negotiation) with protocol ID `"mqtt"`.
-  - Session Resumption / Session Tickets for ultra-fast reconnects without handshake overhead.
-- **Memory Safety & Flow Control:**
-  - Zero-cost memory safety with pure Rust concurrency.
-  - Configurable backpressure policies (`drop_oldest`, `drop_newest`, `reject_publisher`) preventing Out-Of-Memory (OOM) crashes from slow consumers.
+  - **Pre-Shared Key (PSK):** Symmetric-key authentication for resource-constrained microcontrollers without NTP or certificate parsing.
+  - **ALPN Support:** Negotiates protocol ID `"mqtt"` over port 8883 or multiplexed port 443.
+  - **Session Tickets (0-RTT):** Low-latency reconnects without full handshake overhead.
+- **Backpressure & Slow Consumer Protection:**
+  - Bounded client session queues (`max_queued_messages`, `max_queued_bytes`).
+  - Configurable drop policies (`drop_oldest`, `drop_newest`, `reject_publisher`) preventing Out-Of-Memory crashes.
 - **Structured Observability:**
-  - Dynamic log levels (`trace`, `debug`, `info`, `warn`, `error`).
-  - Pluggable log formats (`pretty`, `compact`, `json`).
-- **Test-Driven Rigor:** 7-layer testing suite integrated with `Taskfile` and automated GitHub Actions CI.
+  - Configurable log levels (`trace`, `debug`, `info`, `warn`, `error`).
+  - Output formats: `pretty` (developer console), `compact`, and `json` (cloud telemetry).
+- **Rigorously Tested:** 28+ unit, integration, and backpressure test suites integrated with `Taskfile` and GitHub Actions CI.
 
 ---
 
 ## Quick Start
 
-### 1. Prerequisites
-Managed automatically via [`mise`](https://mise.jdx.dev):
-- Rust 1.99+ (installed via `mise`)
+### 1. Prerequisites (Managed via `mise`)
+- Rust 1.99+
 - Go-Task (`task`)
 
 ### 2. Available Task Commands
 ```bash
-# View all available tasks
+# Display all tasks
 task
 
-# Run full CI check locally (Formatting, Clippy Lints, Type check, All tests)
+# Run full CI validation pipeline locally
 task ci
 
-# Generate local test certificates for mTLS
+# Run all 28+ unit and integration tests
+task test
+
+# Generate mTLS test PKI certificates
 task certs:gen
 
-# Run unit tests
-task test:unit
-
-# Run integration tests
-task test:integration
-
-# Build release binary
+# Build optimized release binary
 task build:release
 ```
 
@@ -66,12 +71,15 @@ task build:release
 
 ## Configuration
 
-Edit [`config/broker.toml`](config/broker.toml) to customize your broker:
+Edit [`config/broker.toml`](config/broker.toml) to configure runtime behavior:
 
 ```toml
+[broker]
+node_id = "wolfimq-node-01"
+
 [logging]
-level = "info"          # "trace", "debug", "info", "warn", "error"
-format = "pretty"       # "pretty", "compact", "json"
+level = "info"
+format = "pretty"
 
 [listeners.tls]
 enabled = true
