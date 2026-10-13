@@ -480,7 +480,7 @@ impl BrokerServer {
                                     break 'connection;
                                 }
 
-                                let mut return_codes = Vec::new();
+                                let mut return_codes = Vec::with_capacity(topics.len());
                                 let mut authorized_filters = Vec::new();
 
                                 let user = current_user.clone().unwrap_or_else(|| {
@@ -493,53 +493,55 @@ impl BrokerServer {
                                     })
                                 });
 
-                                // Step 1: Authorization check outside router write lock
-                                for (topic_filter, qos) in &topics {
-                                    if context.acl.check_subscribe(
-                                        &user,
-                                        &connected_client_id,
-                                        topic_filter,
-                                    ) {
-                                        let granted_qos = if *qos == QoS::ExactlyOnce {
-                                            QoS::AtLeastOnce
-                                        } else {
-                                            *qos
-                                        };
-                                        authorized_filters
-                                            .push((topic_filter.clone(), granted_qos));
-                                        return_codes.push(granted_qos as u8);
-                                    } else {
-                                        warn!(
-                                            "Subscribe authorization denied for user '{}' on '{}'",
-                                            user.username, topic_filter
-                                        );
-                                        return_codes.push(0x80); // Unauthorized
-                                    }
-                                }
-
-                                // Step 2: Minimal router write lock to register subscriptions
                                 {
                                     let mut router_guard = context.router.write().await;
-                                    for (topic_filter, _) in &authorized_filters {
-                                        if router_guard.subscribe(topic_filter, client_id).is_ok()
-                                            && !subscribed_topics.contains(topic_filter)
-                                        {
-                                            subscribed_topics.push(topic_filter.clone());
+                                    let mut qos_guard = context.subscription_qos.write().await;
+                                    let client_qos_map = qos_guard.entry(client_id).or_default();
+
+                                    for (topic_filter, qos) in &topics {
+                                        if !context.acl.check_subscribe(
+                                            &user,
+                                            &connected_client_id,
+                                            topic_filter,
+                                        ) {
+                                            warn!(
+                                                "Subscribe authorization denied for user '{}' on '{}'",
+                                                user.username, topic_filter
+                                            );
+                                            return_codes.push(0x80); // Unauthorized
+                                        } else if let Err(e) = router_guard.subscribe(topic_filter, client_id) {
+                                            warn!(
+                                                "Subscribe topic filter '{}' invalid: {:?}",
+                                                topic_filter, e
+                                            );
+                                            return_codes.push(0x80); // Filter invalid / syntax error
+                                        } else {
+                                            let granted_qos = if *qos == QoS::ExactlyOnce {
+                                                QoS::AtLeastOnce
+                                            } else {
+                                                *qos
+                                            };
+                                            if !subscribed_topics.contains(topic_filter) {
+                                                subscribed_topics.push(topic_filter.clone());
+                                            }
+                                            client_qos_map.insert(topic_filter.clone(), granted_qos);
+                                            authorized_filters.push((topic_filter.clone(), granted_qos));
+                                            return_codes.push(granted_qos as u8);
                                         }
                                     }
                                 }
 
-                                // Step 3: Respond with SubAck
+                                // Respond with SubAck framed for client's protocol version
                                 let suback = MqttPacket::SubAck {
                                     packet_id,
                                     return_codes,
                                 };
                                 let mut ack_buf = BytesMut::new();
-                                if suback.encode(&mut ack_buf).is_ok() {
+                                if suback.encode_for_version(&mut ack_buf, client_protocol_version).is_ok() {
                                     let _ = tx.send(ack_buf.freeze()).await;
                                 }
 
-                                // Step 4: Retained message queries with read lock
+                                // Retained message queries with read lock
                                 let mut matched_retained = Vec::new();
                                 {
                                     let retained_guard = context.retained.read().await;
@@ -550,17 +552,26 @@ impl BrokerServer {
                                     }
                                 }
 
-                                // Deliver matching retained messages (with retain=true and assigned packet_id)
+                                // Deliver matching retained messages (with retain=true and downgraded QoS per subscription)
                                 for mut ret_pkt in matched_retained {
                                     ret_pkt.retain = true;
-                                    if ret_pkt.qos != QoS::AtMostOnce && ret_pkt.packet_id.is_none()
-                                    {
+                                    let filter_qos = authorized_filters
+                                        .iter()
+                                        .filter(|(f, _)| crate::auth::mqtt_topic_match(f, &ret_pkt.topic))
+                                        .map(|(_, q)| *q)
+                                        .max()
+                                        .unwrap_or(ret_pkt.qos);
+                                    let effective_qos = std::cmp::min(ret_pkt.qos, filter_qos);
+                                    ret_pkt.qos = effective_qos;
+                                    if effective_qos != QoS::AtMostOnce {
                                         ret_pkt.packet_id =
                                             Some(next_outbound_pid.fetch_add(1, Ordering::Relaxed));
+                                    } else {
+                                        ret_pkt.packet_id = None;
                                     }
                                     let mut ret_buf = BytesMut::new();
                                     let ret_packet = MqttPacket::Publish(ret_pkt);
-                                    if ret_packet.encode(&mut ret_buf).is_ok() {
+                                    if ret_packet.encode_for_version(&mut ret_buf, client_protocol_version).is_ok() {
                                         let _ = tx.send(ret_buf.freeze()).await;
                                     }
                                 }
@@ -573,15 +584,24 @@ impl BrokerServer {
 
                                 {
                                     let mut router_guard = context.router.write().await;
-                                    for topic in &topics {
-                                        router_guard.unsubscribe(topic, &client_id);
-                                        subscribed_topics.retain(|t| t != topic);
+                                    let mut qos_guard = context.subscription_qos.write().await;
+                                    if let Some(client_qos_map) = qos_guard.get_mut(&client_id) {
+                                        for topic in &topics {
+                                            router_guard.unsubscribe(topic, &client_id);
+                                            subscribed_topics.retain(|t| t != topic);
+                                            client_qos_map.remove(topic);
+                                        }
+                                    } else {
+                                        for topic in &topics {
+                                            router_guard.unsubscribe(topic, &client_id);
+                                            subscribed_topics.retain(|t| t != topic);
+                                        }
                                     }
                                 }
 
                                 let unsuback = MqttPacket::UnsubAck { packet_id };
                                 let mut ack_buf = BytesMut::new();
-                                if unsuback.encode(&mut ack_buf).is_ok() {
+                                if unsuback.encode_for_version(&mut ack_buf, client_protocol_version).is_ok() {
                                     let _ = tx.send(ack_buf.freeze()).await;
                                 }
                             }
@@ -647,30 +667,56 @@ impl BrokerServer {
                                     retained_guard.update(pub_pkt.clone());
                                 }
 
-                                // Forward to matching subscribers
+                                // Forward to matching subscribers with per-subscriber QoS downgrade
                                 let matched_ids = {
                                     let router_guard = context.router.read().await;
                                     router_guard.matches(&pub_pkt.topic)
                                 };
 
-                                let mut forward_pkt = pub_pkt.clone();
-                                // MQTT-3.3.1-9: Retain flag is cleared when forwarding to existing subscribers
-                                forward_pkt.retain = false;
-                                if forward_pkt.qos != QoS::AtMostOnce
-                                    && forward_pkt.packet_id.is_none()
-                                {
-                                    forward_pkt.packet_id =
-                                        Some(next_outbound_pid.fetch_add(1, Ordering::Relaxed));
-                                }
+                                let subscriber_qos_list = {
+                                    let qos_guard = context.subscription_qos.read().await;
+                                    matched_ids
+                                        .iter()
+                                        .map(|&tid| {
+                                            let max_sub_qos = qos_guard
+                                                .get(&tid)
+                                                .and_then(|topics_map| {
+                                                    topics_map
+                                                        .iter()
+                                                        .filter(|(filter, _)| {
+                                                            crate::auth::mqtt_topic_match(
+                                                                filter,
+                                                                &pub_pkt.topic,
+                                                            )
+                                                        })
+                                                        .map(|(_, &q)| q)
+                                                        .max()
+                                                })
+                                                .unwrap_or(pub_pkt.qos);
+                                            (tid, max_sub_qos)
+                                        })
+                                        .collect::<Vec<_>>()
+                                };
 
-                                let mut forward_buf = BytesMut::new();
-                                let forward_packet = MqttPacket::Publish(forward_pkt);
-                                if forward_packet.encode(&mut forward_buf).is_ok() {
-                                    let frozen = forward_buf.freeze();
-                                    let clients_guard = context.clients.read().await;
-                                    for target_id in matched_ids {
-                                        if let Some(target_tx) = clients_guard.get(&target_id) {
-                                            if target_tx.try_send(frozen.clone()).is_err() {
+                                let clients_guard = context.clients.read().await;
+                                for (target_id, max_sub_qos) in subscriber_qos_list {
+                                    if let Some(target_tx) = clients_guard.get(&target_id) {
+                                        let effective_qos = std::cmp::min(pub_pkt.qos, max_sub_qos);
+                                        let mut forward_pkt = pub_pkt.clone();
+                                        forward_pkt.retain = false;
+                                        forward_pkt.qos = effective_qos;
+                                        if effective_qos != QoS::AtMostOnce {
+                                            forward_pkt.packet_id =
+                                                Some(next_outbound_pid.fetch_add(1, Ordering::Relaxed));
+                                        } else {
+                                            forward_pkt.packet_id = None;
+                                        }
+
+                                        let mut forward_buf = BytesMut::new();
+                                        let forward_packet = MqttPacket::Publish(forward_pkt);
+                                        if forward_packet.encode(&mut forward_buf).is_ok() {
+                                            let frozen = forward_buf.freeze();
+                                            if target_tx.try_send(frozen).is_err() {
                                                 warn!(
                                                     "Slow consumer queue full (1024) on client #{}, dropping message on topic '{}'",
                                                     target_id, pub_pkt.topic
@@ -819,25 +865,35 @@ impl BrokerServer {
             }
         }
 
-        // Clean up subscriptions from router
+        // Clean up subscriptions from router and subscription QoS map
         {
             let mut router_guard = context.router.write().await;
             for topic in subscribed_topics {
                 router_guard.unsubscribe(&topic, &client_id);
             }
         }
+        {
+            let mut qos_guard = context.subscription_qos.write().await;
+            qos_guard.remove(&client_id);
+        }
 
-        // Clean up active client sender
+        // Clean up active client sender and disconnect signal
         {
             let mut clients_guard = context.clients.write().await;
             clients_guard.remove(&client_id);
+        }
+        {
+            let mut dc_guard = context.client_disconnect_tx.write().await;
+            dc_guard.remove(&client_id);
         }
 
         // Clean up client session map
         if !connected_client_id.is_empty() {
             let mut sessions_guard = context.client_sessions.write().await;
-            if sessions_guard.get(&connected_client_id) == Some(&client_id) {
-                sessions_guard.remove(&connected_client_id);
+            if let Some((existing_id, _)) = sessions_guard.get(&connected_client_id) {
+                if *existing_id == client_id {
+                    sessions_guard.remove(&connected_client_id);
+                }
             }
         }
 
