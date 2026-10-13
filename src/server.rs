@@ -1,5 +1,5 @@
 use crate::auth::{AclEngine, UserAccount, UserRole};
-use crate::protocol::{MqttPacket, PacketError, PublishPacket, QoS};
+use crate::protocol::{MqttPacket, PacketError, ProtocolVersion, PublishPacket, QoS};
 use crate::routing::retained::RetainedStore;
 use crate::routing::TopicTrie;
 use bytes::{Buf, Bytes, BytesMut};
@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, info, warn};
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -22,7 +22,9 @@ pub struct BrokerContext {
     pub clients: Arc<RwLock<HashMap<u64, mpsc::Sender<Bytes>>>>,
     pub retained: Arc<RwLock<RetainedStore>>,
     pub acl: Arc<AclEngine>,
-    pub client_sessions: Arc<RwLock<HashMap<String, u64>>>,
+    pub client_sessions: Arc<RwLock<HashMap<String, (u64, String)>>>,
+    pub client_disconnect_tx: Arc<RwLock<HashMap<u64, oneshot::Sender<()>>>>,
+    pub subscription_qos: Arc<RwLock<HashMap<u64, HashMap<String, QoS>>>>,
 }
 
 impl BrokerContext {
@@ -33,6 +35,8 @@ impl BrokerContext {
             retained: Arc::new(RwLock::new(RetainedStore::new())),
             acl,
             client_sessions: Arc::new(RwLock::new(HashMap::new())),
+            client_disconnect_tx: Arc::new(RwLock::new(HashMap::new())),
+            subscription_qos: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
