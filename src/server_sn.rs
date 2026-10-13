@@ -17,6 +17,9 @@ pub struct SnClientSession {
     pub internal_id: u64,
     pub last_seen: Instant,
     pub duration_sec: u16,
+    pub asleep: bool,
+    pub will: Option<PublishPacket>,
+    pub pending_will_topic: Option<(String, QoS, bool)>,
     pub next_topic_id: u16,
     pub topic_id_to_name: HashMap<u16, String>,
     pub name_to_topic_id: HashMap<String, u16>,
@@ -30,6 +33,9 @@ impl SnClientSession {
             internal_id,
             last_seen: Instant::now(),
             duration_sec,
+            asleep: false,
+            will: None,
+            pending_will_topic: None,
             next_topic_id: 100, // IDs 1..99 reserved for predefined topics
             topic_id_to_name: HashMap::new(),
             name_to_topic_id: HashMap::new(),
@@ -173,14 +179,14 @@ impl MqttSnServer {
             }
 
             SnPacket::Connect {
+                will,
                 clean_session,
                 duration,
                 client_id,
-                ..
             } => {
                 debug!(
-                    "MQTT-SN CONNECT from {} (client_id: '{}', duration: {}s)",
-                    peer, client_id, duration
+                    "MQTT-SN CONNECT from {} (client_id: '{}', will: {}, duration: {}s)",
+                    peer, client_id, will, duration
                 );
 
                 let internal_id = self.context.next_client_id();
@@ -191,12 +197,119 @@ impl MqttSnServer {
                     } else if let Some(session) = lock.get_mut(&peer) {
                         session.last_seen = Instant::now();
                         session.duration_sec = duration;
+                        session.asleep = false;
+                    }
+                }
+
+                if will {
+                    // OASIS MQTT-SN v1.2 §5.4.4: Gateway prompts client for WillTopic
+                    let will_req = SnPacket::WillTopicReq;
+                    let mut buf = BytesMut::new();
+                    will_req.encode(&mut buf);
+                    let _ = outbound.send((peer, buf)).await;
+                } else {
+                    let connack = SnPacket::ConnAck { return_code: 0x00 };
+                    let mut buf = BytesMut::new();
+                    connack.encode(&mut buf);
+                    let _ = outbound.send((peer, buf)).await;
+                }
+            }
+
+            SnPacket::WillTopic {
+                qos,
+                retain,
+                will_topic,
+            } => {
+                debug!(
+                    "MQTT-SN WILLTOPIC from {} (topic: '{}', qos: {})",
+                    peer, will_topic, qos
+                );
+                let qos_mapped = match qos {
+                    1 => QoS::AtLeastOnce,
+                    2 => QoS::ExactlyOnce,
+                    _ => QoS::AtMostOnce,
+                };
+                {
+                    let mut lock = self.sessions.write().await;
+                    if let Some(session) = lock.get_mut(&peer) {
+                        session.last_seen = Instant::now();
+                        session.pending_will_topic = Some((will_topic, qos_mapped, retain));
+                    }
+                }
+
+                let msg_req = SnPacket::WillMsgReq;
+                let mut buf = BytesMut::new();
+                msg_req.encode(&mut buf);
+                let _ = outbound.send((peer, buf)).await;
+            }
+
+            SnPacket::WillMsg { will_msg } => {
+                debug!("MQTT-SN WILLMSG from {} (len: {})", peer, will_msg.len());
+                {
+                    let mut lock = self.sessions.write().await;
+                    if let Some(session) = lock.get_mut(&peer) {
+                        session.last_seen = Instant::now();
+                        if let Some((topic, qos, retain)) = session.pending_will_topic.take() {
+                            session.will = Some(PublishPacket {
+                                topic,
+                                qos,
+                                retain,
+                                dup: false,
+                                packet_id: None,
+                                payload: will_msg,
+                            });
+                        }
                     }
                 }
 
                 let connack = SnPacket::ConnAck { return_code: 0x00 };
                 let mut buf = BytesMut::new();
                 connack.encode(&mut buf);
+                let _ = outbound.send((peer, buf)).await;
+            }
+
+            SnPacket::WillTopicUpd {
+                qos,
+                retain,
+                will_topic,
+            } => {
+                let qos_mapped = match qos {
+                    1 => QoS::AtLeastOnce,
+                    2 => QoS::ExactlyOnce,
+                    _ => QoS::AtMostOnce,
+                };
+                {
+                    let mut lock = self.sessions.write().await;
+                    if let Some(session) = lock.get_mut(&peer) {
+                        session.last_seen = Instant::now();
+                        if let Some(ref mut will) = session.will {
+                            will.topic = will_topic;
+                            will.qos = qos_mapped;
+                            will.retain = retain;
+                        } else {
+                            session.pending_will_topic = Some((will_topic, qos_mapped, retain));
+                        }
+                    }
+                }
+                let resp = SnPacket::WillTopicResp { return_code: 0x00 };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf);
+                let _ = outbound.send((peer, buf)).await;
+            }
+
+            SnPacket::WillMsgUpd { will_msg } => {
+                {
+                    let mut lock = self.sessions.write().await;
+                    if let Some(session) = lock.get_mut(&peer) {
+                        session.last_seen = Instant::now();
+                        if let Some(ref mut will) = session.will {
+                            will.payload = will_msg;
+                        }
+                    }
+                }
+                let resp = SnPacket::WillMsgResp { return_code: 0x00 };
+                let mut buf = BytesMut::new();
+                resp.encode(&mut buf);
                 let _ = outbound.send((peer, buf)).await;
             }
 

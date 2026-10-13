@@ -43,6 +43,7 @@ pub enum SnMsgType {
     WillTopicResp = 0x1B,
     WillMsgUpd = 0x1C,
     WillMsgResp = 0x1D,
+    EncapMsg = 0xFE,
 }
 
 impl TryFrom<u8> for SnMsgType {
@@ -77,6 +78,7 @@ impl TryFrom<u8> for SnMsgType {
             0x1B => Ok(Self::WillTopicResp),
             0x1C => Ok(Self::WillMsgUpd),
             0x1D => Ok(Self::WillMsgResp),
+            0xFE => Ok(Self::EncapMsg),
             other => Err(SnError::UnknownMsgType(other)),
         }
     }
@@ -196,6 +198,25 @@ pub enum SnPacket {
     PingResp,
     Disconnect {
         duration: Option<u16>,
+    },
+    WillTopicUpd {
+        qos: u8,
+        retain: bool,
+        will_topic: String,
+    },
+    WillTopicResp {
+        return_code: u8,
+    },
+    WillMsgUpd {
+        will_msg: Bytes,
+    },
+    WillMsgResp {
+        return_code: u8,
+    },
+    EncapMsg {
+        ctrl: u8,
+        wireless_node_id: Vec<u8>,
+        payload: Bytes,
     },
 }
 
@@ -486,6 +507,53 @@ impl SnPacket {
                 };
                 SnPacket::Disconnect { duration }
             }
+            SnMsgType::WillTopicUpd => {
+                if body.is_empty() {
+                    return Err(SnError::InvalidLength(0));
+                }
+                let flags = body[0];
+                let qos = (flags >> 5) & 0x03;
+                let retain = (flags & 0x10) != 0;
+                let will_topic = String::from_utf8_lossy(&body[1..]).to_string();
+                SnPacket::WillTopicUpd {
+                    qos,
+                    retain,
+                    will_topic,
+                }
+            }
+            SnMsgType::WillTopicResp => {
+                if body.is_empty() {
+                    return Err(SnError::InvalidLength(0));
+                }
+                SnPacket::WillTopicResp {
+                    return_code: body[0],
+                }
+            }
+            SnMsgType::WillMsgUpd => SnPacket::WillMsgUpd {
+                will_msg: Bytes::copy_from_slice(body),
+            },
+            SnMsgType::WillMsgResp => {
+                if body.is_empty() {
+                    return Err(SnError::InvalidLength(0));
+                }
+                SnPacket::WillMsgResp {
+                    return_code: body[0],
+                }
+            }
+            SnMsgType::EncapMsg => {
+                if body.is_empty() {
+                    return Err(SnError::InvalidLength(0));
+                }
+                let ctrl = body[0];
+                let node_id_len = if body.len() >= 3 { 2 } else { 0 };
+                let wireless_node_id = body[1..1 + node_id_len].to_vec();
+                let payload = Bytes::copy_from_slice(&body[1 + node_id_len..]);
+                SnPacket::EncapMsg {
+                    ctrl,
+                    wireless_node_id,
+                    payload,
+                }
+            }
             _ => return Err(SnError::UnknownMsgType(msg_type_raw)),
         };
 
@@ -696,6 +764,41 @@ impl SnPacket {
                     body.put_u16(*dur);
                 }
                 SnMsgType::Disconnect
+            }
+            SnPacket::WillTopicUpd {
+                qos,
+                retain,
+                will_topic,
+            } => {
+                let mut flags = (*qos & 0x03) << 5;
+                if *retain {
+                    flags |= 0x10;
+                }
+                body.put_u8(flags);
+                body.extend_from_slice(will_topic.as_bytes());
+                SnMsgType::WillTopicUpd
+            }
+            SnPacket::WillTopicResp { return_code } => {
+                body.put_u8(*return_code);
+                SnMsgType::WillTopicResp
+            }
+            SnPacket::WillMsgUpd { will_msg } => {
+                body.extend_from_slice(will_msg);
+                SnMsgType::WillMsgUpd
+            }
+            SnPacket::WillMsgResp { return_code } => {
+                body.put_u8(*return_code);
+                SnMsgType::WillMsgResp
+            }
+            SnPacket::EncapMsg {
+                ctrl,
+                wireless_node_id,
+                payload,
+            } => {
+                body.put_u8(*ctrl);
+                body.extend_from_slice(wireless_node_id);
+                body.extend_from_slice(payload);
+                SnMsgType::EncapMsg
             }
         };
 
