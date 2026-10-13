@@ -29,7 +29,7 @@
 | :--- | :--- | :---: | :--- |
 | **Transport** | TCP Listener (Plaintext) | ✅ Implemented | Asynchronous Tokio TCP server on configurable host/port with unified `BrokerContext` |
 | **Transport** | TLS 1.3 / 1.2 Listener (mTLS) | ✅ Implemented | Full mutual authentication, ALPN (`mqtt`), shared routing state with TCP listener |
-| **Transport** | MQTT-SN Listener (UDP / DTLS) | ✅ Implemented | OASIS MQTT-SN v1.2 over UDP (Port 1884) with DTLS support and predefined topic mappings |
+| **Transport** | MQTT-SN Listener (UDP) | ✅ Implemented | OASIS MQTT-SN v1.2 over UDP (Port 1884) with predefined topic mappings (DTLS transport encapsulation on roadmap) |
 | **Multi-Listener**| Unified Broker State & Cross-Routing | ✅ Implemented | TCP, TLS, and UDP SN listeners share router, sessions, ACL, and retained store ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)) |
 | **MQTT-SN 1.2**| Predefined & Short Topic IDs | ✅ Implemented | Zero-bandwidth topic IDs for aerial telemetry (UAVs / Drones) and constrained wireless sensors |
 | **MQTT-SN 1.2**| QoS -1 (Ultra-Fast Fire & Forget) | ✅ Implemented | Low-power stateless publishing without prior `CONNECT` handshake |
@@ -267,7 +267,7 @@ port = 8883
 
 [listeners.mqtt_sn]
 enabled = true
-bind_address = "0.0.0.0"     # UDP / MQTT-SN listener (DTLS enabled via wolfSSL)
+bind_address = "0.0.0.0"     # UDP / MQTT-SN listener (Port 1884)
 port = 1884
 gateway_id = 1
 advertise_interval_sec = 900 # Periodic ADVERTISE broadcast (0 to disable)

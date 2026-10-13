@@ -6,11 +6,13 @@ use std::collections::HashMap;
 pub struct RetainedStore {
     messages: HashMap<String, PublishPacket>,
     max_messages: usize,
+    current_bytes: usize,
+    max_bytes: usize,
 }
 
 impl Default for RetainedStore {
     fn default() -> Self {
-        Self::with_max_messages(100_000)
+        Self::with_limits(100_000, 64 * 1024 * 1024)
     }
 }
 
@@ -20,32 +22,71 @@ impl RetainedStore {
     }
 
     pub fn with_max_messages(max_messages: usize) -> Self {
+        Self::with_limits(max_messages, 64 * 1024 * 1024)
+    }
+
+    pub fn with_limits(max_messages: usize, max_bytes: usize) -> Self {
         Self {
             messages: HashMap::new(),
             max_messages,
+            current_bytes: 0,
+            max_bytes,
         }
+    }
+
+    pub fn current_bytes(&self) -> usize {
+        self.current_bytes
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
     }
 
     /// Stores or deletes a retained message according to MQTT specifications.
     /// If payload is empty (zero-length), the retained message for this topic is deleted.
     pub fn update(&mut self, mut packet: PublishPacket) -> bool {
+        let old_size = self
+            .messages
+            .get(&packet.topic)
+            .map(|p| p.payload.len() + p.topic.len())
+            .unwrap_or(0);
+
         if packet.payload.is_empty() {
             // OASIS Spec: Empty payload clears the retained message
-            self.messages.remove(&packet.topic).is_some()
+            if self.messages.remove(&packet.topic).is_some() {
+                self.current_bytes = self.current_bytes.saturating_sub(old_size);
+                true
+            } else {
+                false
+            }
         } else {
-            // Ensure retain flag is true in the stored message
-            packet.retain = true;
+            let new_size = packet.payload.len() + packet.topic.len();
             if self.messages.len() >= self.max_messages
                 && !self.messages.contains_key(&packet.topic)
             {
                 tracing::warn!(
-                    "Retained store quota exceeded ({}/{}). Rejecting new topic '{}'",
+                    "Retained store count quota exceeded ({}/{}). Rejecting new topic '{}'",
                     self.messages.len(),
                     self.max_messages,
                     packet.topic
                 );
                 return false;
             }
+
+            let new_total = self.current_bytes.saturating_sub(old_size) + new_size;
+            if new_total > self.max_bytes {
+                tracing::warn!(
+                    "Retained store byte quota exceeded ({}/{} bytes). Rejecting topic '{}'",
+                    new_total,
+                    self.max_bytes,
+                    packet.topic
+                );
+                return false;
+            }
+
+            self.current_bytes = new_total;
+            // Ensure retain flag is true in the stored message
+            packet.retain = true;
             self.messages.insert(packet.topic.clone(), packet);
             true
         }

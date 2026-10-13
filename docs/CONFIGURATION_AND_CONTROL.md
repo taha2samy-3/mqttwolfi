@@ -39,7 +39,7 @@ WolfiMQ utilizes an asynchronous, non-blocking I/O event loop built on Tokio. It
            +--------------------------------------+--------------------------------------+
            |                                      |                                      |
     [listeners.tcp]                        [listeners.tls]                       [listeners.mqtt_sn]
-  Plain TCP (Port 1883)               wolfSSL TLS 1.3 (Port 8883)             UDP / DTLS (Port 1884)
+  Plain TCP (Port 1883)               wolfSSL TLS 1.3 (Port 8883)             UDP (Port 1884, DTLS-Ready)
   MQTT v3.1.1 / v5.0                     MQTT v3.1.1 / v5.0                      OASIS MQTT-SN v1.2
            |                                      |                                      |
            +--------------------------------------+--------------------------------------+
@@ -167,7 +167,7 @@ advertise_interval_sec = 900 # Send ADVERTISE frames every 15 mins (0 to disable
 2. **QoS -1 (Ultra-Fast Fire-and-Forget):** Constrained edge nodes and UAVs can transmit datagrams directly without prior `CONNECT` handshakes or session initialization.
 3. **Sleeping Client Message Buffering:** Battery-saving edge devices can enter an asleep state (`DISCONNECT { duration: T }`). WolfiMQ automatically buffers downstream messages and transfers them sequentially upon receiving a wake-up `PINGREQ { client_id }`, concluding with `PINGRESP`.
 4. **Session Keepalive Reaper & LWT Timeout:** Background reaper monitors client heartbeats. If a client fails to transmit within `1.5 * duration`, WolfiMQ automatically cleans the dead session and publishes its registered Last Will & Testament to all subscribers.
-5. **DTLS Transport Security:** wolfSSL DTLS 1.2 / 1.3 provides datagram-level cipher encryption, anti-replay protection, and mutual certificate authentication across UDP channels.
+5. **Transport Security & DTLS Roadmap:** wolfSSL is compiled with `-DWOLFSSL_DTLS=ON` in preparation for DTLS 1.2 / 1.3 encapsulation, providing datagram encryption and mutual certificate authentication across UDP channels.
 6. **Cross-Protocol Hybrid Delivery:** UDP datagrams published by MQTT-SN clients are immediately dispatched into the central `TopicTrie` and delivered to TCP/TLS subscribers in real-time, and vice versa.
 
 #### Exactly-Once Delivery (QoS 2) State Machine & Deduplication
@@ -186,7 +186,7 @@ WolfiMQ implements the complete 4-step state machine specified in OASIS MQTT v3.
 - **Benchmarked Performance:** Processes over **2.19 Million complete 4-step handshakes/sec** with mean latency under `457 ns` in release mode.
 
 > [!TIP]
-> In production environments with public internet exposure, set `listeners.tcp.enabled = false` and exclusively expose `listeners.tls` on port 8883 and `listeners.mqtt_sn` on port 1884 (with DTLS).
+> In production environments with public internet exposure, set `listeners.tcp.enabled = false` and exclusively expose `listeners.tls` on port 8883 and `listeners.mqtt_sn` on port 1884.
 
 ---
 
@@ -520,16 +520,16 @@ cargo run --release --bin wolf-bench-tls -- \
 
 ## 6. Multi-Architecture Release Builds & FIPS Variants
 
-WolfiMQ provides automated continuous delivery via `.github/workflows/release.yml` targeting both 64-bit x86 and ARM platforms, available in standard and FIPS-validated cryptographic flavors:
+WolfiMQ provides automated continuous delivery via `.github/workflows/release.yml` targeting both 64-bit x86 and ARM platforms, available in standard and FIPS-Ready cryptographic flavors:
 
 ### Distribution Matrix
 
 | Package Name | Architecture | Platform ABI | Cryptographic Engine | FIPS 140-2/3 |
 | :--- | :--- | :--- | :--- | :---: |
 | `wolfimq-*-linux-amd64-wolfssl.tar.gz` | `x86_64` (AMD64) | GNU / Linux | Native wolfSSL TLS 1.3 | Standard |
-| `wolfimq-*-linux-amd64-wolfssl-fips.tar.gz` | `x86_64` (AMD64) | GNU / Linux | wolfSSL FIPS 140-2/3 Module | Validated |
+| `wolfimq-*-linux-amd64-wolfssl-fips.tar.gz` | `x86_64` (AMD64) | GNU / Linux | wolfSSL FIPS 140-2/3 Module | FIPS-Ready |
 | `wolfimq-*-linux-arm64-wolfssl.tar.gz` | `aarch64` (ARM64) | GNU / Linux | Native wolfSSL TLS 1.3 | Standard |
-| `wolfimq-*-linux-arm64-wolfssl-fips.tar.gz` | `aarch64` (ARM64) | GNU / Linux | wolfSSL FIPS 140-2/3 Module | Validated |
+| `wolfimq-*-linux-arm64-wolfssl-fips.tar.gz` | `aarch64` (ARM64) | GNU / Linux | wolfSSL FIPS 140-2/3 Module | FIPS-Ready |
 
 ### Building Locally
 
@@ -537,7 +537,7 @@ WolfiMQ provides automated continuous delivery via `.github/workflows/release.ym
 # Compile standard release binary (AMD64)
 task build:release
 
-# Compile FIPS 140-2/3 validated release binary
+# Compile FIPS 140-2/3 Ready release binary
 task build:release:fips
 
 # Package complete release distribution archive locally
@@ -550,8 +550,8 @@ Run `--version` on any deployed binary:
 ```bash
 ./bin/wolf-broker --version
 ```
-- **Standard variant:** `wolf-mqtt-broker v0.1.0 (wolfSSL TLS 1.3 / mTLS)`
-- **FIPS variant:** `wolf-mqtt-broker v0.1.0 (wolfSSL FIPS 140-2/3 Validated Cryptographic Module - TLS 1.3 / mTLS)`
+- **Standard variant:** `wolf-mqtt-broker v0.3.3 (wolfSSL TLS 1.3 / mTLS)`
+- **FIPS variant:** `wolf-mqtt-broker v0.3.3 (wolfSSL FIPS-Ready build - FIPS-approved algorithms, TLS 1.3 / mTLS)`
 
 ---
 
