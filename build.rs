@@ -37,9 +37,7 @@ fn main() {
             // NOTE: FIPS requires a validated wolfSSL FIPS source bundle.
             // The standard open-source wolfSSL tree does NOT include FIPS code.
             // Set FIPS_VERSION to match your validated bundle (v1, v2, v5, etc.)
-            cmake_cmd
-                .arg("-DWOLFSSL_FIPS=ON")
-                .arg("-DFIPS_VERSION=v5"); // Adjust to your certified bundle version
+            cmake_cmd.arg("-DWOLFSSL_FIPS=ON").arg("-DFIPS_VERSION=v5"); // Adjust to your certified bundle version
             println!("cargo:warning=Building wolfSSL in FIPS mode (FIPS_VERSION=v5). Ensure you are using a validated FIPS source bundle.");
         }
 

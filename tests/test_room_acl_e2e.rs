@@ -878,7 +878,11 @@ async fn test_e2e_acl_conf_guest_auditor() {
     )
     .await;
     // No deliver-back expected (viewer cannot publish)
-    let no_msg = timeout(Duration::from_millis(200), read_packet(&mut stream, &mut buf)).await;
+    let no_msg = timeout(
+        Duration::from_millis(200),
+        read_packet(&mut stream, &mut buf),
+    )
+    .await;
     assert!(
         no_msg.is_err(),
         "guest_auditor must NOT be able to publish (viewer = read-only)"
@@ -1010,7 +1014,11 @@ async fn test_e2e_acl_conf_sensor_node() {
         }),
     )
     .await;
-    let no_puback = timeout(Duration::from_millis(200), read_packet(&mut stream, &mut buf)).await;
+    let no_puback = timeout(
+        Duration::from_millis(200),
+        read_packet(&mut stream, &mut buf),
+    )
+    .await;
     assert!(
         no_puback.is_err(),
         "sensor_node must NOT receive PUBACK when publishing to another device's topic"
