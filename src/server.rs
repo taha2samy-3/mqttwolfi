@@ -760,7 +760,10 @@ impl BrokerServer {
                                         if let Some(pid) = pub_pkt.packet_id {
                                             let puback = MqttPacket::PubAck { packet_id: pid };
                                             let mut ack_buf = BytesMut::new();
-                                            if puback.encode(&mut ack_buf).is_ok() {
+                                            if puback
+                                                .encode_for_version(&mut ack_buf, client_protocol_version)
+                                                .is_ok()
+                                            {
                                                 let _ = tx.send(ack_buf.freeze()).await;
                                             }
                                         }
@@ -769,7 +772,10 @@ impl BrokerServer {
                                         if let Some(pid) = pub_pkt.packet_id {
                                             let pubrec = MqttPacket::PubRec { packet_id: pid };
                                             let mut ack_buf = BytesMut::new();
-                                            if pubrec.encode(&mut ack_buf).is_ok() {
+                                            if pubrec
+                                                .encode_for_version(&mut ack_buf, client_protocol_version)
+                                                .is_ok()
+                                            {
                                                 let _ = tx.send(ack_buf.freeze()).await;
                                             }
                                         }
