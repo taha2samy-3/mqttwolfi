@@ -12,9 +12,9 @@
       .brand-tagline {
         fill: #475569;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Inter', sans-serif;
-        font-size: 14px;
+        font-size: 13.5px;
         font-weight: 700;
-        letter-spacing: 5px;
+        letter-spacing: 4px;
       }
       .badge-bg {
         fill: rgba(15, 23, 42, 0.06);
@@ -22,6 +22,9 @@
       }
       .badge-text-green {
         fill: #059669;
+      }
+      .badge-text-cyan {
+        fill: #0891B2;
       }
       .badge-text-blue {
         fill: #0284C7;
@@ -50,6 +53,9 @@
         .badge-text-green {
           fill: #34D399;
         }
+        .badge-text-cyan {
+          fill: #00F2FE;
+        }
         .badge-text-blue {
           fill: #38BDF8;
         }
@@ -71,6 +77,16 @@
       <stop offset="100%" stop-color="#4FACFE"/>
     </linearGradient>
 
+    <linearGradient id="sn-accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38EF7D"/>
+      <stop offset="100%" stop-color="#00F2FE"/>
+    </linearGradient>
+
+    <linearGradient id="dtls-shield-grad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#0B132B"/>
+    </linearGradient>
+
     <!-- Glow Filters -->
     <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
       <feGaussianBlur stdDeviation="8" result="blur"/>
@@ -85,11 +101,11 @@
 
   <!-- NOTE: No Background Rectangle (100% Transparent) -->
 
-  <!-- MQTT Signal Radiating Waves (Concentric Arcs) -->
+  <!-- MQTT & MQTT-SN Radiating Waves (Concentric Arcs & Radio Pulses) -->
   <g opacity="0.45" stroke="#00F2FE" stroke-width="2.5" fill="none" filter="url(#soft-glow)">
     <path d="M 230,105 A 210,210 0 0,1 570,105" stroke-dasharray="8,8"/>
     <path d="M 270,140 A 160,160 0 0,1 530,140" stroke-width="2.5"/>
-    <path d="M 315,175 A 110,110 0 0,1 485,175" stroke-width="3"/>
+    <path d="M 315,175 A 110,110 0 0,1 485,175" stroke-width="3" stroke="#38EF7D" opacity="0.8"/>
   </g>
 
   <!-- Central Emblem: Geometric Cyber Wolf Head & Shield -->
@@ -140,12 +156,13 @@
     <!-- Nose Node -->
     <polygon points="0,60 -12,72 12,72" fill="#00F2FE"/>
 
-    <!-- Cryptographic Lock Accent at Muzzle Base -->
+    <!-- Cryptographic DTLS & TLS Shield with Padlock Accent at Muzzle Base -->
     <g transform="translate(0, 100)" filter="url(#soft-glow)">
-      <circle cx="0" cy="0" r="14" fill="#0B132B" stroke="#00F2FE" stroke-width="2"/>
-      <path d="M -5,-2 L -5,-5 A 5,5 0 0,1 5,-5 L 5,-2" fill="none" stroke="#00F2FE" stroke-width="2"/>
-      <rect x="-6" y="-2" width="12" height="9" rx="2" fill="url(#wolf-primary)"/>
-      <circle cx="0" cy="2.5" r="1.5" fill="#0B132B"/>
+      <path d="M 0,-13 L 15,-5 L 15,7 C 15,16 0,22 0,22 C 0,22 -15,16 -15,7 L -15,-5 Z"
+            fill="url(#dtls-shield-grad)" stroke="#00F2FE" stroke-width="2"/>
+      <path d="M -4.5,1 L -4.5,-2.5 A 4.5,4.5 0 0,1 4.5,-2.5 L 4.5,1" fill="none" stroke="#00F2FE" stroke-width="1.8"/>
+      <rect x="-5.5" y="1" width="11" height="8" rx="1.8" fill="url(#sn-accent)"/>
+      <circle cx="0" cy="5" r="1.3" fill="#0B132B"/>
     </g>
 
     <!-- Dynamic Telemetry Data Particles -->
@@ -164,19 +181,26 @@
 
     <!-- Subtitle / Tagline -->
     <text x="400" y="475" class="brand-tagline">
-      THE GUARDED PACK • RUST &amp; WOLFSSL BROKER
+      THE GUARDED PACK • RUST, WOLFSSL TLS/DTLS &amp; MQTT-SN BROKER
     </text>
 
-    <!-- Protocol Badges -->
+    <!-- Protocol Badges (MQTT v5/v3, MQTT-SN, TLS 1.3 / DTLS, Tokio Async) -->
     <g transform="translate(400, 505)">
-      <rect x="-185" y="0" width="115" height="26" rx="13" class="badge-bg" stroke-width="1"/>
-      <text x="-127" y="17" font-family="monospace" font-size="11" font-weight="700" class="badge-text-green">MQTT v5 / v3</text>
+      <!-- Badge 1: MQTT v5 / v3 -->
+      <rect x="-310" y="0" width="140" height="26" rx="13" class="badge-bg" stroke-width="1"/>
+      <text x="-240" y="17" font-family="monospace" font-size="11" font-weight="700" class="badge-text-green">MQTT v5 / v3</text>
 
-      <rect x="-55" y="0" width="115" height="26" rx="13" class="badge-bg" stroke="#00F2FE" stroke-width="1"/>
-      <text x="2" y="17" font-family="monospace" font-size="11" font-weight="700" class="badge-text-blue">wolfSSL TLS 1.3</text>
+      <!-- Badge 2: MQTT-SN (UDP) -->
+      <rect x="-155" y="0" width="145" height="26" rx="13" class="badge-bg" stroke="#00F2FE" stroke-width="1"/>
+      <text x="-82" y="17" font-family="monospace" font-size="11" font-weight="700" class="badge-text-cyan">MQTT-SN (UDP)</text>
 
-      <rect x="75" y="0" width="110" height="26" rx="13" class="badge-bg" stroke-width="1"/>
-      <text x="130" y="17" font-family="monospace" font-size="11" font-weight="700" class="badge-text-purple">TOKIO ASYNC</text>
+      <!-- Badge 3: TLS 1.3 / DTLS -->
+      <rect x="5" y="0" width="145" height="26" rx="13" class="badge-bg" stroke="#38BDF8" stroke-width="1"/>
+      <text x="78" y="17" font-family="monospace" font-size="11" font-weight="700" class="badge-text-blue">TLS 1.3 / DTLS</text>
+
+      <!-- Badge 4: TOKIO ASYNC -->
+      <rect x="165" y="0" width="145" height="26" rx="13" class="badge-bg" stroke-width="1"/>
+      <text x="238" y="17" font-family="monospace" font-size="11" font-weight="700" class="badge-text-purple">TOKIO ASYNC</text>
     </g>
   </g>
 </svg>
