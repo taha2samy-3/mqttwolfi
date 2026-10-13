@@ -481,7 +481,10 @@ fn write_markdown_summary(path: &str, results: &[BenchmarkResult]) -> std::io::R
         file,
         "| Broker | TLS engine | Clients | Handshakes (total) | Delivered | Throughput | Bandwidth | Mean RTT | p90 RTT | p99 RTT | Max RTT |"
     )?;
-    writeln!(file, "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")?;
+    writeln!(
+        file,
+        "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+    )?;
     for r in results {
         writeln!(
             file,
