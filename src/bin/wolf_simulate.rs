@@ -78,6 +78,7 @@ struct ClientSession {
 }
 
 impl ClientSession {
+    #[allow(clippy::too_many_arguments)]
     async fn connect(
         host: &str,
         port: u16,
@@ -355,7 +356,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("  --tls             Connect via TLS 1.3 encrypted socket");
                 println!("  --delay <MS>      Delay in milliseconds between simulated steps (default: 500)");
                 println!("  --username, -u    Authentication username (default: superadmin)");
-                println!("  --password, -p    Authentication password (default: admin_secret_pass)");
+                println!(
+                    "  --password, -p    Authentication password (default: admin_secret_pass)"
+                );
                 println!("  --anonymous       Connect anonymously without credentials");
                 println!("  --help, -h        Display this help message");
                 return Ok(());

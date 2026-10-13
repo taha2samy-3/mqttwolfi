@@ -30,6 +30,7 @@ jobs:
         uses: arduino/setup-task@v2
         with:
           version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check Code Formatting
         run: task fmt
@@ -54,6 +55,7 @@ jobs:
         uses: arduino/setup-task@v2
         with:
           version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Generate Testing Certificates (mTLS)
         run: task certs:gen
@@ -84,6 +86,7 @@ jobs:
         uses: arduino/setup-task@v2
         with:
           version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Execute High-Precision Benchmarks
         run: task bench
@@ -118,6 +121,7 @@ jobs:
         uses: arduino/setup-task@v2
         with:
           version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Eclipse Mosquitto & OpenSSL
         run: |
