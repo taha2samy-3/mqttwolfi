@@ -419,6 +419,12 @@ impl MqttSnServer {
                         let mut buf = BytesMut::new();
                         puback.encode(&mut buf);
                         let _ = outbound.send((peer, buf)).await;
+                    } else if qos == 2 {
+                        // OASIS MQTT-SN v1.2 §5.4.10: QoS 2 Handshake step 1 - Gateway sends PubRec
+                        let pubrec = SnPacket::PubRec { msg_id };
+                        let mut buf = BytesMut::new();
+                        pubrec.encode(&mut buf);
+                        let _ = outbound.send((peer, buf)).await;
                     }
                 } else {
                     warn!(
@@ -551,11 +557,67 @@ impl MqttSnServer {
                 }
             }
 
-            SnPacket::PingReq { .. } => {
+            SnPacket::PubRel { msg_id } => {
+                // OASIS MQTT-SN v1.2 §5.4.12: QoS 2 Handshake step 2 - Gateway responds with PubComp
+                let pubcomp = SnPacket::PubComp { msg_id };
+                let mut buf = BytesMut::new();
+                pubcomp.encode(&mut buf);
+                let _ = outbound.send((peer, buf)).await;
+            }
+
+            SnPacket::PubRec { msg_id } => {
+                let pubrel = SnPacket::PubRel { msg_id };
+                let mut buf = BytesMut::new();
+                pubrel.encode(&mut buf);
+                let _ = outbound.send((peer, buf)).await;
+            }
+
+            SnPacket::Unsubscribe {
+                topic_id_type,
+                msg_id,
+                topic_id,
+                topic_name,
+            } => {
+                let resolved_topic = match topic_id_type {
+                    TopicIdType::Normal => topic_name,
+                    TopicIdType::Predefined => self.predefined_id_to_name.get(&topic_id).cloned(),
+                    TopicIdType::Short => {
+                        let bytes = topic_id.to_be_bytes();
+                        Some(String::from_utf8_lossy(&bytes).to_string())
+                    }
+                    _ => None,
+                };
+
+                if let Some(topic) = resolved_topic {
+                    let mut internal_id = None;
+                    {
+                        let mut lock = self.sessions.write().await;
+                        if let Some(session) = lock.get_mut(&peer) {
+                            session.subscribed_topics.retain(|t| t != &topic);
+                            internal_id = Some(session.internal_id);
+                        }
+                    }
+                    if let Some(id) = internal_id {
+                        let mut router_guard = self.context.router.write().await;
+                        let _ = router_guard.unsubscribe(&topic, id);
+                    }
+                }
+
+                let unsuback = SnPacket::UnsubAck { msg_id };
+                let mut buf = BytesMut::new();
+                unsuback.encode(&mut buf);
+                let _ = outbound.send((peer, buf)).await;
+            }
+
+            SnPacket::PingReq { client_id } => {
                 {
                     let mut lock = self.sessions.write().await;
                     if let Some(session) = lock.get_mut(&peer) {
                         session.last_seen = Instant::now();
+                        if client_id.is_some() {
+                            // OASIS MQTT-SN v1.2 §5.4.18: Sleeping client wakes up
+                            session.asleep = false;
+                        }
                     }
                 }
                 let mut buf = BytesMut::new();
@@ -563,21 +625,43 @@ impl MqttSnServer {
                 let _ = outbound.send((peer, buf)).await;
             }
 
-            SnPacket::Disconnect { .. } => {
-                let mut internal_id = None;
-                {
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.remove(&peer) {
-                        internal_id = Some(session.internal_id);
+            SnPacket::Disconnect { duration } => {
+                if duration.is_none() {
+                    // Permanent disconnect: clean up session and central client channel
+                    let mut internal_id = None;
+                    {
+                        let mut lock = self.sessions.write().await;
+                        if let Some(session) = lock.remove(&peer) {
+                            internal_id = Some(session.internal_id);
+                        }
                     }
-                }
-                if let Some(id) = internal_id {
-                    let mut clients_guard = self.context.clients.write().await;
-                    clients_guard.remove(&id);
+                    if let Some(id) = internal_id {
+                        let mut clients_guard = self.context.clients.write().await;
+                        clients_guard.remove(&id);
+                    }
+                } else {
+                    // OASIS MQTT-SN v1.2 §5.4.20: Client enters Asleep state; retain session & subscriptions
+                    let mut lock = self.sessions.write().await;
+                    if let Some(session) = lock.get_mut(&peer) {
+                        session.last_seen = Instant::now();
+                        session.asleep = true;
+                    }
                 }
                 let mut buf = BytesMut::new();
                 SnPacket::Disconnect { duration: None }.encode(&mut buf);
                 let _ = outbound.send((peer, buf)).await;
+            }
+
+            SnPacket::EncapMsg {
+                ctrl: _,
+                wireless_node_id: _,
+                payload,
+            } => {
+                // OASIS MQTT-SN v1.2 §5.5: Forwarder Encapsulation unwrapping
+                let mut slice = &payload[..];
+                if let Ok(inner) = SnPacket::decode(&mut slice) {
+                    Box::pin(self.handle_packet(inner, peer, outbound)).await;
+                }
             }
 
             _ => {}

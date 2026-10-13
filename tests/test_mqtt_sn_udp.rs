@@ -407,3 +407,179 @@ async fn test_cross_protocol_tcp_to_sn_udp_delivery() {
         other => panic!("Expected SnPacket::Publish, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn test_mqtt_sn_lwt_handshake_flow() {
+    let (server_addr, _context) = spawn_test_sn_server().await;
+    let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // 1. Connect with will = true
+    let mut buf = BytesMut::new();
+    SnPacket::Connect {
+        will: true,
+        clean_session: true,
+        duration: 30,
+        client_id: "drone-lwt-client".into(),
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // 2. Gateway MUST prompt with WillTopicReq
+    let resp1 = recv_sn_packet(&client_sock).await;
+    assert_eq!(resp1, SnPacket::WillTopicReq);
+
+    // 3. Client responds with WillTopic
+    buf.clear();
+    SnPacket::WillTopic {
+        qos: 1,
+        retain: false,
+        will_topic: "uav/drone_01/status/lost".into(),
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // 4. Gateway prompts with WillMsgReq
+    let resp2 = recv_sn_packet(&client_sock).await;
+    assert_eq!(resp2, SnPacket::WillMsgReq);
+
+    // 5. Client responds with WillMsg
+    buf.clear();
+    SnPacket::WillMsg {
+        will_msg: Bytes::from_static(b"SIGNAL_LOST_CRASH_DETECTED"),
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // 6. Gateway now completes handshake with ConnAck!
+    let resp3 = recv_sn_packet(&client_sock).await;
+    assert_eq!(resp3, SnPacket::ConnAck { return_code: 0x00 });
+}
+
+#[tokio::test]
+async fn test_mqtt_sn_unsubscribe_flow() {
+    let (server_addr, _context) = spawn_test_sn_server().await;
+    let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // Connect first
+    let mut buf = BytesMut::new();
+    SnPacket::Connect {
+        will: false,
+        clean_session: true,
+        duration: 60,
+        client_id: "unsub-drone".into(),
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+    let _ = recv_sn_packet(&client_sock).await; // ConnAck
+
+    // Subscribe
+    buf.clear();
+    SnPacket::Subscribe {
+        dup: false,
+        qos: 1,
+        topic_id_type: TopicIdType::Predefined,
+        topic_id: 1,
+        topic_name: None,
+        msg_id: 20,
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+    let suback = recv_sn_packet(&client_sock).await;
+    assert!(matches!(
+        suback,
+        SnPacket::SubAck {
+            return_code: 0x00,
+            ..
+        }
+    ));
+
+    // Unsubscribe
+    buf.clear();
+    SnPacket::Unsubscribe {
+        topic_id_type: TopicIdType::Predefined,
+        msg_id: 21,
+        topic_id: 1,
+        topic_name: None,
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // Verify UnsubAck with msg_id 21
+    let unsuback = recv_sn_packet(&client_sock).await;
+    assert_eq!(unsuback, SnPacket::UnsubAck { msg_id: 21 });
+}
+
+#[tokio::test]
+async fn test_mqtt_sn_qos2_handshake_flow() {
+    let (server_addr, _context) = spawn_test_sn_server().await;
+    let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // 1. Send Publish with QoS 2
+    let mut buf = BytesMut::new();
+    SnPacket::Publish {
+        dup: false,
+        qos: 2,
+        retain: false,
+        topic_id_type: TopicIdType::Predefined,
+        topic_id: 1,
+        msg_id: 77,
+        data: Bytes::from_static(b"CRITICAL_WAYPOINT_CONFIRMED"),
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // 2. Gateway MUST reply with PubRec
+    let pubrec = recv_sn_packet(&client_sock).await;
+    assert_eq!(pubrec, SnPacket::PubRec { msg_id: 77 });
+
+    // 3. Client sends PubRel
+    buf.clear();
+    SnPacket::PubRel { msg_id: 77 }.encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // 4. Gateway completes with PubComp
+    let pubcomp = recv_sn_packet(&client_sock).await;
+    assert_eq!(pubcomp, SnPacket::PubComp { msg_id: 77 });
+}
+
+#[tokio::test]
+async fn test_mqtt_sn_sleeping_client_lifecycle() {
+    let (server_addr, _context) = spawn_test_sn_server().await;
+    let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // 1. Connect
+    let mut buf = BytesMut::new();
+    SnPacket::Connect {
+        will: false,
+        clean_session: true,
+        duration: 100,
+        client_id: "low-power-sensor-99".into(),
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+    let _ = recv_sn_packet(&client_sock).await; // ConnAck
+
+    // 2. Client enters sleep state with duration = 300s
+    buf.clear();
+    SnPacket::Disconnect {
+        duration: Some(300),
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // Gateway acknowledges with Disconnect (without duration)
+    let disc_ack = recv_sn_packet(&client_sock).await;
+    assert_eq!(disc_ack, SnPacket::Disconnect { duration: None });
+
+    // 3. Client wakes up and sends PingReq with its client_id
+    buf.clear();
+    SnPacket::PingReq {
+        client_id: Some("low-power-sensor-99".into()),
+    }
+    .encode(&mut buf);
+    client_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // Gateway responds with PingResp
+    let ping_resp = recv_sn_packet(&client_sock).await;
+    assert_eq!(ping_resp, SnPacket::PingResp);
+}
