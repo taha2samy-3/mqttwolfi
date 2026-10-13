@@ -36,6 +36,10 @@ impl BrokerContext {
         }
     }
 
+    pub fn next_client_id(&self) -> u64 {
+        NEXT_CLIENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Starts the background periodic $SYS topic publisher task.
     pub fn start_sys_publisher(&self, interval_sec: u64) {
         let context = self.clone();

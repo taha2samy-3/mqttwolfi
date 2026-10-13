@@ -1,6 +1,6 @@
 use crate::config::MqttSnListenerConfig;
 use crate::protocol::sn::{SnPacket, TopicIdType};
-use crate::protocol::QoS;
+use crate::protocol::{MqttPacket, PublishPacket, QoS};
 use crate::server::BrokerContext;
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
@@ -13,7 +13,8 @@ use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub struct SnClientSession {
-    pub client_id: String,
+    pub client_id_str: String,
+    pub internal_id: u64,
     pub last_seen: Instant,
     pub duration_sec: u16,
     pub next_topic_id: u16,
@@ -23,13 +24,14 @@ pub struct SnClientSession {
 }
 
 impl SnClientSession {
-    pub fn new(client_id: String, duration_sec: u16) -> Self {
+    pub fn new(client_id_str: String, internal_id: u64, duration_sec: u16) -> Self {
         Self {
-            client_id,
+            client_id_str,
+            internal_id,
             last_seen: Instant::now(),
             duration_sec,
             next_topic_id: 100, // IDs 1..99 reserved for predefined topics
-            topic_id_to_name: HashMap::new>,
+            topic_id_to_name: HashMap::new(),
             name_to_topic_id: HashMap::new(),
             subscribed_topics: Vec::new(),
         }
@@ -49,14 +51,14 @@ impl SnClientSession {
 
 pub struct MqttSnServer {
     config: MqttSnListenerConfig,
-    context: Arc<BrokerContext>,
+    context: BrokerContext,
     predefined_id_to_name: Arc<HashMap<u16, String>>,
     predefined_name_to_id: Arc<HashMap<String, u16>>,
     sessions: Arc<RwLock<HashMap<SocketAddr, SnClientSession>>>,
 }
 
 impl MqttSnServer {
-    pub fn new(config: MqttSnListenerConfig, context: Arc<BrokerContext>) -> Self {
+    pub fn new(config: MqttSnListenerConfig, context: BrokerContext) -> Self {
         let mut id_to_name = HashMap::new();
         let mut name_to_id = HashMap::new();
 
@@ -101,20 +103,17 @@ impl MqttSnServer {
             let adv_socket = Arc::clone(&socket);
             let gw_id = self.config.gateway_id;
             let duration = self.config.advertise_interval_sec * 3;
-            let interval = std::time::Duration::from_secs(self.config.advertise_interval_sec as u64);
+            let interval =
+                std::time::Duration::from_secs(self.config.advertise_interval_sec as u64);
 
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
-                let adv_pkt = SnPacket::Advertise {
-                    gw_id,
-                    duration,
-                };
+                let adv_pkt = SnPacket::Advertise { gw_id, duration };
                 let mut buf = BytesMut::new();
                 adv_pkt.encode(&mut buf);
 
                 loop {
                     ticker.tick().await;
-                    // Broadcast locally or on loopback
                     let _ = adv_socket.send_to(&buf, "255.255.255.255:1884").await;
                 }
             });
@@ -172,10 +171,14 @@ impl MqttSnServer {
                     peer, client_id, duration
                 );
 
+                let internal_id = self.context.next_client_id();
                 {
                     let mut lock = self.sessions.write().await;
                     if clean_session || !lock.contains_key(&peer) {
-                        lock.insert(peer, SnClientSession::new(client_id, duration));
+                        lock.insert(
+                            peer,
+                            SnClientSession::new(client_id, internal_id, duration),
+                        );
                     } else if let Some(session) = lock.get_mut(&peer) {
                         session.last_seen = Instant::now();
                         session.duration_sec = duration;
@@ -218,7 +221,7 @@ impl MqttSnServer {
                 topic_id,
                 msg_id,
                 data,
-                ..
+                dup,
             } => {
                 // Resolve Topic Name
                 let resolved_topic = match topic_id_type {
@@ -250,15 +253,38 @@ impl MqttSnServer {
                         _ => QoS::AtMostOnce,
                     };
 
+                    let pub_pkt = PublishPacket {
+                        topic: topic.clone(),
+                        qos: qos_mapped,
+                        retain,
+                        dup,
+                        packet_id: if qos > 0 { Some(msg_id) } else { None },
+                        payload: data.clone(),
+                    };
+
                     if retain {
-                        self.context
-                            .retained
-                            .set(&topic, data.clone(), qos_mapped)
-                            .await;
+                        let mut ret_guard = self.context.retained.write().await;
+                        ret_guard.update(pub_pkt.clone());
                     }
 
-                    // Push directly into WolfiMQ's central Router!
-                    self.context.router.publish(&topic, data, qos_mapped, retain).await;
+                    // Forward to all matching subscribers across TCP, TLS, and SN
+                    let matched_ids = {
+                        let router_guard = self.context.router.read().await;
+                        router_guard.matches(&topic)
+                    };
+
+                    let mut forward_pkt = pub_pkt;
+                    forward_pkt.retain = false;
+                    let mut forward_buf = BytesMut::new();
+                    if MqttPacket::Publish(forward_pkt).encode(&mut forward_buf).is_ok() {
+                        let frozen = forward_buf.freeze();
+                        let clients_guard = self.context.clients.read().await;
+                        for target_id in matched_ids {
+                            if let Some(target_tx) = clients_guard.get(&target_id) {
+                                let _ = target_tx.try_send(frozen.clone());
+                            }
+                        }
+                    }
 
                     // QoS 1 Acknowledgment
                     if qos == 1 {
@@ -309,6 +335,8 @@ impl MqttSnServer {
 
                 if let Some(topic) = resolved_topic {
                     let mut assigned_id = topic_id;
+                    let mut internal_id = self.context.next_client_id();
+
                     {
                         let mut lock = self.sessions.write().await;
                         if let Some(session) = lock.get_mut(&peer) {
@@ -316,17 +344,21 @@ impl MqttSnServer {
                                 assigned_id = session.register_topic(&topic);
                             }
                             session.subscribed_topics.push(topic.clone());
+                            internal_id = session.internal_id;
                         }
                     }
 
-                    // Subscribe on central router
-                    let (tx, mut rx) = mpsc::channel(128);
-                    let sub_qos = match qos {
-                        1 => QoS::AtLeastOnce,
-                        2 => QoS::ExactlyOnce,
-                        _ => QoS::AtMostOnce,
-                    };
-                    self.context.router.subscribe(&topic, sub_qos, tx).await;
+                    // Register client channel in central context
+                    let (tx, mut rx) = mpsc::channel::<Bytes>(1024);
+                    {
+                        let mut clients_guard = self.context.clients.write().await;
+                        clients_guard.insert(internal_id, tx);
+                    }
+
+                    {
+                        let mut router_guard = self.context.router.write().await;
+                        let _ = router_guard.subscribe(&topic, internal_id);
+                    }
 
                     // Spawn forwarder task for this UDP subscriber
                     let forward_outbound = outbound.clone();
@@ -335,37 +367,41 @@ impl MqttSnServer {
                     let target_peer = peer;
 
                     tokio::spawn(async move {
-                        while let Some(msg) = rx.recv().await {
-                            // Find topic ID for this topic
-                            let (tid_type, tid) = if let Some(&pid) = forward_predefined.get(&msg.topic) {
-                                (TopicIdType::Predefined, pid)
-                            } else {
-                                let lock = forward_sessions.read().await;
-                                if let Some(s) = lock.get(&target_peer) {
-                                    if let Some(&nid) = s.name_to_topic_id.get(&msg.topic) {
-                                        (TopicIdType::Normal, nid)
+                        while let Some(raw_mqtt_bytes) = rx.recv().await {
+                            let mut slice = &raw_mqtt_bytes[..];
+                            if let Ok(MqttPacket::Publish(p)) = MqttPacket::decode(&mut slice) {
+                                // Find topic id for this topic
+                                let (tid_type, tid) =
+                                    if let Some(&pid) = forward_predefined.get(&p.topic) {
+                                        (TopicIdType::Predefined, pid)
                                     } else {
-                                        (TopicIdType::Normal, 0)
-                                    }
-                                } else {
-                                    (TopicIdType::Normal, 0)
+                                        let lock = forward_sessions.read().await;
+                                        if let Some(s) = lock.get(&target_peer) {
+                                            if let Some(&nid) = s.name_to_topic_id.get(&p.topic) {
+                                                (TopicIdType::Normal, nid)
+                                            } else {
+                                                (TopicIdType::Normal, 0)
+                                            }
+                                        } else {
+                                            (TopicIdType::Normal, 0)
+                                        }
+                                    };
+
+                                let fwd_pkt = SnPacket::Publish {
+                                    dup: p.dup,
+                                    qos: p.qos as i8,
+                                    retain: p.retain,
+                                    topic_id_type: tid_type,
+                                    topic_id: tid,
+                                    msg_id: p.packet_id.unwrap_or(0),
+                                    data: p.payload,
+                                };
+
+                                let mut buf = BytesMut::new();
+                                fwd_pkt.encode(&mut buf);
+                                if forward_outbound.send((target_peer, buf)).await.is_err() {
+                                    break;
                                 }
-                            };
-
-                            let fwd_pkt = SnPacket::Publish {
-                                dup: msg.dup,
-                                qos: msg.qos as i8,
-                                retain: msg.retain,
-                                topic_id_type: tid_type,
-                                topic_id: tid,
-                                msg_id: msg.packet_id.unwrap_or(0),
-                                data: msg.payload,
-                            };
-
-                            let mut buf = BytesMut::new();
-                            fwd_pkt.encode(&mut buf);
-                            if forward_outbound.send((target_peer, buf)).await.is_err() {
-                                break;
                             }
                         }
                     });
@@ -405,9 +441,16 @@ impl MqttSnServer {
             }
 
             SnPacket::Disconnect { .. } => {
+                let mut internal_id = None;
                 {
                     let mut lock = self.sessions.write().await;
-                    lock.remove(&peer);
+                    if let Some(session) = lock.remove(&peer) {
+                        internal_id = Some(session.internal_id);
+                    }
+                }
+                if let Some(id) = internal_id {
+                    let mut clients_guard = self.context.clients.write().await;
+                    clients_guard.remove(&id);
                 }
                 let mut buf = BytesMut::new();
                 SnPacket::Disconnect { duration: None }.encode(&mut buf);

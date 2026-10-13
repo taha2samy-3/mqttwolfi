@@ -156,6 +156,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if config.listeners.mqtt_sn.enabled {
+        let sn_server = wolf_mqtt::server_sn::MqttSnServer::new(
+            config.listeners.mqtt_sn.clone(),
+            shared_context.clone(),
+        );
+        listeners_active += 1;
+        info!(
+            "WolfiMQ MQTT-SN (UDP) listener active on {}:{} (Gateway ID: {})",
+            config.listeners.mqtt_sn.bind_address,
+            config.listeners.mqtt_sn.port,
+            config.listeners.mqtt_sn.gateway_id
+        );
+        tokio::spawn(async move {
+            if let Err(e) = sn_server.run().await {
+                error!("MQTT-SN UDP server failure: {}", e);
+            }
+        });
+    }
+
     if config.listeners.tcp.enabled {
         let tcp_addr = format!(
             "{}:{}",
