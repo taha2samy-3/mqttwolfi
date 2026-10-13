@@ -24,6 +24,7 @@ pub struct SnClientSession {
     pub topic_id_to_name: HashMap<u16, String>,
     pub name_to_topic_id: HashMap<String, u16>,
     pub subscribed_topics: Vec<String>,
+    pub buffered_messages: Vec<BytesMut>,
 }
 
 impl SnClientSession {
@@ -40,6 +41,7 @@ impl SnClientSession {
             topic_id_to_name: HashMap::new(),
             name_to_topic_id: HashMap::new(),
             subscribed_topics: Vec::new(),
+            buffered_messages: Vec::new(),
         }
     }
 
@@ -62,6 +64,32 @@ pub struct MqttSnServer {
     predefined_id_to_name: Arc<HashMap<u16, String>>,
     predefined_name_to_id: Arc<HashMap<String, u16>>,
     sessions: Arc<RwLock<HashMap<SocketAddr, SnClientSession>>>,
+}
+
+/// Dispatches an MQTT publish packet through the central broker router and retains it if requested.
+async fn dispatch_publish(context: &BrokerContext, pub_pkt: PublishPacket) {
+    if pub_pkt.retain {
+        let mut ret_guard = context.retained.write().await;
+        ret_guard.update(pub_pkt.clone());
+    }
+
+    let matched_ids = {
+        let router_guard = context.router.read().await;
+        router_guard.matches(&pub_pkt.topic)
+    };
+
+    let mut forward_pkt = pub_pkt;
+    forward_pkt.retain = false;
+    let mut forward_buf = BytesMut::new();
+    if MqttPacket::Publish(forward_pkt).encode(&mut forward_buf).is_ok() {
+        let frozen = forward_buf.freeze();
+        let clients_guard = context.clients.read().await;
+        for target_id in matched_ids {
+            if let Some(target_tx) = clients_guard.get(&target_id) {
+                let _ = target_tx.try_send(frozen.clone());
+            }
+        }
+    }
 }
 
 impl MqttSnServer {
@@ -137,6 +165,49 @@ impl MqttSnServer {
             });
         }
 
+        // Task 3: Periodic Session Keepalive & LWT monitor (OASIS MQTT-SN v1.2 §5.4.5)
+        let reaper_sessions = Arc::clone(&self.sessions);
+        let reaper_context = self.context.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            loop {
+                interval.tick().await;
+                let now = Instant::now();
+                let mut expired_peers = Vec::new();
+
+                {
+                    let lock = reaper_sessions.read().await;
+                    for (&peer, session) in lock.iter() {
+                        if session.duration_sec > 0 {
+                            // MQTT-SN standard timeout threshold is 1.5 * duration
+                            let timeout_sec = (session.duration_sec as u64) * 3 / 2;
+                            if now.duration_since(session.last_seen).as_secs() >= timeout_sec {
+                                expired_peers.push((peer, session.internal_id, session.will.clone()));
+                            }
+                        }
+                    }
+                }
+
+                if !expired_peers.is_empty() {
+                    let mut lock = reaper_sessions.write().await;
+                    for (peer, internal_id, will) in expired_peers {
+                        lock.remove(&peer);
+                        {
+                            let mut clients_guard = reaper_context.clients.write().await;
+                            clients_guard.remove(&internal_id);
+                        }
+                        if let Some(will_pkt) = will {
+                            warn!(
+                                "MQTT-SN client at {} timed out. Publishing LWT on topic '{}'",
+                                peer, will_pkt.topic
+                            );
+                            dispatch_publish(&reaper_context, will_pkt).await;
+                        }
+                    }
+                }
+            }
+        });
+
         // Main Loop: Inbound Datagram receiver
         let mut recv_buf = [0u8; 4096];
         loop {
@@ -167,6 +238,14 @@ impl MqttSnServer {
         peer: SocketAddr,
         outbound: &mpsc::Sender<(SocketAddr, BytesMut)>,
     ) {
+        // Refresh keepalive timer on any received packet (OASIS MQTT-SN v1.2 §5.4.18)
+        {
+            let mut lock = self.sessions.write().await;
+            if let Some(session) = lock.get_mut(&peer) {
+                session.last_seen = Instant::now();
+            }
+        }
+
         match packet {
             SnPacket::SearchGw { .. } => {
                 let resp = SnPacket::GwInfo {
@@ -224,23 +303,37 @@ impl MqttSnServer {
                     "MQTT-SN WILLTOPIC from {} (topic: '{}', qos: {})",
                     peer, will_topic, qos
                 );
-                let qos_mapped = match qos {
-                    1 => QoS::AtLeastOnce,
-                    2 => QoS::ExactlyOnce,
-                    _ => QoS::AtMostOnce,
-                };
-                {
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.get_mut(&peer) {
-                        session.last_seen = Instant::now();
-                        session.pending_will_topic = Some((will_topic, qos_mapped, retain));
+                if will_topic.is_empty() {
+                    // OASIS MQTT-SN v1.2 §5.4.4: Empty will_topic deletes will and concludes with ConnAck
+                    {
+                        let mut lock = self.sessions.write().await;
+                        if let Some(session) = lock.get_mut(&peer) {
+                            session.will = None;
+                            session.pending_will_topic = None;
+                        }
                     }
-                }
+                    let connack = SnPacket::ConnAck { return_code: 0x00 };
+                    let mut buf = BytesMut::new();
+                    connack.encode(&mut buf);
+                    let _ = outbound.send((peer, buf)).await;
+                } else {
+                    let qos_mapped = match qos {
+                        1 => QoS::AtLeastOnce,
+                        2 => QoS::ExactlyOnce,
+                        _ => QoS::AtMostOnce,
+                    };
+                    {
+                        let mut lock = self.sessions.write().await;
+                        if let Some(session) = lock.get_mut(&peer) {
+                            session.pending_will_topic = Some((will_topic, qos_mapped, retain));
+                        }
+                    }
 
-                let msg_req = SnPacket::WillMsgReq;
-                let mut buf = BytesMut::new();
-                msg_req.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
+                    let msg_req = SnPacket::WillMsgReq;
+                    let mut buf = BytesMut::new();
+                    msg_req.encode(&mut buf);
+                    let _ = outbound.send((peer, buf)).await;
+                }
             }
 
             SnPacket::WillMsg { will_msg } => {
@@ -382,32 +475,7 @@ impl MqttSnServer {
                         payload: data.clone(),
                     };
 
-                    if retain {
-                        let mut ret_guard = self.context.retained.write().await;
-                        ret_guard.update(pub_pkt.clone());
-                    }
-
-                    // Forward to all matching subscribers across TCP, TLS, and SN
-                    let matched_ids = {
-                        let router_guard = self.context.router.read().await;
-                        router_guard.matches(&topic)
-                    };
-
-                    let mut forward_pkt = pub_pkt;
-                    forward_pkt.retain = false;
-                    let mut forward_buf = BytesMut::new();
-                    if MqttPacket::Publish(forward_pkt)
-                        .encode(&mut forward_buf)
-                        .is_ok()
-                    {
-                        let frozen = forward_buf.freeze();
-                        let clients_guard = self.context.clients.read().await;
-                        for target_id in matched_ids {
-                            if let Some(target_tx) = clients_guard.get(&target_id) {
-                                let _ = target_tx.try_send(frozen.clone());
-                            }
-                        }
-                    }
+                    dispatch_publish(&self.context, pub_pkt).await;
 
                     // QoS 1 Acknowledgment
                     if qos == 1 {
@@ -503,13 +571,27 @@ impl MqttSnServer {
                                 let (tid_type, tid) =
                                     if let Some(&pid) = forward_predefined.get(&p.topic) {
                                         (TopicIdType::Predefined, pid)
+                                    } else if p.topic.len() == 2 {
+                                        let bytes = p.topic.as_bytes();
+                                        let short_id = u16::from_be_bytes([bytes[0], bytes[1]]);
+                                        (TopicIdType::Short, short_id)
                                     } else {
-                                        let lock = forward_sessions.read().await;
-                                        if let Some(s) = lock.get(&target_peer) {
+                                        let mut lock = forward_sessions.write().await;
+                                        if let Some(s) = lock.get_mut(&target_peer) {
                                             if let Some(&nid) = s.name_to_topic_id.get(&p.topic) {
                                                 (TopicIdType::Normal, nid)
                                             } else {
-                                                (TopicIdType::Normal, 0)
+                                                let nid = s.register_topic(&p.topic);
+                                                // Dynamic registration per OASIS MQTT-SN v1.2 §5.4.8
+                                                let reg_pkt = SnPacket::Register {
+                                                    topic_id: nid,
+                                                    msg_id: 0,
+                                                    topic_name: p.topic.clone(),
+                                                };
+                                                let mut reg_buf = BytesMut::new();
+                                                reg_pkt.encode(&mut reg_buf);
+                                                let _ = forward_outbound.send((target_peer, reg_buf)).await;
+                                                (TopicIdType::Normal, nid)
                                             }
                                         } else {
                                             (TopicIdType::Normal, 0)
@@ -528,8 +610,21 @@ impl MqttSnServer {
 
                                 let mut buf = BytesMut::new();
                                 fwd_pkt.encode(&mut buf);
-                                if forward_outbound.send((target_peer, buf)).await.is_err() {
-                                    break;
+
+                                let is_asleep = {
+                                    let lock = forward_sessions.read().await;
+                                    lock.get(&target_peer).map(|s| s.asleep).unwrap_or(false)
+                                };
+
+                                if is_asleep {
+                                    let mut lock = forward_sessions.write().await;
+                                    if let Some(s) = lock.get_mut(&target_peer) {
+                                        s.buffered_messages.push(buf);
+                                    }
+                                } else {
+                                    if forward_outbound.send((target_peer, buf)).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -610,16 +705,25 @@ impl MqttSnServer {
             }
 
             SnPacket::PingReq { client_id } => {
-                {
+                let buffered = {
                     let mut lock = self.sessions.write().await;
                     if let Some(session) = lock.get_mut(&peer) {
                         session.last_seen = Instant::now();
                         if client_id.is_some() {
-                            // OASIS MQTT-SN v1.2 §5.4.18: Sleeping client wakes up
+                            // OASIS MQTT-SN v1.2 §5.4.18 & §5.4.20: Sleeping client wakes up
                             session.asleep = false;
                         }
+                        std::mem::take(&mut session.buffered_messages)
+                    } else {
+                        Vec::new()
                     }
+                };
+
+                // Flush buffered messages to awakening sleeping client
+                for msg in buffered {
+                    let _ = outbound.send((peer, msg)).await;
                 }
+
                 let mut buf = BytesMut::new();
                 SnPacket::PingResp.encode(&mut buf);
                 let _ = outbound.send((peer, buf)).await;
@@ -662,6 +766,32 @@ impl MqttSnServer {
                 if let Ok(inner) = SnPacket::decode(&mut slice) {
                     Box::pin(self.handle_packet(inner, peer, outbound)).await;
                 }
+            }
+
+            SnPacket::RegAck {
+                topic_id,
+                msg_id,
+                return_code,
+            } => {
+                debug!(
+                    "MQTT-SN REGACK from {} (topic_id: {}, msg_id: {}, rc: {})",
+                    peer, topic_id, msg_id, return_code
+                );
+            }
+
+            SnPacket::PubAck {
+                topic_id,
+                msg_id,
+                return_code,
+            } => {
+                debug!(
+                    "MQTT-SN PUBACK from {} (topic_id: {}, msg_id: {}, rc: {})",
+                    peer, topic_id, msg_id, return_code
+                );
+            }
+
+            SnPacket::PubComp { msg_id } => {
+                debug!("MQTT-SN PUBCOMP from {} (msg_id: {})", peer, msg_id);
             }
 
             _ => {}
