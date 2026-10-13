@@ -1,4 +1,4 @@
-use crate::auth::{AclEngine, UserAccount, UserRole};
+use crate::auth::UserAccount;
 use crate::config::MqttSnListenerConfig;
 use crate::protocol::sn::{SnPacket, TopicIdType};
 use crate::protocol::{MqttPacket, PublishPacket, QoS};
