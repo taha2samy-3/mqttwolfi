@@ -1,142 +1,183 @@
-use std::path::PathBuf;
+//! Builds wolfSSL as a static library and links it into the broker.
+//!
+//! Standard build (default `wolfssl` feature)
+//!   Source : external/wolfssl (git submodule, pinned to a wolfSSL stable release)
+//!   Build  : CMake via the `cmake` crate, into Cargo's OUT_DIR. Cross compilation works with
+//!            any target whose C cross compiler is installed (e.g. `aarch64-linux-gnu-gcc`).
+//!
+//! FIPS-Ready build (`--no-default-features --features wolfssl-fips`)
+//!   Source : the wolfSSL FIPS-Ready bundle, which is not open source. Point
+//!            WOLFSSL_FIPS_BUNDLE_DIR at it (default: external/wolfssl-fips-bundle).
+//!   Build  : wolfSSL's autotools build with `--enable-fips=ready`, the only build system
+//!            wolfSSL supports for FIPS (its CMake build has no FIPS support).
+//!   Note   : "FIPS-Ready" means FIPS-approved algorithms only. It is not a CMVP-validated
+//!            module; validated builds require wolfSSL's commercial FIPS package.
+
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Build wolfSSL as a static library.
-///
-/// Two build variants are supported via Cargo features:
-///
-/// ─────────────────────────────────────────────────────────────────────────────
-/// Variant 1: Standard (`--features wolfssl`, default)
-/// ─────────────────────────────────────────────────────────────────────────────
-///   Source : external/wolfssl  (git submodule → github.com/wolfSSL/wolfssl)
-///   Output : external/wolfssl/build/libwolfssl.a
-///   Ciphers: Full suite — TLS 1.3, AES-GCM, ChaCha20-Poly1305, all ECDH curves
-///   Build  : cargo build                        (default)
-///            cargo build --features wolfssl      (explicit)
-///
-/// ─────────────────────────────────────────────────────────────────────────────
-/// Variant 2: FIPS-Ready (`--features wolfssl-fips`)
-/// ─────────────────────────────────────────────────────────────────────────────
-///   Source : external/wolfssl-fips-bundle/      ← YOU MUST PROVIDE THIS
-///            Download the "wolfSSL FIPS Ready" source bundle from:
-///            https://www.wolfssl.com/products/wolfcrypt-fips/
-///            Extract into: external/wolfssl-fips-bundle/
-///
-///   Output : external/wolfssl-fips-bundle/build/libwolfssl.a
-///   Ciphers: FIPS 140-2/3 approved only:
-///            ALLOWED : AES-128/256 CBC+GCM, SHA-224/256/384/512, SHA-3,
-///                      RSA 2048+, ECDSA/ECDH P-256/P-384/P-521, HMAC-SHA,
-///                      Hash-DRBG (SP 800-90A)
-///            REMOVED : ChaCha20-Poly1305, MD5, DES, RC4
-///   Build  : cargo build --no-default-features --features wolfssl-fips
-///
-///   CMVP Note: "FIPS-Ready" uses only FIPS-approved algorithms but does NOT
-///   carry a formal CMVP certificate. For a formally validated build
-///   (CMVP Certificate #4718), use the wolfSSL FIPS-validated source bundle
-///   (requires a wolfSSL commercial license).
-///   See: https://www.wolfssl.com/products/wolfcrypt-fips/
-///
-/// ─────────────────────────────────────────────────────────────────────────────
 fn main() {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let fips_enabled = std::env::var("CARGO_FEATURE_WOLFSSL_FIPS").is_ok();
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=WOLFSSL_FIPS_BUNDLE_DIR");
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
 
-    // ── Source directory selection ────────────────────────────────────────────
-    let (wolfssl_src, build_dir) = if fips_enabled {
-        // FIPS-Ready build requires a separate source bundle (not the open-source tree).
-        // The open-source GitHub wolfSSL tree is missing wolfcrypt/src/wolfcrypt_first.c
-        // and other proprietary FIPS boundary files that are only in the FIPS bundle.
-        let fips_src = manifest_dir.join("external/wolfssl-fips-bundle");
-        let fips_build = fips_src.join("build");
-
-        if !fips_src.join("CMakeLists.txt").exists() {
-            eprintln!();
-            eprintln!("╔══════════════════════════════════════════════════════════════╗");
-            eprintln!("║         wolfSSL FIPS-Ready Source Bundle Not Found           ║");
-            eprintln!("╠══════════════════════════════════════════════════════════════╣");
-            eprintln!("║                                                              ║");
-            eprintln!("║  The FIPS-Ready build requires a wolfSSL FIPS source bundle ║");
-            eprintln!("║  that is NOT included in the standard open-source GitHub    ║");
-            eprintln!("║  wolfSSL repository.                                        ║");
-            eprintln!("║                                                              ║");
-            eprintln!("║  HOW TO OBTAIN:                                              ║");
-            eprintln!("║  1. Download from: https://wolfssl.com/products/wolfcrypt-fips/");
-            eprintln!("║  2. Extract into:  external/wolfssl-fips-bundle/             ║");
-            eprintln!("║  3. Rebuild:       cargo build --no-default-features \\      ║");
-            eprintln!("║                              --features wolfssl-fips         ║");
-            eprintln!("║                                                              ║");
-            eprintln!("║  For the standard (non-FIPS) build, use:                    ║");
-            eprintln!("║       cargo build   (or --features wolfssl)                 ║");
-            eprintln!("║                                                              ║");
-            eprintln!("╚══════════════════════════════════════════════════════════════╝");
-            eprintln!();
-            panic!(
-                "FIPS-Ready source bundle not found at: {}",
-                fips_src.display()
-            );
-        }
-
-        println!(
-            "cargo:warning=wolfSSL FIPS-Ready build: using bundle at {}",
-            fips_src.display()
-        );
-        (fips_src, fips_build)
-    } else {
-        // Standard build uses the open-source wolfSSL git submodule
-        let std_src = manifest_dir.join("external/wolfssl");
-        let std_build = std_src.join("build");
-        (std_src, std_build)
-    };
-
-    // ── CMake build (skip if already built) ──────────────────────────────────
-    let lib_path = build_dir.join("libwolfssl.a");
-    if !lib_path.exists() {
-        // Configure
-        let mut cmake_cfg = Command::new("cmake");
-        cmake_cfg
-            .arg("-S")
-            .arg(&wolfssl_src)
-            .arg("-B")
-            .arg(&build_dir)
-            .arg("-DBUILD_SHARED_LIBS=OFF")
-            .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
-            .arg("-DWOLFSSL_BUILD_TESTS=OFF")
-            .arg("-DWOLFSSL_BUILD_EXAMPLES=OFF")
-            .arg("-DWOLFSSL_TLS13=ON")
-            .arg("-DWOLFSSL_ALPN=ON")
-            .arg("-DWOLFSSL_SNI=ON")
-            .arg("-DWOLFSSL_DTLS=ON");
-
-        if fips_enabled {
-            cmake_cfg.arg("-DWOLFSSL_FIPS=ON");
-        }
-
-        let status = cmake_cfg
-            .status()
-            .expect("cmake configure failed — is cmake installed?");
-        assert!(status.success(), "CMake configure step failed for wolfSSL");
-
-        // Build
-        let status = Command::new("cmake")
-            .arg("--build")
-            .arg(&build_dir)
-            .arg("--target")
-            .arg("wolfssl")
-            .arg("-j4")
-            .status()
-            .expect("cmake build failed");
-        assert!(status.success(), "CMake build step failed for wolfSSL");
-    }
-
-    // ── Linker directives ────────────────────────────────────────────────────
-    println!("cargo:rustc-link-search=native={}", build_dir.display());
-    println!("cargo:rustc-link-lib=static=wolfssl");
-    println!("cargo:rerun-if-changed=external/wolfssl/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=external/wolfssl-fips-bundle/CMakeLists.txt");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WOLFSSL_FIPS");
-
-    // cfg flag for conditional compilation: #[cfg(wolfssl_fips)]
-    if fips_enabled {
+    if std::env::var_os("CARGO_FEATURE_WOLFSSL_FIPS").is_some() {
+        let bundle = std::env::var_os("WOLFSSL_FIPS_BUNDLE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| manifest.join("external/wolfssl-fips-bundle"));
+        build_fips(&bundle);
         println!("cargo:rustc-cfg=wolfssl_fips");
+    } else {
+        build_standard(&manifest.join("external/wolfssl"));
     }
+    println!("cargo:rustc-check-cfg=cfg(wolfssl_fips)");
+}
+
+fn build_standard(src: &Path) {
+    if !src.join("CMakeLists.txt").exists() {
+        panic!(
+            "wolfSSL sources not found at {}.\nRun: git submodule update --init --recursive",
+            src.display()
+        );
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        src.join("CMakeLists.txt").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src.join("wolfssl/version.h").display()
+    );
+
+    let mut cfg = cmake::Config::new(src);
+    cfg.profile("Release")
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
+        .define("CMAKE_INSTALL_LIBDIR", "lib")
+        .define("WOLFSSL_EXAMPLES", "no")
+        .define("WOLFSSL_CRYPT_TESTS", "no")
+        .define("WOLFSSL_TLS13", "yes")
+        .define("WOLFSSL_TLSV12", "yes")
+        .define("WOLFSSL_OLD_TLS", "no")
+        .define("WOLFSSL_HARDEN", "yes")
+        .define("WOLFSSL_ALPN", "yes")
+        .define("WOLFSSL_SNI", "yes")
+        .define("WOLFSSL_CURVE25519", "yes")
+        .define("WOLFSSL_DTLS", "no")
+        .define("WOLFSSL_SYS_CA_CERTS", "no")
+        // Needed for client certificate identity checks (verify_client_identity).
+        .cflag("-DKEEP_PEER_CERT");
+    let dst = cfg.build();
+    println!(
+        "cargo:rustc-link-search=native={}",
+        dst.join("lib").display()
+    );
+    println!("cargo:rustc-link-lib=static=wolfssl");
+    link_system_libs();
+}
+
+fn build_fips(bundle: &Path) {
+    if !bundle.join("configure.ac").exists() && !bundle.join("configure").exists() {
+        panic!(
+            "\nwolfSSL FIPS-Ready bundle not found at {}.\n\
+             Download it from https://www.wolfssl.com/products/wolfcrypt-fips/ and extract it\n\
+             there, or set WOLFSSL_FIPS_BUNDLE_DIR. For the standard build run `cargo build`.\n",
+            bundle.display()
+        );
+    }
+    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
+    let build_dir = out.join("wolfssl-fips-build");
+    let prefix = out.join("wolfssl-fips");
+    // Autotools builds in-tree; copy the bundle so the source checkout stays clean.
+    let _ = std::fs::remove_dir_all(&build_dir);
+    copy_dir(bundle, &build_dir).expect("copy FIPS bundle");
+
+    let run = |cmd: &mut Command, what: &str| {
+        let status = cmd
+            .current_dir(&build_dir)
+            .status()
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(
+            status.success(),
+            "{what} failed for the wolfSSL FIPS bundle"
+        );
+    };
+    if !build_dir.join("configure").exists() {
+        run(Command::new("sh").arg("autogen.sh"), "autogen.sh");
+    }
+    let mut configure = Command::new("sh");
+    configure.args([
+        "./configure",
+        "--enable-fips=ready",
+        "--enable-static",
+        "--disable-shared",
+        "--with-pic",
+        "--enable-tls13",
+        "--enable-alpn",
+        "--enable-sni",
+        "--enable-harden",
+        "--disable-oldtls",
+        "--disable-examples",
+        "--disable-crypttests",
+        "CPPFLAGS=-DKEEP_PEER_CERT",
+    ]);
+    configure.arg(format!("--prefix={}", prefix.display()));
+    if let (Ok(target), Ok(host)) = (std::env::var("TARGET"), std::env::var("HOST")) {
+        if target != host {
+            configure.arg(format!("--host={}", gnu_triple(&target)));
+        }
+    }
+    run(&mut configure, "configure");
+    let jobs = std::env::var("NUM_JOBS").unwrap_or_else(|_| "4".into());
+    run(Command::new("make").arg(format!("-j{jobs}")), "make");
+    // FIPS Ready requires the in-core integrity hash to be embedded after the first build.
+    if build_dir.join("fips-hash.sh").exists() {
+        run(Command::new("sh").arg("./fips-hash.sh"), "fips-hash.sh");
+        run(
+            Command::new("make").arg(format!("-j{jobs}")),
+            "make (after fips-hash)",
+        );
+    }
+    run(Command::new("make").arg("install"), "make install");
+    println!(
+        "cargo:rustc-link-search=native={}",
+        prefix.join("lib").display()
+    );
+    println!("cargo:rustc-link-lib=static=wolfssl");
+    link_system_libs();
+}
+
+fn link_system_libs() {
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match os.as_str() {
+        "linux" | "android" => println!("cargo:rustc-link-lib=m"),
+        // Winsock, certificate store and the system RNG used by wolfSSL on Windows.
+        "windows" => {
+            for lib in ["ws2_32", "crypt32", "advapi32"] {
+                println!("cargo:rustc-link-lib={lib}");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Maps a Rust target triple to the GNU triple autotools expects.
+fn gnu_triple(target: &str) -> String {
+    target
+        .replace("-unknown-linux-", "-linux-")
+        .replace("armv7-linux-gnueabihf", "arm-linux-gnueabihf")
+}
+
+fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }

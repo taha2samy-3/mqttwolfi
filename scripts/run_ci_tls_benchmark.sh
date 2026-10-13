@@ -8,7 +8,7 @@ echo "==========================================================================
 # 1. Ensure test certificates exist
 if [ ! -f "certs/server-cert.pem" ] || [ ! -f "certs/ca-cert.pem" ]; then
     echo "==> Generating PKI test certificates..."
-    bash scripts/generate_certs.sh
+    bash scripts/generate_certs.sh certs
 fi
 
 MOSQUITTO_PORT=18883
@@ -69,7 +69,7 @@ else
 fi
 
 # 3. Run comparative benchmark binary
-SUMMARY_FILE="tls_benchmark_summary.md"
+SUMMARY_FILE="${SUMMARY_FILE:-tls_benchmark_summary.md}"
 CONCURRENCY="${CONCURRENCY:-8}"
 MSG_COUNT="${MSG_COUNT:-10000}"
 PAYLOAD_SIZE="${PAYLOAD_SIZE:-128}"

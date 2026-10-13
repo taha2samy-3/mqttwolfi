@@ -1,18 +1,26 @@
-use std::ffi::CString;
+//! wolfSSL TLS integration for Tokio.
+//!
+//! wolfSSL performs the record I/O directly on the socket file descriptor. To stay correct with
+//! Tokio's edge-triggered readiness, every wolfSSL call that may hit `EAGAIN` runs inside
+//! [`TcpStream::try_io`]: Tokio then clears the readiness flag only if no new readiness event
+//! arrived while the call ran, which avoids lost wake-ups.
+//!
+//! All `unsafe` code of the crate lives in this module and is limited to FFI calls on pointers
+//! owned by [`SslHandle`] / [`WolfContext`].
+
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::future::poll_fn;
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
+use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::TcpStream;
-use tracing::{info, warn};
-
-/// Maximum time allowed for a TLS handshake before the connection is dropped.
-/// Prevents SlowLoris-style resource exhaustion attacks.
-const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+use tracing::info;
 
 #[repr(C)]
 pub struct WOLFSSL_CTX {
@@ -29,310 +37,409 @@ pub struct WOLFSSL_METHOD {
     _private: [u8; 0],
 }
 
-pub const WOLFSSL_SUCCESS: i32 = 1;
-pub const WOLFSSL_FAILURE: i32 = 0;
-pub const WOLFSSL_ERROR_WANT_READ: i32 = 2;
-pub const WOLFSSL_ERROR_WANT_WRITE: i32 = 3;
-pub const WOLFSSL_ERROR_ZERO_RETURN: i32 = 6;
+#[repr(C)]
+pub struct WOLFSSL_X509 {
+    _private: [u8; 0],
+}
 
-pub const SSL_FILETYPE_PEM: i32 = 1;
-pub const SSL_VERIFY_NONE: i32 = 0;
-pub const SSL_VERIFY_PEER: i32 = 1;
-pub const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: i32 = 2;
+const WOLFSSL_SUCCESS: c_int = 1;
+const WOLFSSL_ERROR_WANT_READ: c_int = 2;
+const WOLFSSL_ERROR_WANT_WRITE: c_int = 3;
+const WOLFSSL_ERROR_ZERO_RETURN: c_int = 6;
+const SSL_FILETYPE_PEM: c_int = 1;
+const SSL_VERIFY_NONE: c_int = 0;
+const SSL_VERIFY_PEER: c_int = 1;
+const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: c_int = 2;
+const WOLFSSL_TLSV1_2: c_int = 3;
+const WOLFSSL_ALPN_FAILED_ON_MISMATCH: u8 = 4;
+const WOLFSSL_SNI_HOST_NAME: u8 = 0;
 
 extern "C" {
-    pub fn wolfSSL_Init() -> i32;
-    pub fn wolfSSL_Cleanup() -> i32;
-
-    pub fn wolfTLSv1_3_server_method() -> *mut WOLFSSL_METHOD;
-    pub fn wolfTLSv1_3_client_method() -> *mut WOLFSSL_METHOD;
-    pub fn wolfSSLv23_server_method() -> *mut WOLFSSL_METHOD;
-    pub fn wolfSSLv23_client_method() -> *mut WOLFSSL_METHOD;
-
-    pub fn wolfSSL_CTX_new(method: *mut WOLFSSL_METHOD) -> *mut WOLFSSL_CTX;
-    pub fn wolfSSL_CTX_free(ctx: *mut WOLFSSL_CTX);
-
-    pub fn wolfSSL_CTX_use_certificate_chain_file(
+    fn wolfSSL_Init() -> c_int;
+    fn wolfTLSv1_3_server_method() -> *mut WOLFSSL_METHOD;
+    fn wolfTLSv1_3_client_method() -> *mut WOLFSSL_METHOD;
+    fn wolfSSLv23_server_method() -> *mut WOLFSSL_METHOD;
+    fn wolfSSLv23_client_method() -> *mut WOLFSSL_METHOD;
+    fn wolfSSL_CTX_new(method: *mut WOLFSSL_METHOD) -> *mut WOLFSSL_CTX;
+    fn wolfSSL_CTX_free(ctx: *mut WOLFSSL_CTX);
+    fn wolfSSL_CTX_use_certificate_chain_file(ctx: *mut WOLFSSL_CTX, file: *const c_char) -> c_int;
+    fn wolfSSL_CTX_use_PrivateKey_file(
         ctx: *mut WOLFSSL_CTX,
-        file: *const std::ffi::c_char,
-    ) -> i32;
-
-    pub fn wolfSSL_CTX_use_PrivateKey_file(
+        file: *const c_char,
+        format: c_int,
+    ) -> c_int;
+    fn wolfSSL_CTX_load_verify_locations(
         ctx: *mut WOLFSSL_CTX,
-        file: *const std::ffi::c_char,
-        format: i32,
-    ) -> i32;
-
-    pub fn wolfSSL_CTX_load_verify_locations(
+        file: *const c_char,
+        path: *const c_char,
+    ) -> c_int;
+    fn wolfSSL_CTX_set_verify(
         ctx: *mut WOLFSSL_CTX,
-        file: *const std::ffi::c_char,
-        path: *const std::ffi::c_char,
-    ) -> i32;
-
-    pub fn wolfSSL_CTX_set_verify(
-        ctx: *mut WOLFSSL_CTX,
-        mode: i32,
-        verify_callback: Option<extern "C" fn(i32, *mut std::ffi::c_void) -> i32>,
+        mode: c_int,
+        verify_callback: Option<extern "C" fn(c_int, *mut c_void) -> c_int>,
     );
+    fn wolfSSL_CTX_SetMinVersion(ctx: *mut WOLFSSL_CTX, version: c_int) -> c_int;
+    fn wolfSSL_CTX_set_cipher_list(ctx: *mut WOLFSSL_CTX, list: *const c_char) -> c_int;
+    fn wolfSSL_new(ctx: *mut WOLFSSL_CTX) -> *mut WOLFSSL;
+    fn wolfSSL_free(ssl: *mut WOLFSSL);
+    fn wolfSSL_set_fd(ssl: *mut WOLFSSL, fd: c_int) -> c_int;
+    fn wolfSSL_UseALPN(ssl: *mut WOLFSSL, list: *mut c_char, list_sz: u32, options: u8) -> c_int;
+    fn wolfSSL_UseSNI(ssl: *mut WOLFSSL, sni_type: u8, data: *const c_void, size: u16) -> c_int;
+    fn wolfSSL_check_domain_name(ssl: *mut WOLFSSL, dn: *const c_char) -> c_int;
+    fn wolfSSL_accept(ssl: *mut WOLFSSL) -> c_int;
+    fn wolfSSL_connect(ssl: *mut WOLFSSL) -> c_int;
+    fn wolfSSL_read(ssl: *mut WOLFSSL, data: *mut c_void, sz: c_int) -> c_int;
+    fn wolfSSL_write(ssl: *mut WOLFSSL, data: *const c_void, sz: c_int) -> c_int;
+    fn wolfSSL_shutdown(ssl: *mut WOLFSSL) -> c_int;
+    fn wolfSSL_get_error(ssl: *mut WOLFSSL, ret: c_int) -> c_int;
+    fn wolfSSL_get_peer_certificate(ssl: *mut WOLFSSL) -> *mut WOLFSSL_X509;
+    fn wolfSSL_X509_get_subjectCN(x509: *mut WOLFSSL_X509) -> *mut c_char;
+    fn wolfSSL_X509_get_next_altname(x509: *mut WOLFSSL_X509) -> *mut c_char;
+    fn wolfSSL_X509_free(x509: *mut WOLFSSL_X509);
+    fn wolfSSL_get_version(ssl: *const WOLFSSL) -> *const c_char;
+}
 
-    pub fn wolfSSL_new(ctx: *mut WOLFSSL_CTX) -> *mut WOLFSSL;
-    pub fn wolfSSL_free(ssl: *mut WOLFSSL);
-    pub fn wolfSSL_set_fd(ssl: *mut WOLFSSL, fd: i32) -> i32;
+/// The socket handle wolfSSL performs I/O on (`int` file descriptor / Winsock `SOCKET`).
+#[cfg(unix)]
+fn socket_handle(stream: &TcpStream) -> c_int {
+    use std::os::unix::io::AsRawFd;
+    stream.as_raw_fd()
+}
 
-    pub fn wolfSSL_UseALPN(
-        ssl: *mut WOLFSSL,
-        protocol_name_list: *const std::ffi::c_char,
-        protocol_name_list_sz: u32,
-        options: u8,
-    ) -> i32;
+#[cfg(windows)]
+fn socket_handle(stream: &TcpStream) -> c_int {
+    use std::os::windows::io::AsRawSocket;
+    // wolfSSL_set_fd takes an int and casts it back to SOCKET; Winsock handles fit in 32 bits.
+    stream.as_raw_socket() as c_int
+}
 
-    pub fn wolfSSL_UseSNI(
-        ssl: *mut WOLFSSL,
-        sni_type: u8,
-        data: *const std::ffi::c_void,
-        size: u16,
-    ) -> i32;
-
-    pub fn wolfSSL_accept(ssl: *mut WOLFSSL) -> i32;
-    pub fn wolfSSL_connect(ssl: *mut WOLFSSL) -> i32;
-    pub fn wolfSSL_read(ssl: *mut WOLFSSL, data: *mut std::ffi::c_void, sz: i32) -> i32;
-    pub fn wolfSSL_write(ssl: *mut WOLFSSL, data: *const std::ffi::c_void, sz: i32) -> i32;
-    pub fn wolfSSL_shutdown(ssl: *mut WOLFSSL) -> i32;
-    pub fn wolfSSL_get_error(ssl: *mut WOLFSSL, ret: i32) -> i32;
-    pub fn wolfSSL_pending(ssl: *mut WOLFSSL) -> i32;
+#[derive(Debug, Error)]
+pub enum TlsError {
+    #[error("{what} file not found: {path}")]
+    FileNotFound { what: &'static str, path: String },
+    #[error("failed to load {what} from {path}")]
+    Load { what: &'static str, path: String },
+    #[error("invalid TLS setting: {0}")]
+    InvalidSetting(String),
+    #[error("wolfSSL error: {0}")]
+    Library(&'static str),
 }
 
 static WOLFSSL_INIT: std::sync::Once = std::sync::Once::new();
 
 pub fn ensure_wolfssl_initialized() {
     WOLFSSL_INIT.call_once(|| {
+        // SAFETY: global library initialization, guarded by `Once`.
         let ret = unsafe { wolfSSL_Init() };
-        if ret != WOLFSSL_SUCCESS {
-            panic!("wolfSSL_Init failed with return code {}", ret);
-        }
-        info!("Native wolfSSL 5.9+ cryptographic engine initialized successfully");
+        assert_eq!(
+            ret, WOLFSSL_SUCCESS,
+            "wolfSSL_Init failed with return code {ret}"
+        );
+        info!("wolfSSL cryptographic engine initialized");
     });
 }
 
+/// Owned `WOLFSSL_CTX`.
 pub struct WolfContext {
-    raw: *mut WOLFSSL_CTX,
+    raw: NonNull<WOLFSSL_CTX>,
 }
 
+// SAFETY: a WOLFSSL_CTX is safe to share between threads once configured; it is only mutated
+// during construction, before it is wrapped in an `Arc`.
 unsafe impl Send for WolfContext {}
 unsafe impl Sync for WolfContext {}
 
 impl Drop for WolfContext {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { wolfSSL_CTX_free(self.raw) };
-        }
+        // SAFETY: we own the context and no SSL object outlives it (they hold an Arc to it).
+        unsafe { wolfSSL_CTX_free(self.raw.as_ptr()) };
     }
 }
 
 impl WolfContext {
-    pub fn as_ptr(&self) -> *mut WOLFSSL_CTX {
-        self.raw
-    }
-}
-
-#[derive(Clone)]
-pub struct WolfTlsAcceptor {
-    ctx: Arc<WolfContext>,
-}
-
-impl WolfTlsAcceptor {
-    pub async fn accept(&self, stream: TcpStream) -> io::Result<WolfTlsStream> {
-        WolfTlsStream::accept(stream, &self.ctx).await
-    }
-}
-
-#[derive(Clone)]
-pub struct WolfTlsConnector {
-    ctx: Arc<WolfContext>,
-}
-
-impl WolfTlsConnector {
-    pub async fn connect<T>(&self, domain: T, stream: TcpStream) -> io::Result<WolfTlsStream>
-    where
-        T: ToString,
-    {
-        let domain_str = domain.to_string();
-        WolfTlsStream::connect(&domain_str, stream, &self.ctx).await
-    }
-}
-
-#[repr(transparent)]
-#[derive(Copy, Clone)]
-pub struct WolfSslPtr(pub *mut WOLFSSL);
-
-unsafe impl Send for WolfSslPtr {}
-unsafe impl Sync for WolfSslPtr {}
-
-pub struct WolfTlsStream {
-    ssl: Arc<Mutex<WolfSslPtr>>,
-    stream: TcpStream,
-}
-
-unsafe impl Send for WolfTlsStream {}
-unsafe impl Sync for WolfTlsStream {}
-
-impl Drop for WolfTlsStream {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.ssl) == 1 {
-            let guard = self.ssl.lock().unwrap();
-            if !guard.0.is_null() {
-                unsafe {
-                    let _ = wolfSSL_shutdown(guard.0);
-                    wolfSSL_free(guard.0);
-                }
-            }
+    fn new(method: *mut WOLFSSL_METHOD) -> Result<Self, TlsError> {
+        if method.is_null() {
+            return Err(TlsError::Library("TLS method unavailable"));
         }
+        // SAFETY: method is a valid static method table; wolfSSL_CTX_new takes ownership of it.
+        let raw = unsafe { wolfSSL_CTX_new(method) };
+        NonNull::new(raw)
+            .map(|raw| Self { raw })
+            .ok_or(TlsError::Library("wolfSSL_CTX_new failed"))
     }
+
+    fn ptr(&self) -> *mut WOLFSSL_CTX {
+        self.raw.as_ptr()
+    }
+
+    fn load_file(
+        &self,
+        what: &'static str,
+        path: &str,
+        f: impl FnOnce(*mut WOLFSSL_CTX, *const c_char) -> c_int,
+    ) -> Result<(), TlsError> {
+        if !Path::new(path).exists() {
+            return Err(TlsError::FileNotFound {
+                what,
+                path: path.into(),
+            });
+        }
+        let c_path = CString::new(path)
+            .map_err(|_| TlsError::InvalidSetting(format!("{what} path contains NUL")))?;
+        if f(self.ptr(), c_path.as_ptr()) != WOLFSSL_SUCCESS {
+            return Err(TlsError::Load {
+                what,
+                path: path.into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn use_cert_chain(&self, path: &str, what: &'static str) -> Result<(), TlsError> {
+        // SAFETY: ctx and the NUL-terminated path are valid for the duration of the call.
+        self.load_file(what, path, |ctx, p| unsafe {
+            wolfSSL_CTX_use_certificate_chain_file(ctx, p)
+        })
+    }
+
+    fn use_private_key(&self, path: &str, what: &'static str) -> Result<(), TlsError> {
+        // SAFETY: as above.
+        self.load_file(what, path, |ctx, p| unsafe {
+            wolfSSL_CTX_use_PrivateKey_file(ctx, p, SSL_FILETYPE_PEM)
+        })
+    }
+
+    fn load_ca(&self, path: &str) -> Result<(), TlsError> {
+        // SAFETY: as above; the directory argument may be NULL.
+        self.load_file("CA certificate", path, |ctx, p| unsafe {
+            wolfSSL_CTX_load_verify_locations(ctx, p, std::ptr::null())
+        })
+    }
+
+    fn set_verify(&self, mode: c_int) {
+        // SAFETY: ctx is valid; no callback is installed.
+        unsafe { wolfSSL_CTX_set_verify(self.ptr(), mode, None) };
+    }
+
+    fn set_cipher_list(&self, list: &str) -> Result<(), TlsError> {
+        let normalized = list.replace(',', ":");
+        let c = CString::new(normalized)
+            .map_err(|_| TlsError::InvalidSetting("cipher list contains NUL".into()))?;
+        // SAFETY: ctx and the NUL-terminated list are valid.
+        if unsafe { wolfSSL_CTX_set_cipher_list(self.ptr(), c.as_ptr()) } != WOLFSSL_SUCCESS {
+            return Err(TlsError::InvalidSetting(format!(
+                "wolfSSL rejected cipher list '{list}'"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Owned `WOLFSSL` session object. Freed exactly once, on drop.
+struct SslHandle {
+    raw: NonNull<WOLFSSL>,
+    /// Keeps the context alive for as long as the session exists.
+    _ctx: Arc<WolfContext>,
+}
+
+// SAFETY: a WOLFSSL object may move between threads; all access goes through `&mut self` of the
+// owning stream, so it is never used concurrently.
+unsafe impl Send for SslHandle {}
+
+impl SslHandle {
+    fn new(ctx: &Arc<WolfContext>) -> io::Result<Self> {
+        // SAFETY: ctx is a valid, configured context.
+        let raw = unsafe { wolfSSL_new(ctx.ptr()) };
+        NonNull::new(raw)
+            .map(|raw| Self {
+                raw,
+                _ctx: Arc::clone(ctx),
+            })
+            .ok_or_else(|| io::Error::other("wolfSSL_new failed"))
+    }
+
+    fn ptr(&self) -> *mut WOLFSSL {
+        self.raw.as_ptr()
+    }
+
+    fn error(&self, ret: c_int) -> c_int {
+        // SAFETY: ssl is valid.
+        unsafe { wolfSSL_get_error(self.ptr(), ret) }
+    }
+}
+
+impl Drop for SslHandle {
+    fn drop(&mut self) {
+        // SAFETY: we own the object and it is not used after this point.
+        unsafe { wolfSSL_free(self.ptr()) };
+    }
+}
+
+/// Builds the comma separated ALPN list wolfSSL expects.
+fn alpn_list(protocols: &[String]) -> Result<Option<CString>, TlsError> {
+    if protocols.is_empty() {
+        return Ok(None);
+    }
+    if protocols
+        .iter()
+        .any(|p| p.is_empty() || p.contains([',', '\0']))
+    {
+        return Err(TlsError::InvalidSetting(
+            "invalid ALPN protocol name".into(),
+        ));
+    }
+    CString::new(protocols.join(","))
+        .map(Some)
+        .map_err(|_| TlsError::InvalidSetting("invalid ALPN protocol name".into()))
+}
+
+/// Outcome of one wolfSSL operation attempt.
+enum Step {
+    Done(c_int),
+    Want(Interest),
+    Eof,
+    Fatal(c_int),
+}
+
+/// TLS stream over a Tokio TCP socket.
+pub struct WolfTlsStream {
+    // Field order matters: the SSL object is freed before the socket is closed.
+    ssl: SslHandle,
+    stream: TcpStream,
+    shutdown_sent: bool,
 }
 
 impl WolfTlsStream {
-    pub async fn accept(stream: TcpStream, ctx: &Arc<WolfContext>) -> io::Result<Self> {
-        // Wrap the entire TLS handshake in a timeout to prevent SlowLoris resource exhaustion
-        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, Self::do_accept(stream, ctx))
-            .await
-            .map_err(|_| {
-                warn!(
-                    "TLS handshake timed out after {}s",
-                    TLS_HANDSHAKE_TIMEOUT.as_secs()
-                );
-                io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timeout")
-            })?
-    }
-
-    async fn do_accept(stream: TcpStream, ctx: &Arc<WolfContext>) -> io::Result<Self> {
-        let raw_ssl = unsafe { wolfSSL_new(ctx.as_ptr()) };
-        if raw_ssl.is_null() {
-            return Err(io::Error::other("wolfSSL_new failed"));
-        }
-
-        // Set ALPN "mqtt" — required for MQTT over TLS (RFC 7301)
-        let alpn = b"mqtt\0";
-        unsafe {
-            wolfSSL_UseALPN(raw_ssl, alpn.as_ptr() as *const _, 4, 4);
-        }
-
-        let fd = stream.as_raw_fd();
-        if unsafe { wolfSSL_set_fd(raw_ssl, fd) } != WOLFSSL_SUCCESS {
-            unsafe { wolfSSL_free(raw_ssl) };
+    fn new(ctx: &Arc<WolfContext>, stream: TcpStream) -> io::Result<Self> {
+        let ssl = SslHandle::new(ctx)?;
+        // SAFETY: ssl is valid and the fd stays open as long as `stream` (owned by Self) lives.
+        if unsafe { wolfSSL_set_fd(ssl.ptr(), socket_handle(&stream)) } != WOLFSSL_SUCCESS {
             return Err(io::Error::other("wolfSSL_set_fd failed"));
         }
-
-        let ssl = Arc::new(Mutex::new(WolfSslPtr(raw_ssl)));
-
-        loop {
-            let ret = {
-                let guard = ssl.lock().unwrap();
-                unsafe { wolfSSL_accept(guard.0) }
-            };
-            if ret == WOLFSSL_SUCCESS {
-                break;
-            }
-            let err = {
-                let guard = ssl.lock().unwrap();
-                unsafe { wolfSSL_get_error(guard.0, ret) }
-            };
-            if err == WOLFSSL_ERROR_WANT_READ {
-                let _: io::Result<()> = stream.try_io(Interest::READABLE, || {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
-                stream.readable().await?;
-            } else if err == WOLFSSL_ERROR_WANT_WRITE {
-                let _: io::Result<()> = stream.try_io(Interest::WRITABLE, || {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
-                stream.writable().await?;
-            } else {
-                let guard = ssl.lock().unwrap();
-                unsafe { wolfSSL_free(guard.0) };
-                return Err(io::Error::other(format!(
-                    "wolfSSL_accept failed with error code: {}",
-                    err
-                )));
-            }
-        }
-
-        Ok(Self { ssl, stream })
+        Ok(Self {
+            ssl,
+            stream,
+            shutdown_sent: false,
+        })
     }
 
-    pub async fn connect(
-        domain: &str,
-        stream: TcpStream,
-        ctx: &Arc<WolfContext>,
-    ) -> io::Result<Self> {
-        let raw_ssl = unsafe { wolfSSL_new(ctx.as_ptr()) };
-        if raw_ssl.is_null() {
-            return Err(io::Error::other("wolfSSL_new failed"));
+    fn classify(&self, ret: c_int) -> Step {
+        if ret > 0 {
+            return Step::Done(ret);
         }
+        match self.ssl.error(ret) {
+            WOLFSSL_ERROR_WANT_READ => Step::Want(Interest::READABLE),
+            WOLFSSL_ERROR_WANT_WRITE => Step::Want(Interest::WRITABLE),
+            WOLFSSL_ERROR_ZERO_RETURN => Step::Eof,
+            _ if ret == 0 => Step::Eof,
+            err => Step::Fatal(err),
+        }
+    }
 
-        // Set SNI Hostname
-        if !domain.is_empty() {
-            let c_domain = CString::new(domain).unwrap_or_default();
-            unsafe {
-                wolfSSL_UseSNI(
-                    raw_ssl,
-                    0,
-                    c_domain.as_ptr() as *const _,
-                    domain.len() as u16,
-                );
+    /// Drives a wolfSSL operation to completion, registering for socket readiness as needed.
+    fn poll_op(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut op: impl FnMut(*mut WOLFSSL) -> c_int,
+    ) -> Poll<io::Result<Option<c_int>>> {
+        // Optimistic attempt: wolfSSL may complete from its internal buffers without the socket.
+        let mut want = match self.classify(op(self.ssl.ptr())) {
+            Step::Done(n) => return Poll::Ready(Ok(Some(n))),
+            Step::Eof => return Poll::Ready(Ok(None)),
+            Step::Fatal(err) => {
+                return Poll::Ready(Err(io::Error::other(format!("wolfSSL error {err}"))))
             }
-        }
-
-        // Set ALPN "mqtt"
-        let alpn = b"mqtt\0";
-        unsafe {
-            wolfSSL_UseALPN(raw_ssl, alpn.as_ptr() as *const _, 4, 4);
-        }
-
-        let fd = stream.as_raw_fd();
-        if unsafe { wolfSSL_set_fd(raw_ssl, fd) } != WOLFSSL_SUCCESS {
-            unsafe { wolfSSL_free(raw_ssl) };
-            return Err(io::Error::other("wolfSSL_set_fd failed"));
-        }
-
-        let ssl = Arc::new(Mutex::new(WolfSslPtr(raw_ssl)));
-
+            Step::Want(interest) => interest,
+        };
         loop {
-            let ret = {
-                let guard = ssl.lock().unwrap();
-                unsafe { wolfSSL_connect(guard.0) }
-            };
-            if ret == WOLFSSL_SUCCESS {
-                break;
-            }
-            let err = {
-                let guard = ssl.lock().unwrap();
-                unsafe { wolfSSL_get_error(guard.0, ret) }
-            };
-            if err == WOLFSSL_ERROR_WANT_READ {
-                let _: io::Result<()> = stream.try_io(Interest::READABLE, || {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
-                stream.readable().await?;
-            } else if err == WOLFSSL_ERROR_WANT_WRITE {
-                let _: io::Result<()> = stream.try_io(Interest::WRITABLE, || {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
-                stream.writable().await?;
+            if want == Interest::READABLE {
+                ready!(self.stream.poll_read_ready(cx))?;
             } else {
-                let guard = ssl.lock().unwrap();
-                unsafe { wolfSSL_free(guard.0) };
-                return Err(io::Error::other(format!(
-                    "wolfSSL_connect failed with error code: {}",
-                    err
-                )));
+                ready!(self.stream.poll_write_ready(cx))?;
+            }
+            let ssl = self.ssl.ptr();
+            let this = &*self;
+            let attempt = this.stream.try_io(want, || match this.classify(op(ssl)) {
+                // Clears readiness for `want` (only if no new event raced in) and retries.
+                Step::Want(i) if i == want => Err(io::ErrorKind::WouldBlock.into()),
+                other => Ok(other),
+            });
+            match attempt {
+                Ok(Step::Done(n)) => return Poll::Ready(Ok(Some(n))),
+                Ok(Step::Eof) => return Poll::Ready(Ok(None)),
+                Ok(Step::Fatal(err)) => {
+                    return Poll::Ready(Err(io::Error::other(format!("wolfSSL error {err}"))))
+                }
+                Ok(Step::Want(other)) => want = other,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
             }
         }
+    }
 
-        Ok(Self { ssl, stream })
+    async fn handshake(&mut self, server: bool) -> io::Result<()> {
+        let result = poll_fn(|cx| {
+            self.poll_op(cx, |ssl| {
+                // SAFETY: ssl is valid for the lifetime of self.
+                unsafe {
+                    if server {
+                        wolfSSL_accept(ssl)
+                    } else {
+                        wolfSSL_connect(ssl)
+                    }
+                }
+            })
+        })
+        .await?;
+        match result {
+            Some(_) => Ok(()),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "peer closed during TLS handshake",
+            )),
+        }
     }
 
     pub fn get_ref(&self) -> &TcpStream {
         &self.stream
+    }
+
+    /// Negotiated protocol version, e.g. "TLSv1.3".
+    pub fn protocol_version(&self) -> String {
+        // SAFETY: returns a pointer to a static string or NULL.
+        let p = unsafe { wolfSSL_get_version(self.ssl.ptr()) };
+        if p.is_null() {
+            return String::new();
+        }
+        // SAFETY: non-null, NUL-terminated static string.
+        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    }
+
+    /// Subject CN and subject alternative names of the verified peer certificate.
+    pub fn peer_identities(&self) -> Vec<String> {
+        // SAFETY: returns an owned duplicate (or NULL) that we free below.
+        let cert = unsafe { wolfSSL_get_peer_certificate(self.ssl.ptr()) };
+        if cert.is_null() {
+            return Vec::new();
+        }
+        let mut ids = Vec::new();
+        // SAFETY: cert is valid until freed; returned strings point into it.
+        unsafe {
+            let cn = wolfSSL_X509_get_subjectCN(cert);
+            if !cn.is_null() {
+                ids.push(CStr::from_ptr(cn).to_string_lossy().into_owned());
+            }
+            loop {
+                let alt = wolfSSL_X509_get_next_altname(cert);
+                if alt.is_null() {
+                    break;
+                }
+                ids.push(CStr::from_ptr(alt).to_string_lossy().into_owned());
+            }
+            wolfSSL_X509_free(cert);
+        }
+        ids.retain(|s| !s.is_empty());
+        ids
     }
 }
 
@@ -343,65 +450,18 @@ impl AsyncRead for WolfTlsStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if buf.remaining() == 0 {
+        let unfilled = buf.initialize_unfilled();
+        if unfilled.is_empty() {
             return Poll::Ready(Ok(()));
         }
-
-        loop {
-            let unfilled = buf.initialize_unfilled();
-            if unfilled.is_empty() {
-                return Poll::Ready(Ok(()));
-            }
-
-            let (ret, err) = {
-                let guard = this.ssl.lock().unwrap();
-                let ret = unsafe {
-                    wolfSSL_read(
-                        guard.0,
-                        unfilled.as_mut_ptr() as *mut std::ffi::c_void,
-                        unfilled.len() as i32,
-                    )
-                };
-                let err = if ret <= 0 {
-                    unsafe { wolfSSL_get_error(guard.0, ret) }
-                } else {
-                    0
-                };
-                (ret, err)
-            };
-
-            if ret > 0 {
-                buf.advance(ret as usize);
-                return Poll::Ready(Ok(()));
-            }
-
-            if err == WOLFSSL_ERROR_WANT_READ {
-                let _: io::Result<()> = this.stream.try_io(Interest::READABLE, || {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
-                match this.stream.poll_read_ready(cx) {
-                    Poll::Ready(Ok(())) => continue,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            } else if err == WOLFSSL_ERROR_WANT_WRITE {
-                let _: io::Result<()> = this.stream.try_io(Interest::WRITABLE, || {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
-                match this.stream.poll_write_ready(cx) {
-                    Poll::Ready(Ok(())) => continue,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            } else if err == WOLFSSL_ERROR_ZERO_RETURN || ret == 0 {
-                return Poll::Ready(Ok(()));
-            } else {
-                return Poll::Ready(Err(io::Error::other(format!(
-                    "wolfSSL_read failed with error: {}",
-                    err
-                ))));
-            }
+        let len = unfilled.len().min(c_int::MAX as usize) as c_int;
+        let ptr = unfilled.as_mut_ptr();
+        // SAFETY: `ptr` points to `len` writable bytes owned by `buf` for this call.
+        let n = ready!(this.poll_op(cx, |ssl| unsafe { wolfSSL_read(ssl, ptr.cast(), len) }))?;
+        if let Some(n) = n {
+            buf.advance(n as usize);
         }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -411,196 +471,275 @@ impl AsyncWrite for WolfTlsStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-
-        loop {
-            let (ret, err) = {
-                let guard = this.ssl.lock().unwrap();
-                let ret = unsafe {
-                    wolfSSL_write(
-                        guard.0,
-                        buf.as_ptr() as *const std::ffi::c_void,
-                        buf.len() as i32,
-                    )
-                };
-                let err = if ret <= 0 {
-                    unsafe { wolfSSL_get_error(guard.0, ret) }
-                } else {
-                    0
-                };
-                (ret, err)
-            };
-
-            if ret > 0 {
-                return Poll::Ready(Ok(ret as usize));
-            }
-
-            if err == WOLFSSL_ERROR_WANT_WRITE {
-                let _: io::Result<()> = this.stream.try_io(Interest::WRITABLE, || {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
-                match this.stream.poll_write_ready(cx) {
-                    Poll::Ready(Ok(())) => continue,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            } else if err == WOLFSSL_ERROR_WANT_READ {
-                let _: io::Result<()> = this.stream.try_io(Interest::READABLE, || {
-                    Err(io::Error::from(io::ErrorKind::WouldBlock))
-                });
-                match this.stream.poll_read_ready(cx) {
-                    Poll::Ready(Ok(())) => continue,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
-            } else {
-                return Poll::Ready(Err(io::Error::other(format!(
-                    "wolfSSL_write failed with error: {}",
-                    err
-                ))));
-            }
+        let this = self.get_mut();
+        let len = buf.len().min(c_int::MAX as usize) as c_int;
+        // SAFETY: `buf` is readable for `len` bytes; wolfSSL requires the same buffer on retry,
+        // which AsyncWrite callers provide.
+        let n = ready!(this.poll_op(cx, |ssl| unsafe {
+            wolfSSL_write(ssl, buf.as_ptr().cast(), len)
+        }))?;
+        match n {
+            Some(n) => Poll::Ready(Ok(n as usize)),
+            None => Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // wolfSSL_write only returns once the record has been handed to the kernel.
         Poll::Ready(Ok(()))
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let guard = this.ssl.lock().unwrap();
-        if !guard.0.is_null() {
-            let _ = unsafe { wolfSSL_shutdown(guard.0) };
+        if !this.shutdown_sent {
+            this.shutdown_sent = true;
+            // Best effort close_notify; the peer's reply is not awaited.
+            // SAFETY: ssl is valid.
+            let _ = unsafe { wolfSSL_shutdown(this.ssl.ptr()) };
         }
         Pin::new(&mut this.stream).poll_shutdown(cx)
     }
+}
+
+/// Minimum TLS protocol version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsVersion {
+    Tls12,
+    Tls13,
+}
+
+/// Server-side TLS settings.
+#[derive(Debug, Clone)]
+pub struct TlsServerConfig {
+    pub cert_file: String,
+    pub key_file: String,
+    /// CA used to verify client certificates; `Some` enables mutual TLS.
+    pub client_ca_file: Option<String>,
+    pub min_version: TlsVersion,
+    pub ciphers: Option<String>,
+    pub alpn_protocols: Vec<String>,
+    pub handshake_timeout: Duration,
+}
+
+impl TlsServerConfig {
+    pub fn new(cert_file: impl Into<String>, key_file: impl Into<String>) -> Self {
+        Self {
+            cert_file: cert_file.into(),
+            key_file: key_file.into(),
+            client_ca_file: None,
+            min_version: TlsVersion::Tls13,
+            ciphers: None,
+            alpn_protocols: vec!["mqtt".into()],
+            handshake_timeout: Duration::from_secs(10),
+        }
+    }
+
+    pub fn from_config(c: &crate::config::WolfTlsConfig) -> Self {
+        Self {
+            cert_file: c.server_cert_file.clone(),
+            key_file: c.server_key_file.clone(),
+            client_ca_file: c.require_client_cert.then(|| c.ca_cert_file.clone()),
+            min_version: if c.min_tls_version == "TLSv1.2" {
+                TlsVersion::Tls12
+            } else {
+                TlsVersion::Tls13
+            },
+            ciphers: (!c.ciphers.is_empty()).then(|| c.ciphers.clone()),
+            alpn_protocols: c.alpn_protocols.clone(),
+            handshake_timeout: Duration::from_secs(c.handshake_timeout_sec.max(1)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WolfTlsAcceptor {
+    ctx: Arc<WolfContext>,
+    alpn: Option<Arc<CString>>,
+    handshake_timeout: Duration,
+    mutual: bool,
+}
+
+impl WolfTlsAcceptor {
+    /// Performs the server handshake, bounded by the configured handshake timeout.
+    pub async fn accept(&self, stream: TcpStream) -> io::Result<WolfTlsStream> {
+        let mut tls = WolfTlsStream::new(&self.ctx, stream)?;
+        if let Some(alpn) = &self.alpn {
+            let mut list = alpn.as_bytes().to_vec();
+            let len = list.len() as u32;
+            list.push(0);
+            // SAFETY: ssl is valid; wolfSSL copies the list during the call.
+            unsafe {
+                wolfSSL_UseALPN(
+                    tls.ssl.ptr(),
+                    list.as_mut_ptr().cast(),
+                    len,
+                    WOLFSSL_ALPN_FAILED_ON_MISMATCH,
+                );
+            }
+        }
+        match tokio::time::timeout(self.handshake_timeout, tls.handshake(true)).await {
+            Ok(Ok(())) => Ok(tls),
+            Ok(Err(e)) => Err(e),
+            // Dropping `tls` here frees the half-finished SSL object.
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TLS handshake timeout",
+            )),
+        }
+    }
+
+    /// True when client certificates are required and verified.
+    pub fn is_mutual(&self) -> bool {
+        self.mutual
+    }
+}
+
+/// Creates the wolfSSL acceptor used by the TLS listener.
+pub fn create_tls_acceptor(cfg: &TlsServerConfig) -> Result<WolfTlsAcceptor, TlsError> {
+    ensure_wolfssl_initialized();
+    // SAFETY: method constructors return pointers to static tables.
+    let method = unsafe {
+        match cfg.min_version {
+            TlsVersion::Tls13 => wolfTLSv1_3_server_method(),
+            TlsVersion::Tls12 => wolfSSLv23_server_method(),
+        }
+    };
+    let ctx = WolfContext::new(method)?;
+    if cfg.min_version == TlsVersion::Tls12 {
+        // SAFETY: ctx is valid.
+        if unsafe { wolfSSL_CTX_SetMinVersion(ctx.ptr(), WOLFSSL_TLSV1_2) } != WOLFSSL_SUCCESS {
+            return Err(TlsError::Library("wolfSSL_CTX_SetMinVersion failed"));
+        }
+    }
+    ctx.use_cert_chain(&cfg.cert_file, "server certificate")?;
+    ctx.use_private_key(&cfg.key_file, "server private key")?;
+    match &cfg.client_ca_file {
+        Some(ca) => {
+            ctx.load_ca(ca)?;
+            ctx.set_verify(SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT);
+        }
+        None => ctx.set_verify(SSL_VERIFY_NONE),
+    }
+    if let Some(ciphers) = &cfg.ciphers {
+        ctx.set_cipher_list(ciphers)?;
+    }
+    Ok(WolfTlsAcceptor {
+        ctx: Arc::new(ctx),
+        alpn: alpn_list(&cfg.alpn_protocols)?.map(Arc::new),
+        handshake_timeout: cfg.handshake_timeout,
+        mutual: cfg.client_ca_file.is_some(),
+    })
+}
+
+#[derive(Clone)]
+pub struct WolfTlsConnector {
+    ctx: Arc<WolfContext>,
+    alpn: Option<Arc<CString>>,
+}
+
+impl WolfTlsConnector {
+    /// Connects, sending SNI and verifying that the server certificate matches `domain`.
+    pub async fn connect(&self, domain: &str, stream: TcpStream) -> io::Result<WolfTlsStream> {
+        let c_domain = CString::new(domain)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "domain contains NUL"))?;
+        let mut tls = WolfTlsStream::new(&self.ctx, stream)?;
+        let ssl = tls.ssl.ptr();
+        if !domain.is_empty() {
+            let len = u16::try_from(c_domain.as_bytes().len())
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "domain too long"))?;
+            // SAFETY: ssl is valid; the domain buffer holds `len` bytes and wolfSSL copies it.
+            unsafe {
+                wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, c_domain.as_ptr().cast(), len);
+                if wolfSSL_check_domain_name(ssl, c_domain.as_ptr()) != WOLFSSL_SUCCESS {
+                    return Err(io::Error::other("wolfSSL_check_domain_name failed"));
+                }
+            }
+        }
+        if let Some(alpn) = &self.alpn {
+            let mut list = alpn.as_bytes().to_vec();
+            let len = list.len() as u32;
+            list.push(0);
+            // SAFETY: as in the acceptor.
+            unsafe {
+                wolfSSL_UseALPN(
+                    ssl,
+                    list.as_mut_ptr().cast(),
+                    len,
+                    WOLFSSL_ALPN_FAILED_ON_MISMATCH,
+                )
+            };
+        }
+        tls.handshake(false).await?;
+        Ok(tls)
+    }
+}
+
+/// Creates a wolfSSL connector (used by the benchmark, simulator and tests).
+/// Verifies the server against `ca_cert_path`; optionally presents a client certificate.
+pub fn create_tls_connector(
+    ca_cert_path: &str,
+    client_cert_and_key: Option<(&str, &str)>,
+) -> Result<WolfTlsConnector, TlsError> {
+    ensure_wolfssl_initialized();
+    // SAFETY: static method table.
+    let ctx = WolfContext::new(unsafe { wolfTLSv1_3_client_method() })?;
+    ctx.load_ca(ca_cert_path)?;
+    ctx.set_verify(SSL_VERIFY_PEER);
+    if let Some((cert, key)) = client_cert_and_key {
+        ctx.use_cert_chain(cert, "client certificate")?;
+        ctx.use_private_key(key, "client private key")?;
+    }
+    Ok(WolfTlsConnector {
+        ctx: Arc::new(ctx),
+        alpn: alpn_list(&["mqtt".to_string()])?.map(Arc::new),
+    })
+}
+
+/// Creates a connector that accepts TLS 1.2 or 1.3 servers.
+pub fn create_tls12_connector(ca_cert_path: &str) -> Result<WolfTlsConnector, TlsError> {
+    ensure_wolfssl_initialized();
+    // SAFETY: static method table.
+    let ctx = WolfContext::new(unsafe { wolfSSLv23_client_method() })?;
+    ctx.load_ca(ca_cert_path)?;
+    ctx.set_verify(SSL_VERIFY_PEER);
+    Ok(WolfTlsConnector {
+        ctx: Arc::new(ctx),
+        alpn: None,
+    })
 }
 
 pub type TlsAcceptor = WolfTlsAcceptor;
 pub type TlsConnector = WolfTlsConnector;
 pub type TlsStream = WolfTlsStream;
 
-/// Creates a wolfSSL TLS Acceptor for the MQTT server.
-pub fn create_tls_acceptor(
-    cert_path: &str,
-    key_path: &str,
-    ca_cert_path: Option<&str>,
-) -> Result<WolfTlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
-    ensure_wolfssl_initialized();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if !Path::new(cert_path).exists() {
-        return Err(format!("Server certificate file not found: {}", cert_path).into());
-    }
-    if !Path::new(key_path).exists() {
-        return Err(format!("Server private key file not found: {}", key_path).into());
-    }
-
-    // Use TLS 1.3 exclusively — wolfSSLv23_server_method would allow TLS 1.0/1.1/1.2
-    let method = unsafe { wolfTLSv1_3_server_method() };
-    let raw_ctx = unsafe { wolfSSL_CTX_new(method) };
-    if raw_ctx.is_null() {
-        return Err("wolfSSL_CTX_new failed".into());
-    }
-    let ctx = Arc::new(WolfContext { raw: raw_ctx });
-
-    let c_cert = CString::new(cert_path)?;
-    if unsafe { wolfSSL_CTX_use_certificate_chain_file(ctx.as_ptr(), c_cert.as_ptr()) }
-        != WOLFSSL_SUCCESS
-    {
-        return Err(format!("Failed to load server certificate chain from {}", cert_path).into());
+    #[test]
+    fn alpn_list_validation() {
+        assert!(alpn_list(&[]).unwrap().is_none());
+        assert_eq!(
+            alpn_list(&["mqtt".into(), "x-amzn-mqtt-ca".into()])
+                .unwrap()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "mqtt,x-amzn-mqtt-ca"
+        );
+        assert!(alpn_list(&["a,b".into()]).is_err());
+        assert!(alpn_list(&["".into()]).is_err());
     }
 
-    let c_key = CString::new(key_path)?;
-    if unsafe { wolfSSL_CTX_use_PrivateKey_file(ctx.as_ptr(), c_key.as_ptr(), SSL_FILETYPE_PEM) }
-        != WOLFSSL_SUCCESS
-    {
-        return Err(format!("Failed to load server private key from {}", key_path).into());
+    #[test]
+    fn missing_files_are_reported() {
+        let cfg = TlsServerConfig::new("/nonexistent/cert.pem", "/nonexistent/key.pem");
+        assert!(matches!(
+            create_tls_acceptor(&cfg),
+            Err(TlsError::FileNotFound { .. })
+        ));
     }
-
-    if let Some(ca_path) = ca_cert_path {
-        if !Path::new(ca_path).exists() {
-            return Err(format!("CA certificate file not found: {}", ca_path).into());
-        }
-        let c_ca = CString::new(ca_path)?;
-        if unsafe {
-            wolfSSL_CTX_load_verify_locations(ctx.as_ptr(), c_ca.as_ptr(), std::ptr::null())
-        } != WOLFSSL_SUCCESS
-        {
-            return Err(format!("Failed to load CA verify locations from {}", ca_path).into());
-        }
-        unsafe {
-            wolfSSL_CTX_set_verify(
-                ctx.as_ptr(),
-                SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-                None,
-            );
-        }
-    } else {
-        unsafe {
-            wolfSSL_CTX_set_verify(ctx.as_ptr(), SSL_VERIFY_NONE, None);
-        }
-    }
-
-    Ok(WolfTlsAcceptor { ctx })
-}
-
-/// Creates a wolfSSL TLS Connector for MQTT clients/benchmarks.
-pub fn create_tls_connector(
-    ca_cert_path: &str,
-    client_cert_and_key: Option<(&str, &str)>,
-) -> Result<WolfTlsConnector, Box<dyn std::error::Error + Send + Sync>> {
-    ensure_wolfssl_initialized();
-
-    if !Path::new(ca_cert_path).exists() {
-        return Err(format!("CA certificate file not found: {}", ca_cert_path).into());
-    }
-
-    // Use TLS 1.3 exclusively for client connections
-    let method = unsafe { wolfTLSv1_3_client_method() };
-    let raw_ctx = unsafe { wolfSSL_CTX_new(method) };
-    if raw_ctx.is_null() {
-        return Err("wolfSSL_CTX_new failed".into());
-    }
-    let ctx = Arc::new(WolfContext { raw: raw_ctx });
-
-    let c_ca = CString::new(ca_cert_path)?;
-    if unsafe { wolfSSL_CTX_load_verify_locations(ctx.as_ptr(), c_ca.as_ptr(), std::ptr::null()) }
-        != WOLFSSL_SUCCESS
-    {
-        return Err(format!("Failed to load CA verify locations from {}", ca_cert_path).into());
-    }
-    unsafe {
-        wolfSSL_CTX_set_verify(ctx.as_ptr(), SSL_VERIFY_PEER, None);
-    }
-
-    if let Some((cert_path, key_path)) = client_cert_and_key {
-        if !Path::new(cert_path).exists() {
-            return Err(format!("Client certificate file not found: {}", cert_path).into());
-        }
-        if !Path::new(key_path).exists() {
-            return Err(format!("Client private key file not found: {}", key_path).into());
-        }
-
-        let c_cert = CString::new(cert_path)?;
-        if unsafe { wolfSSL_CTX_use_certificate_chain_file(ctx.as_ptr(), c_cert.as_ptr()) }
-            != WOLFSSL_SUCCESS
-        {
-            return Err(
-                format!("Failed to load client certificate chain from {}", cert_path).into(),
-            );
-        }
-
-        let c_key = CString::new(key_path)?;
-        if unsafe {
-            wolfSSL_CTX_use_PrivateKey_file(ctx.as_ptr(), c_key.as_ptr(), SSL_FILETYPE_PEM)
-        } != WOLFSSL_SUCCESS
-        {
-            return Err(format!("Failed to load client private key from {}", key_path).into());
-        }
-    }
-
-    Ok(WolfTlsConnector { ctx })
 }

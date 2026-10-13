@@ -1,617 +1,270 @@
-use bytes::{Buf, Bytes, BytesMut};
-use std::env;
-use std::sync::atomic::{AtomicU16, Ordering};
+//! Live traffic simulator: exercises a running broker step by step and prints each exchange.
+
+use bytes::Bytes;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use wolf_mqtt::client::RawClient;
 use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS};
-use wolf_mqtt::tls::{create_tls_connector, WolfTlsStream};
+use wolf_mqtt::tls::{create_tls_connector, WolfTlsConnector};
 
-static PID_GEN: AtomicU16 = AtomicU16::new(1);
+type Error = Box<dyn std::error::Error + Send + Sync>;
 
-fn next_pid() -> u16 {
-    let pid = PID_GEN.fetch_add(1, Ordering::Relaxed);
-    if pid == 0 {
-        PID_GEN.fetch_add(1, Ordering::Relaxed)
-    } else {
-        pid
-    }
+const HELP: &str = "\
+Usage: wolf-simulate [OPTIONS]
+
+Options:
+  --host <HOST>          Broker host (default: 127.0.0.1)
+  --port <PORT>          Broker port (default: 1883, or 8883 with --tls)
+  --tls                  Connect with TLS (wolfSSL)
+  --ca <FILE>            CA certificate for TLS (default: certs/ca-cert.pem)
+  --cert <FILE>          Client certificate for mutual TLS (default: certs/client-cert.pem)
+  --key <FILE>           Client private key for mutual TLS (default: certs/client-key.pem)
+  --no-client-cert       Do not present a client certificate
+  --mqtt <3|5>           Protocol version (default: 5)
+  -u, --username <USER>  User name (default: superadmin)
+  -p, --password <PASS>  Password (default: admin_secret_pass)
+  --anonymous            Connect without credentials
+  --delay <MS>           Pause between steps (default: 500)
+  -h, --help             Show this help";
+
+struct Options {
+    host: String,
+    port: Option<u16>,
+    tls: bool,
+    ca: String,
+    cert: Option<(String, String)>,
+    version: ProtocolVersion,
+    credentials: Option<(String, String)>,
+    delay: Duration,
 }
 
-enum AnyStream {
-    Tcp(TcpStream),
-    Tls(Box<WolfTlsStream>),
-}
-
-impl AsyncRead for AnyStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            AnyStream::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            AnyStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_read(cx, buf),
+fn parse() -> Result<Option<Options>, Error> {
+    let mut o = Options {
+        host: "127.0.0.1".into(),
+        port: None,
+        tls: false,
+        ca: "certs/ca-cert.pem".into(),
+        cert: Some((
+            "certs/client-cert.pem".into(),
+            "certs/client-key.pem".into(),
+        )),
+        version: ProtocolVersion::V500,
+        credentials: Some(("superadmin".into(), "admin_secret_pass".into())),
+        delay: Duration::from_millis(500),
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        let mut value = || args.next().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--host" => o.host = value()?,
+            "--port" => o.port = Some(value()?.parse()?),
+            "--tls" => o.tls = true,
+            "--ca" => o.ca = value()?,
+            "--cert" => {
+                let cert = value()?;
+                let key = o
+                    .cert
+                    .take()
+                    .map(|(_, k)| k)
+                    .unwrap_or_else(|| "certs/client-key.pem".into());
+                o.cert = Some((cert, key));
+            }
+            "--key" => {
+                let key = value()?;
+                let cert = o
+                    .cert
+                    .take()
+                    .map(|(c, _)| c)
+                    .unwrap_or_else(|| "certs/client-cert.pem".into());
+                o.cert = Some((cert, key));
+            }
+            "--no-client-cert" => o.cert = None,
+            "--mqtt" => {
+                o.version = match value()?.as_str() {
+                    "3" | "3.1.1" => ProtocolVersion::V311,
+                    "5" | "5.0" => ProtocolVersion::V500,
+                    other => return Err(format!("unknown MQTT version '{other}'").into()),
+                }
+            }
+            "-u" | "--username" => {
+                let user = value()?;
+                let pass = o.credentials.take().map(|(_, p)| p).unwrap_or_default();
+                o.credentials = Some((user, pass));
+            }
+            "-p" | "--password" => {
+                let pass = value()?;
+                let user = o.credentials.take().map(|(u, _)| u).unwrap_or_default();
+                o.credentials = Some((user, pass));
+            }
+            "--anonymous" => o.credentials = None,
+            "--delay" => o.delay = Duration::from_millis(value()?.parse()?),
+            "-h" | "--help" => {
+                println!("{HELP}");
+                return Ok(None);
+            }
+            other => return Err(format!("unknown argument '{other}' (see --help)").into()),
         }
     }
+    Ok(Some(o))
 }
 
-impl AsyncWrite for AnyStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        match self.get_mut() {
-            AnyStream::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            AnyStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        match self.get_mut() {
-            AnyStream::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
-            AnyStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
-        match self.get_mut() {
-            AnyStream::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            AnyStream::Tls(s) => std::pin::Pin::new(s.as_mut()).poll_shutdown(cx),
-        }
-    }
+struct Sim {
+    o: Options,
+    tls: Option<WolfTlsConnector>,
 }
 
-struct ClientSession {
-    stream: AnyStream,
-    read_buf: BytesMut,
-    pub client_id: String,
-}
+impl Sim {
+    fn connect_packet(&self, client_id: &str) -> ConnectPacket {
+        let mut c = ConnectPacket::new(client_id).with_version(self.o.version);
+        if let Some((u, p)) = &self.o.credentials {
+            c = c.with_credentials(u.clone(), p.clone());
+        }
+        c
+    }
 
-impl ClientSession {
-    #[allow(clippy::too_many_arguments)]
-    async fn connect(
-        host: &str,
-        port: u16,
-        use_tls: bool,
-        client_id: &str,
-        version: ProtocolVersion,
-        username: Option<&str>,
-        password: Option<&[u8]>,
-        will: Option<PublishPacket>,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let stream = if use_tls {
-            let ca_file = "certs/ca-cert.pem";
-            let connector = create_tls_connector(ca_file, None)?;
-            let tcp = TcpStream::connect((host, port)).await?;
-            let tls = connector.connect("localhost", tcp).await?;
-            AnyStream::Tls(Box::new(tls))
-        } else {
-            let tcp = TcpStream::connect((host, port)).await?;
-            AnyStream::Tcp(tcp)
+    async fn connect(&self, conn: ConnectPacket) -> Result<RawClient, Error> {
+        let id = conn.client_id.clone();
+        let port = self.o.port.unwrap_or(if self.o.tls { 8883 } else { 1883 });
+        let addr = (self.o.host.as_str(), port);
+        let (client, ack) = match &self.tls {
+            Some(connector) => RawClient::connect_tls(addr, &self.o.host, connector, conn).await?,
+            None => RawClient::connect(addr, conn).await?,
         };
-
-        let mut session = Self {
-            stream,
-            read_buf: BytesMut::with_capacity(8192),
-            client_id: client_id.to_string(),
-        };
-
-        session
-            .send_packet(MqttPacket::Connect(ConnectPacket {
-                version,
-                client_id: client_id.to_string(),
-                clean_start: true,
-                keep_alive_sec: 60,
-                will,
-                username: username.map(|u| u.to_string()),
-                password: password.map(Bytes::copy_from_slice),
-            }))
-            .await?;
-
-        let resp = session.read_packet().await?;
-        match resp {
-            MqttPacket::ConnAck {
-                session_present,
-                reason_code,
-            } => {
-                if reason_code != 0 {
-                    return Err(format!(
-                        "Broker rejected connection for client '{}' with reason code {}",
-                        client_id, reason_code
-                    )
-                    .into());
-                }
-                println!(
-                    "    \x1b[32m✔\x1b[0m [CONNACK] Client '{}' authenticated (session_present: {}, code: 0)",
-                    client_id, session_present
-                );
-            }
-            other => {
-                return Err(format!("Expected ConnAck, received: {:?}", other).into());
-            }
+        if ack.reason_code != 0 {
+            return Err(format!(
+                "broker refused '{id}' with reason code 0x{:02X}",
+                ack.reason_code
+            )
+            .into());
         }
-
-        Ok(session)
-    }
-
-    async fn send_packet(
-        &mut self,
-        packet: MqttPacket,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut buf = BytesMut::new();
-        packet.encode(&mut buf)?;
-        self.stream.write_all(&buf).await?;
-        self.stream.flush().await?;
-        Ok(())
-    }
-
-    async fn read_packet(
-        &mut self,
-    ) -> Result<MqttPacket, Box<dyn std::error::Error + Send + Sync>> {
-        loop {
-            if !self.read_buf.is_empty() {
-                let mut slice = &self.read_buf[..];
-                if let Ok(pkt) = MqttPacket::decode(&mut slice) {
-                    let consumed = self.read_buf.len() - slice.len();
-                    self.read_buf.advance(consumed);
-                    return Ok(pkt);
-                }
-            }
-            let n = self.stream.read_buf(&mut self.read_buf).await?;
-            if n == 0 {
-                return Err("EOF while reading MQTT packet".into());
-            }
-        }
-    }
-
-    async fn subscribe(
-        &mut self,
-        topics: Vec<(&str, QoS)>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let pid = next_pid();
-        let topic_pairs: Vec<(String, QoS)> = topics
-            .into_iter()
-            .map(|(t, q)| (t.to_string(), q))
-            .collect();
-        self.send_packet(MqttPacket::Subscribe {
-            packet_id: pid,
-            topics: topic_pairs.clone(),
-        })
-        .await?;
-
-        let resp = self.read_packet().await?;
-        match resp {
-            MqttPacket::SubAck {
-                packet_id,
-                return_codes,
-            } => {
-                println!(
-                    "    \x1b[32m✔\x1b[0m [SUBACK] Subscribed packet_id: {}, return_codes: {:?}",
-                    packet_id, return_codes
-                );
-            }
-            other => return Err(format!("Expected SubAck, received: {:?}", other).into()),
-        }
-        Ok(())
-    }
-
-    async fn publish(
-        &mut self,
-        topic: &str,
-        payload: &[u8],
-        qos: QoS,
-        retain: bool,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let pid = if qos != QoS::AtMostOnce {
-            Some(next_pid())
-        } else {
-            None
-        };
-
-        let pub_pkt = MqttPacket::Publish(PublishPacket {
-            topic: topic.to_string(),
-            packet_id: pid,
-            payload: Bytes::copy_from_slice(payload),
-            qos,
-            retain,
-            dup: false,
-        });
-
-        self.send_packet(pub_pkt).await?;
-
-        match qos {
-            QoS::AtMostOnce => {
-                println!(
-                    "    \x1b[36m➔\x1b[0m [PUBLISH QoS 0] Topic: '{}' ({} bytes)",
-                    topic,
-                    payload.len()
-                );
-            }
-            QoS::AtLeastOnce => {
-                let resp = self.read_packet().await?;
-                if let MqttPacket::PubAck { packet_id } = resp {
-                    println!(
-                        "    \x1b[32m✔\x1b[0m [PUBACK] Topic: '{}', packet_id: {} acknowledged",
-                        topic, packet_id
-                    );
-                } else {
-                    return Err(format!("Expected PubAck, received {:?}", resp).into());
-                }
-            }
-            QoS::ExactlyOnce => {
-                let resp = self.read_packet().await?;
-                if let MqttPacket::PubRec { packet_id } = resp {
-                    println!(
-                        "    \x1b[35m⇄\x1b[0m [PUBREC] Topic: '{}', packet_id: {} acknowledged (step 1/3)",
-                        topic, packet_id
-                    );
-                    self.send_packet(MqttPacket::PubRel { packet_id }).await?;
-                    let comp_resp = self.read_packet().await?;
-                    if let MqttPacket::PubComp {
-                        packet_id: comp_pid,
-                    } = comp_resp
-                    {
-                        println!(
-                            "    \x1b[32m✔\x1b[0m [PUBCOMP] Handshake completed for pid: {} (step 2/3)",
-                            comp_pid
-                        );
-                    } else {
-                        return Err(format!("Expected PubComp, received {:?}", comp_resp).into());
-                    }
-                } else {
-                    return Err(format!("Expected PubRec, received {:?}", resp).into());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn ping(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_packet(MqttPacket::PingReq).await?;
-        let resp = self.read_packet().await?;
-        if matches!(resp, MqttPacket::PingResp) {
-            println!("    \x1b[32m✔\x1b[0m [PINGRESP] Heartbeat keep-alive roundtrip confirmed");
-            Ok(())
-        } else {
-            Err(format!("Expected PingResp, received {:?}", resp).into())
-        }
-    }
-
-    async fn disconnect(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.send_packet(MqttPacket::Disconnect).await?;
         println!(
-            "    \x1b[34mℹ\x1b[0m [DISCONNECT] Client '{}' disconnected gracefully",
-            self.client_id
+            "  [CONNACK] '{id}' connected (session present: {})",
+            ack.session_present
         );
-        Ok(())
+        Ok(client)
+    }
+
+    async fn pause(&self) {
+        tokio::time::sleep(self.o.delay).await;
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("\x1b[1;36m================================================================================\x1b[0m");
-    println!("\x1b[1;36m       🐺 WolfiMQ Traffic Simulator & Real-Time Protocol Inspector             \x1b[0m");
-    println!("\x1b[1;36m================================================================================\x1b[0m\n");
+async fn main() -> Result<(), Error> {
+    let Some(o) = parse()? else {
+        return Ok(());
+    };
+    let tls = if o.tls {
+        let cert = o.cert.as_ref().map(|(c, k)| (c.as_str(), k.as_str()));
+        Some(create_tls_connector(&o.ca, cert)?)
+    } else {
+        None
+    };
+    let sim = Sim { o, tls };
+    println!(
+        "WolfiMQ traffic simulator ({}, MQTT {:?})",
+        if sim.o.tls { "TLS" } else { "TCP" },
+        sim.o.version
+    );
 
-    let args: Vec<String> = env::args().collect();
-    let mut host = "127.0.0.1".to_string();
-    let mut port: u16 = 1883;
-    let mut use_tls = false;
-    let mut step_delay = 500u64;
-    let mut username: Option<String> = Some("superadmin".to_string());
-    let mut password: Option<Vec<u8>> = Some(b"admin_secret_pass".to_vec());
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--host" if i + 1 < args.len() => {
-                host = args[i + 1].clone();
-                i += 1;
-            }
-            "--port" if i + 1 < args.len() => {
-                port = args[i + 1].parse().unwrap_or(1883);
-                i += 1;
-            }
-            "--tls" => {
-                use_tls = true;
-                if port == 1883 {
-                    port = 8883;
-                }
-            }
-            "--delay" if i + 1 < args.len() => {
-                step_delay = args[i + 1].parse().unwrap_or(500);
-                i += 1;
-            }
-            "--username" | "-u" if i + 1 < args.len() => {
-                username = Some(args[i + 1].clone());
-                i += 1;
-            }
-            "--password" | "-p" if i + 1 < args.len() => {
-                password = Some(args[i + 1].as_bytes().to_vec());
-                i += 1;
-            }
-            "--anonymous" => {
-                username = None;
-                password = None;
-            }
-            "--help" | "-h" => {
-                println!("Usage: cargo run --bin wolf-simulate -- [OPTIONS]");
-                println!();
-                println!("Options:");
-                println!("  --host <HOST>     Target broker hostname/IP (default: 127.0.0.1)");
-                println!(
-                    "  --port <PORT>     Target broker port (default: 1883 for TCP, 8883 for TLS)"
-                );
-                println!("  --tls             Connect via TLS 1.3 encrypted socket");
-                println!("  --delay <MS>      Delay in milliseconds between simulated steps (default: 500)");
-                println!("  --username, -u    Authentication username (default: superadmin)");
-                println!(
-                    "  --password, -p    Authentication password (default: admin_secret_pass)"
-                );
-                println!("  --anonymous       Connect anonymously without credentials");
-                println!("  --help, -h        Display this help message");
-                return Ok(());
-            }
-            _ => {}
-        }
-        i += 1;
+    println!("\n[1/5] Subscriber connects and subscribes");
+    let mut sub = sim.connect(sim.connect_packet("sim-subscriber")).await?;
+    for (filter, qos) in [
+        ("sim/sensors/+/telemetry", QoS::AtLeastOnce),
+        ("sim/alerts/#", QoS::ExactlyOnce),
+        ("sim/devices/+/status", QoS::AtLeastOnce),
+    ] {
+        let code = sub.subscribe(filter, qos).await?;
+        println!("  [SUBACK] {filter} -> 0x{code:02X}");
     }
-
-    println!("\x1b[1mSimulator Settings:\x1b[0m");
-    println!("  Target Broker : {}:{}", host, port);
-    println!(
-        "  Encryption    : {}",
-        if use_tls {
-            "TLS 1.3 / mTLS (Active)"
-        } else {
-            "Plain TCP"
-        }
-    );
-    println!("  Step Interval : {} ms", step_delay);
-    println!(
-        "  Credentials   : {}\n",
-        if let Some(ref u) = username {
-            format!("User '{}'", u)
-        } else {
-            "Anonymous".to_string()
-        }
-    );
-
-    let delay = Duration::from_millis(step_delay);
-    let u_ref = username.as_deref();
-    let p_ref = password.as_deref();
-
-    // -------------------------------------------------------------------------
-    // Phase 1: Connect Subscriber Client
-    // -------------------------------------------------------------------------
-    println!("\x1b[1;33m▶ [Phase 1/6] Connecting Subscriber Client (MQTT v5.0)...\x1b[0m");
-    let mut sub_session = ClientSession::connect(
-        &host,
-        port,
-        use_tls,
-        "wolf-subscriber-node",
-        ProtocolVersion::V500,
-        u_ref,
-        p_ref,
-        None,
-    )
-    .await?;
-    tokio::time::sleep(delay).await;
-
-    println!("\x1b[1;33m▶ [Phase 2/6] Subscribing to telemetry & alerts...\x1b[0m");
-    sub_session
-        .subscribe(vec![
-            ("sensors/+/telemetry", QoS::AtLeastOnce),
-            ("alerts/#", QoS::ExactlyOnce),
-            ("devices/+/status", QoS::AtLeastOnce),
-        ])
-        .await?;
-    tokio::time::sleep(delay).await;
-
-    // Spawn async background listener for subscriber to receive broadcasts
-    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let sub_handle = tokio::spawn(async move {
+    let listener = tokio::spawn(async move {
         loop {
-            tokio::select! {
-                pkt_res = sub_session.read_packet() => {
-                    match pkt_res {
-                        Ok(MqttPacket::Publish(p)) => {
-                            let text = String::from_utf8_lossy(&p.payload);
-                            println!(
-                                "    \x1b[1;32m📥 [SUBSCRIBER RECEIVED]\x1b[0m Topic: '\x1b[33m{}\x1b[0m' | QoS: {:?} | Retain: {} | Payload: {}",
-                                p.topic, p.qos, p.retain, text
-                            );
-                            if p.qos == QoS::AtLeastOnce {
-                                if let Some(pid) = p.packet_id {
-                                    let _ = sub_session.send_packet(MqttPacket::PubAck { packet_id: pid }).await;
-                                }
-                            } else if p.qos == QoS::ExactlyOnce {
-                                if let Some(pid) = p.packet_id {
-                                    let _ = sub_session.send_packet(MqttPacket::PubRec { packet_id: pid }).await;
-                                    // Complete handshake
-                                    if let Ok(MqttPacket::PubRel { packet_id: rel_pid }) = sub_session.read_packet().await {
-                                        let _ = sub_session.send_packet(MqttPacket::PubComp { packet_id: rel_pid }).await;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(MqttPacket::PingResp) => {}
-                        Ok(other) => {
-                            println!("    \x1b[34mℹ\x1b[0m [Subscriber Event]: {:?}", other);
-                        }
-                        Err(_) => {
-                            break;
-                        }
+            match sub.recv_timeout(Duration::from_secs(30)).await {
+                Ok(Some(MqttPacket::Publish(p))) => {
+                    println!(
+                        "  [RECEIVED] {} (QoS {:?}, retain {}): {}",
+                        p.topic,
+                        p.qos,
+                        p.retain,
+                        String::from_utf8_lossy(&p.payload)
+                    );
+                    if sub.ack_publish(&p).await.is_err() {
+                        break;
                     }
                 }
-                _ = &mut stop_rx => {
-                    let _ = sub_session.disconnect().await;
-                    break;
-                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
             }
         }
     });
+    sim.pause().await;
 
-    // -------------------------------------------------------------------------
-    // Phase 2: Connect Publisher Client & Send Multi-QoS Messages
-    // -------------------------------------------------------------------------
-    println!("\n\x1b[1;33m▶ [Phase 3/6] Connecting Publisher Client & Testing Multi-QoS Delivery...\x1b[0m");
-    let mut pub_session = ClientSession::connect(
-        &host,
-        port,
-        use_tls,
-        "wolf-publisher-node",
-        ProtocolVersion::V500,
-        u_ref,
-        p_ref,
-        None,
-    )
-    .await?;
-    tokio::time::sleep(delay).await;
-
-    // QoS 0 Publish
-    println!("  • Publishing Telemetry [QoS 0] (Fire-and-forget)...");
-    pub_session
-        .publish(
-            "sensors/temp/telemetry",
-            br#"{"sensor_id": "temp_01", "temp_c": 24.3, "status": "ok"}"#,
+    println!("\n[2/5] Publisher sends QoS 0, 1 and 2 messages");
+    let mut publ = sim.connect(sim.connect_packet("sim-publisher")).await?;
+    let samples: [(&str, &str, QoS); 3] = [
+        (
+            "sim/sensors/temp/telemetry",
+            r#"{"temp_c":24.3}"#,
             QoS::AtMostOnce,
-            false,
-        )
-        .await?;
-    tokio::time::sleep(delay).await;
-
-    // QoS 1 Publish
-    println!("  • Publishing Pressure [QoS 1] (At-least-once with PUBACK)...");
-    pub_session
-        .publish(
-            "sensors/pressure/telemetry",
-            br#"{"sensor_id": "pres_01", "pressure_bar": 1.013, "status": "nominal"}"#,
+        ),
+        (
+            "sim/sensors/pressure/telemetry",
+            r#"{"bar":1.013}"#,
             QoS::AtLeastOnce,
-            false,
-        )
-        .await?;
-    tokio::time::sleep(delay).await;
-
-    // QoS 2 Publish
-    println!("  • Publishing Critical Alert [QoS 2] (Exactly-once 4-way handshake)...");
-    pub_session
-        .publish(
-            "alerts/critical",
-            br#"{"alert_type": "OVERHEAT_ALARM", "severity": "HIGH", "zone": "DC-01"}"#,
+        ),
+        (
+            "sim/alerts/critical",
+            r#"{"alert":"OVERHEAT"}"#,
             QoS::ExactlyOnce,
-            false,
-        )
-        .await?;
-    tokio::time::sleep(delay).await;
-
-    // Keep-Alive Ping
-    println!("  • Testing Keep-Alive Heartbeat (PINGREQ -> PINGRESP)...");
-    pub_session.ping().await?;
-    tokio::time::sleep(delay).await;
-
-    // -------------------------------------------------------------------------
-    // Phase 4: Retained Messages & Late Joiner Delivery
-    // -------------------------------------------------------------------------
-    println!("\n\x1b[1;33m▶ [Phase 4/6] Testing Retained Message Storage & Late Joiner Delivery...\x1b[0m");
-    println!("  • Storing Retained Message on 'sensors/status/telemetry'...");
-    pub_session
-        .publish(
-            "sensors/status/telemetry",
-            br#"{"system_state": "ONLINE_NORMAL", "cluster_node": "primary"}"#,
-            QoS::AtLeastOnce,
-            true, // retain = true
-        )
-        .await?;
-    tokio::time::sleep(delay).await;
-
-    println!("  • Connecting Late-Joining Subscriber to verify Retained Message delivery...");
-    let mut late_session = ClientSession::connect(
-        &host,
-        port,
-        use_tls,
-        "wolf-late-joiner-node",
-        ProtocolVersion::V500,
-        u_ref,
-        p_ref,
-        None,
-    )
-    .await?;
-
-    late_session
-        .subscribe(vec![("sensors/status/telemetry", QoS::AtLeastOnce)])
-        .await?;
-
-    let retained_pkt = late_session.read_packet().await?;
-    if let MqttPacket::Publish(p) = retained_pkt {
-        let text = String::from_utf8_lossy(&p.payload);
-        println!(
-            "    \x1b[1;32m✔\x1b[0m [RETAINED CONFIRMED] Received topic: '{}' (retain flag: {}): {}",
-            p.topic, p.retain, text
-        );
+        ),
+    ];
+    for (topic, body, qos) in samples {
+        let code = publ
+            .publish(PublishPacket::new(topic, Bytes::from(body)).with_qos(qos, None))
+            .await?;
+        println!("  [PUBLISH] {topic} QoS {qos:?} -> 0x{code:02X}");
+        sim.pause().await;
     }
-    late_session.disconnect().await?;
-    tokio::time::sleep(delay).await;
+    publ.ping().await?;
+    println!("  [PINGRESP] keep-alive round trip OK");
 
-    // Clear retained message
-    println!("  • Deleting Retained Message with empty payload (payload: b\"\")...");
-    pub_session
-        .publish("sensors/status/telemetry", b"", QoS::AtLeastOnce, true)
-        .await?;
-    tokio::time::sleep(delay).await;
-
-    // -------------------------------------------------------------------------
-    // Phase 5: Last Will and Testament (LWT) Ungraceful Disconnect
-    // -------------------------------------------------------------------------
-    println!("\n\x1b[1;33m▶ [Phase 5/6] Testing LWT (Last Will and Testament) Ungraceful Crash Delivery...\x1b[0m");
-    println!("  • Spawning IoT device with Will configured on 'devices/crasher/status' (QoS 1)...");
-    let will_packet = PublishPacket {
-        topic: "devices/crasher/status".to_string(),
-        packet_id: None,
-        payload: Bytes::from_static(b"FATAL_CRASH: Device disconnected without DISCONNECT packet"),
-        qos: QoS::AtLeastOnce,
-        retain: false,
-        dup: false,
-    };
-
-    let crasher_session = ClientSession::connect(
-        &host,
-        port,
-        use_tls,
-        "wolf-crasher-device",
-        ProtocolVersion::V500,
-        u_ref,
-        p_ref,
-        Some(will_packet),
+    println!("\n[3/5] Retained message and late subscriber");
+    publ.publish(
+        PublishPacket::new("sim/devices/gw/status", Bytes::from_static(b"ONLINE"))
+            .with_qos(QoS::AtLeastOnce, None)
+            .with_retain(true),
     )
     .await?;
+    let mut late = sim.connect(sim.connect_packet("sim-late")).await?;
+    late.subscribe("sim/devices/gw/status", QoS::AtLeastOnce)
+        .await?;
+    let p = late.recv_publish().await?;
+    println!(
+        "  [RETAINED] {} (retain {}): {}",
+        p.topic,
+        p.retain,
+        String::from_utf8_lossy(&p.payload)
+    );
+    late.disconnect().await?;
+    publ.publish(PublishPacket::new("sim/devices/gw/status", Bytes::new()).with_retain(true))
+        .await?;
+    println!("  [CLEARED] retained message removed with an empty payload");
+    sim.pause().await;
 
-    tokio::time::sleep(delay).await;
-    println!("  • Abruptly dropping IoT device TCP connection (simulating network crash)...");
-    drop(crasher_session);
+    println!("\n[4/5] Last Will after an abrupt disconnect");
+    let will = PublishPacket::new(
+        "sim/devices/crasher/status",
+        Bytes::from_static(b"CONNECTION_LOST"),
+    )
+    .with_qos(QoS::AtLeastOnce, None);
+    let crasher = sim
+        .connect(sim.connect_packet("sim-crasher").with_will(will))
+        .await?;
+    drop(crasher.into_stream());
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Wait for broker to detect socket close and dispatch LWT to our subscriber
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    // -------------------------------------------------------------------------
-    // Phase 6: Graceful Teardown
-    // -------------------------------------------------------------------------
-    println!("\n\x1b[1;33m▶ [Phase 6/6] Gracefully Closing Sessions...\x1b[0m");
-    pub_session.disconnect().await?;
-    let _ = stop_tx.send(());
-    let _ = sub_handle.await;
-
-    println!("\n\x1b[1;32m================================================================================\x1b[0m");
-    println!("\x1b[1;32m       ✔ All Simulation Protocol Tests Passed Successfully!                   \x1b[0m");
-    println!("\x1b[1;32m================================================================================\x1b[0m\n");
-
+    println!("\n[5/5] Clean shutdown");
+    publ.disconnect().await?;
+    listener.abort();
+    println!("\nSimulation finished successfully.");
     Ok(())
 }

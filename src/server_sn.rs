@@ -1,1077 +1,1254 @@
+//! OASIS MQTT-SN v1.2 gateway over UDP, sharing sessions and routing with the MQTT listeners.
+//!
+//! MQTT-SN v1.2 carries no credentials, so every SN client acts as one configured ACL identity
+//! (`listeners.mqtt_sn.acl_user`) or, when that is empty, as the anonymous identity.
+
 use crate::auth::UserAccount;
+use crate::broker::{BrokerContext, OpenError};
 use crate::config::MqttSnListenerConfig;
-use crate::protocol::sn::{SnPacket, TopicIdType};
-use crate::protocol::{MqttPacket, PublishPacket, QoS};
-use crate::server::BrokerContext;
+use crate::protocol::sn::{return_code, SnPacket, TopicIdType, MAX_SN_CLIENT_ID_LEN};
+use crate::protocol::{PublishPacket, QoS, SubscriptionOptions};
+use crate::queue::{Delivery, Outbound};
+use crate::routing::topic::has_wildcards;
+use crate::routing::{is_valid_topic_name, Subscription};
+use crate::session::{Session, Transport};
 use bytes::{Bytes, BytesMut};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tokio::sync::{oneshot, Notify};
+use tracing::{debug, info, warn};
 
-/// Maximum number of messages buffered for a sleeping MQTT-SN client.
-/// Prevents memory exhaustion by attackers sending large volumes to sleeping clients.
-const MAX_SLEEPING_BUFFER: usize = 100;
+/// Upper bound of topics a single client may register.
+const MAX_REGISTERED_TOPICS: usize = 1024;
+/// Time allowed to finish the Will handshake after CONNECT.
+const WILL_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[derive(Debug)]
-pub struct SnClientSession {
-    pub client_id_str: String,
-    pub internal_id: u64,
-    pub last_seen: Instant,
-    pub duration_sec: u16,
-    pub asleep: bool,
-    pub will: Option<PublishPacket>,
-    pub pending_will_topic: Option<(String, QoS, bool)>,
-    pub next_topic_id: u16,
-    pub topic_id_to_name: HashMap<u16, String>,
-    pub name_to_topic_id: HashMap<String, u16>,
-    pub subscribed_topics: Vec<String>,
-    pub buffered_messages: Vec<BytesMut>,
-    pub inflight_qos2_msg_ids: HashSet<u16>,
-    /// True only after a successful CONNECT + optional auth
-    pub is_authenticated: bool,
-    /// Authenticated user account (None = anonymous denied)
-    pub user: Option<Arc<UserAccount>>,
+/// Identifies a client: its UDP address plus, behind a forwarder, its wireless node id (§5.5).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LinkKey {
+    pub addr: SocketAddr,
+    pub node: Option<Vec<u8>>,
 }
 
-impl SnClientSession {
-    pub fn new(
-        client_id_str: String,
-        internal_id: u64,
-        duration_sec: u16,
-        user: Option<Arc<UserAccount>>,
-    ) -> Self {
-        Self {
-            client_id_str,
-            internal_id,
-            last_seen: Instant::now(),
-            duration_sec,
-            asleep: false,
-            will: None,
-            pending_will_topic: None,
-            next_topic_id: 100, // IDs 1..99 reserved for predefined topics
-            topic_id_to_name: HashMap::new(),
-            name_to_topic_id: HashMap::new(),
-            subscribed_topics: Vec::new(),
-            buffered_messages: Vec::new(),
-            inflight_qos2_msg_ids: HashSet::new(),
-            is_authenticated: true,
-            user,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// CONNECT received with the Will flag; waiting for WILLTOPIC / WILLMSG.
+    WillSetup,
+    Active,
+    /// Sleeping client (§6.14); messages are buffered in the session queue.
+    Asleep {
+        duration: u16,
+    },
+    /// Sleeping client that sent PINGREQ; buffered messages are flushed, then PINGRESP.
+    Awake {
+        duration: u16,
+    },
+}
 
-    pub fn register_topic(&mut self, name: &str) -> u16 {
-        if let Some(&id) = self.name_to_topic_id.get(name) {
-            return id;
-        }
-        let id = self.next_topic_id;
-        self.next_topic_id = self.next_topic_id.wrapping_add(1);
-        self.name_to_topic_id.insert(name.to_string(), id);
-        self.topic_id_to_name.insert(id, name.to_string());
+#[derive(Debug)]
+enum InflightKind {
+    /// REGISTER sent; the delivery is published once REGACK arrives.
+    Register {
+        topic_id: u16,
+        then: Box<Delivery>,
+    },
+    Publish {
+        qos: i8,
+    },
+    PubRel,
+}
+
+#[derive(Debug)]
+struct Inflight {
+    msg_id: u16,
+    packet: SnPacket,
+    kind: InflightKind,
+    sent_at: Instant,
+    retries: u8,
+}
+
+#[derive(Debug)]
+struct LinkState {
+    keep_alive: u16,
+    last_seen: Instant,
+    mode: Mode,
+    will_topic: Option<(String, QoS, bool)>,
+    will: Option<PublishPacket>,
+    topics_by_id: HashMap<u16, String>,
+    topics_by_name: HashMap<String, u16>,
+    next_topic_id: u16,
+    next_msg_id: u16,
+    /// MQTT-SN clients are constrained: one outstanding QoS 1/2 or REGISTER at a time.
+    inflight: Option<Inflight>,
+    release: Option<oneshot::Sender<()>>,
+}
+
+impl LinkState {
+    fn next_msg_id(&mut self) -> u16 {
+        let id = self.next_msg_id;
+        self.next_msg_id = self.next_msg_id.checked_add(1).unwrap_or(1);
         id
     }
+
+    /// Returns the topic id for `name`, registering it when `allocate` is set.
+    fn topic_id(&mut self, name: &str, allocate: bool) -> Option<u16> {
+        if let Some(id) = self.topics_by_name.get(name) {
+            return Some(*id);
+        }
+        if !allocate || self.topics_by_id.len() >= MAX_REGISTERED_TOPICS {
+            return None;
+        }
+        // 0x0000 and 0xFFFF are reserved (§5.3.11).
+        let mut id = self.next_topic_id;
+        while id == 0 || id == 0xFFFF || self.topics_by_id.contains_key(&id) {
+            id = id.wrapping_add(1);
+        }
+        self.next_topic_id = id.wrapping_add(1);
+        self.topics_by_id.insert(id, name.to_owned());
+        self.topics_by_name.insert(name.to_owned(), id);
+        Some(id)
+    }
+}
+
+#[derive(Debug)]
+struct SnLink {
+    key: LinkKey,
+    session: Arc<Session>,
+    epoch: u64,
+    closed: AtomicBool,
+    wake: Notify,
+    st: Mutex<LinkState>,
+}
+
+impl SnLink {
+    fn st(&self) -> MutexGuard<'_, LinkState> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn can_send(&self) -> bool {
+        let st = self.st();
+        matches!(st.mode, Mode::Active | Mode::Awake { .. }) && st.inflight.is_none()
+    }
+}
+
+struct Gateway {
+    config: MqttSnListenerConfig,
+    ctx: BrokerContext,
+    socket: Arc<UdpSocket>,
+    predef_by_id: HashMap<u16, String>,
+    predef_by_name: HashMap<String, u16>,
+    links: Mutex<HashMap<LinkKey, Arc<SnLink>>>,
 }
 
 pub struct MqttSnServer {
-    config: MqttSnListenerConfig,
-    context: BrokerContext,
-    socket: Arc<UdpSocket>,
-    predefined_id_to_name: Arc<HashMap<u16, String>>,
-    predefined_name_to_id: Arc<HashMap<String, u16>>,
-    sessions: Arc<RwLock<HashMap<SocketAddr, SnClientSession>>>,
+    gw: Arc<Gateway>,
 }
 
-/// Dispatches an MQTT publish packet through the central broker router and retains it if requested.
-async fn dispatch_publish(context: &BrokerContext, pub_pkt: PublishPacket) {
-    if pub_pkt.retain {
-        let mut ret_guard = context.retained.write().await;
-        ret_guard.update(pub_pkt.clone());
-    }
-
-    let matched_ids = {
-        let router_guard = context.router.read().await;
-        router_guard.matches(&pub_pkt.topic)
-    };
-
-    let mut forward_pkt = pub_pkt;
-    forward_pkt.retain = false;
-    let mut forward_buf = BytesMut::new();
-    if MqttPacket::Publish(forward_pkt)
-        .encode(&mut forward_buf)
-        .is_ok()
-    {
-        let frozen = forward_buf.freeze();
-        let clients_guard = context.clients.read().await;
-        for target_id in matched_ids {
-            if let Some(target_tx) = clients_guard.get(&target_id) {
-                let _ = target_tx.try_send(frozen.clone());
-            }
-        }
+fn qos_from_sn(q: u8) -> QoS {
+    match q {
+        1 => QoS::AtLeastOnce,
+        2 => QoS::ExactlyOnce,
+        _ => QoS::AtMostOnce,
     }
 }
 
 impl MqttSnServer {
-    /// Binds the MQTT-SN server to the address specified in the configuration.
     pub async fn bind(
         config: MqttSnListenerConfig,
         context: BrokerContext,
     ) -> Result<Self, std::io::Error> {
-        let bind_addr = format!("{}:{}", config.bind_address, config.port);
-        let socket = UdpSocket::bind(&bind_addr).await?;
-        // SO_BROADCAST must be set before sending to 255.255.255.255
-        socket.set_broadcast(true)?;
-        let socket = Arc::new(socket);
-        let mut id_to_name = HashMap::new();
-        let mut name_to_id = HashMap::new();
-
-        for (id_str, topic_name) in &config.predefined_topics {
-            if let Ok(id) = id_str.parse::<u16>() {
-                id_to_name.insert(id, topic_name.clone());
-                name_to_id.insert(topic_name.clone(), id);
+        let socket = UdpSocket::bind((config.bind_address.as_str(), config.port)).await?;
+        if config.advertise_interval_sec > 0 {
+            socket.set_broadcast(true)?;
+        }
+        let mut predef_by_id = HashMap::new();
+        let mut predef_by_name = HashMap::new();
+        for (id, topic) in &config.predefined_topics {
+            match id.parse::<u16>() {
+                Ok(n) if n != 0 && n != 0xFFFF => {
+                    predef_by_id.insert(n, topic.clone());
+                    predef_by_name.insert(topic.clone(), n);
+                }
+                _ => warn!("Ignoring invalid MQTT-SN predefined topic id '{}'", id),
             }
         }
-
         Ok(Self {
-            config,
-            context,
-            socket,
-            predefined_id_to_name: Arc::new(id_to_name),
-            predefined_name_to_id: Arc::new(name_to_id),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
+            gw: Arc::new(Gateway {
+                config,
+                ctx: context,
+                socket: Arc::new(socket),
+                predef_by_id,
+                predef_by_name,
+                links: Mutex::new(HashMap::new()),
+            }),
         })
     }
 
-    /// Returns the local socket address this MQTT-SN listener is bound to.
     pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
-        self.socket.local_addr()
+        self.gw.socket.local_addr()
+    }
+
+    /// Number of connected MQTT-SN clients.
+    pub fn client_count(&self) -> usize {
+        self.gw.links().len()
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let local_addr = self.socket.local_addr()?;
+        let gw = self.gw;
+        let local = gw.socket.local_addr()?;
         info!(
-            "WolfiMQ MQTT-SN (UDP) listener running on {} (Gateway ID: {})",
-            local_addr, self.config.gateway_id
+            "MQTT-SN gateway listening on {} (gateway id {})",
+            local, gw.config.gateway_id
         );
 
-        let (outbound_tx, mut outbound_rx) = mpsc::channel::<(SocketAddr, BytesMut)>(1024);
-
-        // Task 1: Outbound UDP transmitter
-        let out_socket = Arc::clone(&self.socket);
-        tokio::spawn(async move {
-            while let Some((dest, buf)) = outbound_rx.recv().await {
-                if let Err(e) = out_socket.send_to(&buf, dest).await {
-                    warn!("Failed to send outbound MQTT-SN packet to {}: {}", dest, e);
-                }
-            }
-        });
-
-        // Task 2: Periodic ADVERTISE broadcast
-        if self.config.advertise_interval_sec > 0 {
-            let adv_socket = Arc::clone(&self.socket);
-            let gw_id = self.config.gateway_id;
-            let duration = self.config.advertise_interval_sec * 3;
-            let interval =
-                std::time::Duration::from_secs(self.config.advertise_interval_sec as u64);
-
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(interval);
-                let adv_pkt = SnPacket::Advertise { gw_id, duration };
-                let mut buf = BytesMut::new();
-                adv_pkt.encode(&mut buf);
-
-                loop {
-                    ticker.tick().await;
-                    let _ = adv_socket.send_to(&buf, "255.255.255.255:1884").await;
-                }
-            });
+        if gw.config.advertise_interval_sec > 0 {
+            let adv = Arc::clone(&gw);
+            tokio::spawn(async move { adv.advertise_loop().await });
         }
+        let reaper = Arc::clone(&gw);
+        tokio::spawn(async move { reaper.reaper_loop().await });
 
-        // Task 3: Periodic Session Keepalive & LWT monitor (OASIS MQTT-SN v1.2 §5.4.5)
-        let reaper_sessions = Arc::clone(&self.sessions);
-        let reaper_context = self.context.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-                let now = Instant::now();
-                let mut expired_peers = Vec::new();
-
-                {
-                    let lock = reaper_sessions.read().await;
-                    for (&peer, session) in lock.iter() {
-                        if session.duration_sec > 0 {
-                            // MQTT-SN standard timeout threshold is 1.5 * duration
-                            let timeout_sec = (session.duration_sec as u64) * 3 / 2;
-                            if now.duration_since(session.last_seen).as_secs() >= timeout_sec {
-                                expired_peers.push((
-                                    peer,
-                                    session.internal_id,
-                                    session.will.clone(),
-                                    session.subscribed_topics.clone(),
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                if !expired_peers.is_empty() {
-                    let mut lock = reaper_sessions.write().await;
-                    for (peer, internal_id, will, subscribed_topics) in expired_peers {
-                        lock.remove(&peer);
-                        // Remove client from active map
-                        {
-                            let mut clients_guard = reaper_context.clients.write().await;
-                            clients_guard.remove(&internal_id);
-                        }
-                        // CRITICAL: Also remove all router subscriptions to prevent trie leaks
-                        {
-                            let mut router_guard = reaper_context.router.write().await;
-                            for topic in &subscribed_topics {
-                                router_guard.unsubscribe(topic, &internal_id);
-                            }
-                        }
-                        if let Some(will_pkt) = will {
-                            warn!(
-                                "MQTT-SN client at {} timed out. Publishing LWT on topic '{}'",
-                                peer, will_pkt.topic
-                            );
-                            dispatch_publish(&reaper_context, will_pkt).await;
-                        }
-                    }
-                }
-            }
-        });
-
-        // Main Loop: Inbound Datagram receiver
-        let mut recv_buf = [0u8; 4096];
+        let mut shutdown = gw.ctx.shutdown_signal();
+        let mut buf = vec![0u8; 65_535];
         loop {
-            let (len, peer) = match self.socket.recv_from(&mut recv_buf).await {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("Error receiving UDP packet on MQTT-SN listener: {}", e);
-                    continue;
+            let (len, addr) = tokio::select! {
+                r = gw.socket.recv_from(&mut buf) => match r {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // ICMP errors from previous sends surface here on some platforms.
+                        debug!("MQTT-SN recv error: {}", e);
+                        continue;
+                    }
+                },
+                _ = shutdown.changed() => {
+                    info!("MQTT-SN gateway stopped");
+                    return Ok(());
                 }
             };
-
-            let mut slice = &recv_buf[..len];
-            let packet = match SnPacket::decode(&mut slice) {
-                Ok(pkt) => pkt,
-                Err(e) => {
-                    debug!("Failed to decode MQTT-SN packet from {}: {}", peer, e);
-                    continue;
+            let mut slice = &buf[..len];
+            match SnPacket::decode(&mut slice) {
+                Ok(SnPacket::EncapMsg {
+                    wireless_node_id,
+                    payload,
+                    ..
+                }) => {
+                    let key = LinkKey {
+                        addr,
+                        node: Some(wireless_node_id),
+                    };
+                    let mut inner = &payload[..];
+                    match SnPacket::decode(&mut inner) {
+                        Ok(SnPacket::EncapMsg { .. }) => {
+                            debug!("Nested MQTT-SN encapsulation from {} ignored", addr)
+                        }
+                        Ok(pkt) => gw.handle(pkt, key).await,
+                        Err(e) => debug!("Bad encapsulated MQTT-SN frame from {}: {}", addr, e),
+                    }
                 }
-            };
+                Ok(pkt) => gw.handle(pkt, LinkKey { addr, node: None }).await,
+                Err(e) => debug!("Bad MQTT-SN frame from {}: {}", addr, e),
+            }
+        }
+    }
+}
 
-            self.handle_packet(packet, peer, &outbound_tx).await;
+impl Gateway {
+    fn links(&self) -> MutexGuard<'_, HashMap<LinkKey, Arc<SnLink>>> {
+        self.links.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn link(&self, key: &LinkKey) -> Option<Arc<SnLink>> {
+        self.links().get(key).cloned()
+    }
+
+    async fn send(&self, key: &LinkKey, pkt: &SnPacket) {
+        let mut buf = BytesMut::new();
+        if let Err(e) = pkt.encode(&mut buf) {
+            warn!("Cannot encode MQTT-SN packet for {:?}: {}", key.addr, e);
+            return;
+        }
+        if let Some(node) = &key.node {
+            let encap = SnPacket::EncapMsg {
+                ctrl: 0,
+                wireless_node_id: node.clone(),
+                payload: buf.freeze(),
+            };
+            buf = BytesMut::new();
+            if encap.encode(&mut buf).is_err() {
+                return;
+            }
+        }
+        if let Err(e) = self.socket.send_to(&buf, key.addr).await {
+            debug!("MQTT-SN send to {} failed: {}", key.addr, e);
         }
     }
 
-    async fn handle_packet(
-        &self,
-        packet: SnPacket,
-        peer: SocketAddr,
-        outbound: &mpsc::Sender<(SocketAddr, BytesMut)>,
-    ) {
-        // Refresh keepalive timer on any received packet (OASIS MQTT-SN v1.2 §5.4.18)
-        {
-            let mut lock = self.sessions.write().await;
-            if let Some(session) = lock.get_mut(&peer) {
-                session.last_seen = Instant::now();
+    /// The ACL identity of MQTT-SN clients.
+    async fn identity(&self) -> Option<Arc<UserAccount>> {
+        if self.config.acl_user.is_empty() {
+            self.ctx.acl.anonymous_identity()
+        } else {
+            self.ctx.acl.get_user(&self.config.acl_user).await
+        }
+    }
+
+    async fn advertise_loop(&self) {
+        let interval = Duration::from_secs(self.config.advertise_interval_sec as u64);
+        let target = format!("{}:{}", self.config.advertise_address, self.config.port);
+        let pkt = SnPacket::Advertise {
+            gw_id: self.config.gateway_id,
+            duration: self.config.advertise_interval_sec,
+        };
+        let Ok(frame) = pkt.to_bytes() else {
+            return;
+        };
+        let mut tick = tokio::time::interval(interval);
+        let mut shutdown = self.ctx.shutdown_signal();
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            if let Err(e) = self.socket.send_to(&frame, &target).await {
+                debug!("ADVERTISE to {} failed: {}", target, e);
             }
         }
+    }
 
-        match packet {
+    /// Keep-alive / sleep timers (§6.14) and retransmissions (Tretry / Nretry, §6.13).
+    async fn reaper_loop(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        let mut shutdown = self.ctx.shutdown_signal();
+        let retry_after = Duration::from_secs(self.config.retry_interval_sec.max(1));
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = shutdown.changed() => return,
+            }
+            let now = Instant::now();
+            let links: Vec<Arc<SnLink>> = self.links().values().cloned().collect();
+            for link in links {
+                enum Action {
+                    None,
+                    Lost,
+                    Resend(SnPacket),
+                }
+                let action = {
+                    let mut st = link.st();
+                    let idle = now.duration_since(st.last_seen);
+                    let limit = match st.mode {
+                        Mode::WillSetup => Some(WILL_SETUP_TIMEOUT),
+                        Mode::Active if st.keep_alive > 0 => {
+                            Some(Duration::from_millis(st.keep_alive as u64 * 1500))
+                        }
+                        Mode::Asleep { duration } | Mode::Awake { duration } if duration > 0 => {
+                            Some(Duration::from_millis(duration as u64 * 1500))
+                        }
+                        _ => None,
+                    };
+                    if limit.is_some_and(|l| idle > l) {
+                        Action::Lost
+                    } else if let Some(inf) = st
+                        .inflight
+                        .as_mut()
+                        .filter(|i| now.duration_since(i.sent_at) >= retry_after)
+                    {
+                        if inf.retries >= self.config.max_retries {
+                            Action::Lost
+                        } else {
+                            inf.retries += 1;
+                            inf.sent_at = now;
+                            if let SnPacket::Publish { dup, .. } = &mut inf.packet {
+                                *dup = true;
+                            }
+                            Action::Resend(inf.packet.clone())
+                        }
+                    } else {
+                        Action::None
+                    }
+                };
+                match action {
+                    Action::None => {}
+                    Action::Resend(p) => self.send(&link.key, &p).await,
+                    Action::Lost => {
+                        info!(
+                            "MQTT-SN client '{}' at {} timed out",
+                            link.session.client_id, link.key.addr
+                        );
+                        self.close_link(&link, true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Detaches a link from its session; `abnormal` publishes the Will.
+    fn close_link(&self, link: &Arc<SnLink>, abnormal: bool) {
+        if link.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        {
+            let mut links = self.links();
+            if links.get(&link.key).is_some_and(|l| Arc::ptr_eq(l, link)) {
+                links.remove(&link.key);
+            }
+        }
+        let (will, release) = {
+            let mut st = link.st();
+            (st.will.take(), st.release.take())
+        };
+        self.ctx.connection_closed(
+            &link.session,
+            link.epoch,
+            if abnormal { will } else { None },
+        );
+        drop(release);
+        link.wake.notify_one();
+        link.session.queue.wake();
+    }
+
+    fn resolve_topic(
+        &self,
+        link: Option<&SnLink>,
+        id_type: TopicIdType,
+        topic_id: u16,
+    ) -> Option<String> {
+        match id_type {
+            TopicIdType::Predefined => self.predef_by_id.get(&topic_id).cloned(),
+            TopicIdType::Short => {
+                let bytes = topic_id.to_be_bytes();
+                String::from_utf8(bytes.to_vec())
+                    .ok()
+                    .filter(|t| is_valid_topic_name(t))
+            }
+            TopicIdType::Normal => link.and_then(|l| l.st().topics_by_id.get(&topic_id).cloned()),
+            TopicIdType::Reserved => None,
+        }
+    }
+
+    async fn handle(self: &Arc<Self>, pkt: SnPacket, key: LinkKey) {
+        let link = self.link(&key);
+        if let Some(l) = &link {
+            l.st().last_seen = Instant::now();
+        }
+        match pkt {
             SnPacket::SearchGw { .. } => {
                 let resp = SnPacket::GwInfo {
                     gw_id: self.config.gateway_id,
                     gw_add: None,
                 };
-                let mut buf = BytesMut::new();
-                resp.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
+                self.send(&key, &resp).await;
             }
-
             SnPacket::Connect {
                 will,
                 clean_session,
                 duration,
                 client_id,
             } => {
-                debug!(
-                    "MQTT-SN CONNECT from {} (client_id: '{}', will: {}, duration: {}s)",
-                    peer, client_id, will, duration
-                );
-
-                // Authenticate: MQTT-SN has no built-in credentials.
-                // We use anonymous auth; if allow_anonymous=false, reject the connection.
-                let auth_result = self.context.acl.authenticate(None, None, &client_id).await;
-
-                let user = match auth_result {
-                    Ok(u) => u,
-                    Err(e) => {
-                        warn!(
-                            "MQTT-SN CONNECT rejected for client '{}' from {}: {:?}",
-                            client_id, peer, e
-                        );
-                        // OASIS MQTT-SN v1.2 rc=0x01: Rejected (Congestion) — closest code for auth failure
-                        let connack = SnPacket::ConnAck { return_code: 0x01 };
-                        let mut buf = BytesMut::new();
-                        connack.encode(&mut buf);
-                        let _ = outbound.send((peer, buf)).await;
-                        return;
-                    }
-                };
-
-                let internal_id = self.context.next_client_id();
-                {
-                    let mut lock = self.sessions.write().await;
-                    if clean_session || !lock.contains_key(&peer) {
-                        lock.insert(
-                            peer,
-                            SnClientSession::new(client_id, internal_id, duration, Some(user)),
-                        );
-                    } else if let Some(session) = lock.get_mut(&peer) {
-                        session.last_seen = Instant::now();
-                        session.duration_sec = duration;
-                        session.asleep = false;
-                    }
-                }
-
-                if will {
-                    // OASIS MQTT-SN v1.2 §5.4.4: Gateway prompts client for WillTopic
-                    let will_req = SnPacket::WillTopicReq;
-                    let mut buf = BytesMut::new();
-                    will_req.encode(&mut buf);
-                    let _ = outbound.send((peer, buf)).await;
-                } else {
-                    let connack = SnPacket::ConnAck { return_code: 0x00 };
-                    let mut buf = BytesMut::new();
-                    connack.encode(&mut buf);
-                    let _ = outbound.send((peer, buf)).await;
-                }
+                self.on_connect(key, link, will, clean_session, duration, client_id)
+                    .await
             }
-
             SnPacket::WillTopic {
                 qos,
                 retain,
                 will_topic,
             } => {
-                debug!(
-                    "MQTT-SN WILLTOPIC from {} (topic: '{}', qos: {})",
-                    peer, will_topic, qos
-                );
+                let Some(link) = link else { return };
                 if will_topic.is_empty() {
-                    // OASIS MQTT-SN v1.2 §5.4.4: Empty will_topic deletes will and concludes with ConnAck
-                    {
-                        let mut lock = self.sessions.write().await;
-                        if let Some(session) = lock.get_mut(&peer) {
-                            session.will = None;
-                            session.pending_will_topic = None;
-                        }
-                    }
-                    let connack = SnPacket::ConnAck { return_code: 0x00 };
-                    let mut buf = BytesMut::new();
-                    connack.encode(&mut buf);
-                    let _ = outbound.send((peer, buf)).await;
+                    link.st().will_topic = None;
+                    self.finish_connect(&link, true).await;
                 } else {
-                    let qos_mapped = match qos {
-                        1 => QoS::AtLeastOnce,
-                        2 => QoS::ExactlyOnce,
-                        _ => QoS::AtMostOnce,
-                    };
-                    {
-                        let mut lock = self.sessions.write().await;
-                        if let Some(session) = lock.get_mut(&peer) {
-                            session.pending_will_topic = Some((will_topic, qos_mapped, retain));
-                        }
-                    }
-
-                    let msg_req = SnPacket::WillMsgReq;
-                    let mut buf = BytesMut::new();
-                    msg_req.encode(&mut buf);
-                    let _ = outbound.send((peer, buf)).await;
+                    link.st().will_topic = Some((will_topic, qos_from_sn(qos), retain));
+                    self.send(&key, &SnPacket::WillMsgReq).await;
                 }
             }
-
             SnPacket::WillMsg { will_msg } => {
-                debug!("MQTT-SN WILLMSG from {} (len: {})", peer, will_msg.len());
-                {
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.get_mut(&peer) {
-                        session.last_seen = Instant::now();
-                        if let Some((topic, qos, retain)) = session.pending_will_topic.take() {
-                            session.will = Some(PublishPacket {
-                                topic,
-                                qos,
-                                retain,
-                                dup: false,
-                                packet_id: None,
-                                payload: will_msg,
-                            });
-                        }
+                let Some(link) = link else { return };
+                let topic = link.st().will_topic.take();
+                let ok = match topic {
+                    Some((topic, qos, retain)) => {
+                        self.set_will(&link, topic, qos, retain, will_msg)
                     }
-                }
-
-                let connack = SnPacket::ConnAck { return_code: 0x00 };
-                let mut buf = BytesMut::new();
-                connack.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
+                    None => true,
+                };
+                self.finish_connect(&link, ok).await;
             }
-
             SnPacket::WillTopicUpd {
                 qos,
                 retain,
                 will_topic,
             } => {
-                let qos_mapped = match qos {
-                    1 => QoS::AtLeastOnce,
-                    2 => QoS::ExactlyOnce,
-                    _ => QoS::AtMostOnce,
+                let Some(link) = link else { return };
+                let rc = if will_topic.is_empty() {
+                    link.st().will = None;
+                    return_code::ACCEPTED
+                } else {
+                    let payload = link
+                        .st()
+                        .will
+                        .as_ref()
+                        .map(|w| w.payload.clone())
+                        .unwrap_or_default();
+                    if self.set_will(&link, will_topic, qos_from_sn(qos), retain, payload) {
+                        return_code::ACCEPTED
+                    } else {
+                        return_code::REJECTED_NOT_SUPPORTED
+                    }
                 };
-                {
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.get_mut(&peer) {
-                        session.last_seen = Instant::now();
-                        if let Some(ref mut will) = session.will {
-                            will.topic = will_topic;
-                            will.qos = qos_mapped;
-                            will.retain = retain;
-                        } else {
-                            session.pending_will_topic = Some((will_topic, qos_mapped, retain));
-                        }
-                    }
-                }
-                let resp = SnPacket::WillTopicResp { return_code: 0x00 };
-                let mut buf = BytesMut::new();
-                resp.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
+                self.send(&key, &SnPacket::WillTopicResp { return_code: rc })
+                    .await;
             }
-
             SnPacket::WillMsgUpd { will_msg } => {
-                {
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.get_mut(&peer) {
-                        session.last_seen = Instant::now();
-                        if let Some(ref mut will) = session.will {
-                            will.payload = will_msg;
-                        }
-                    }
+                let Some(link) = link else { return };
+                if let Some(w) = link.st().will.as_mut() {
+                    w.payload = will_msg;
                 }
-                let resp = SnPacket::WillMsgResp { return_code: 0x00 };
-                let mut buf = BytesMut::new();
-                resp.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
+                self.send(
+                    &key,
+                    &SnPacket::WillMsgResp {
+                        return_code: return_code::ACCEPTED,
+                    },
+                )
+                .await;
             }
-
             SnPacket::Register {
                 msg_id, topic_name, ..
             } => {
-                // Guard: must be authenticated (i.e., CONNECT received)
-                let is_auth = {
-                    let lock = self.sessions.read().await;
-                    lock.get(&peer).map(|s| s.is_authenticated).unwrap_or(false)
-                };
-                if !is_auth {
-                    warn!("MQTT-SN REGISTER from {} without CONNECT; ignoring", peer);
-                    return;
-                }
-
-                // MQTT topic names MUST NOT contain wildcards (+ or #)
-                if topic_name.contains('+') || topic_name.contains('#') {
-                    warn!(
-                        "MQTT-SN REGISTER rejected from {}: topic name '{}' contains wildcard",
-                        peer, topic_name
-                    );
-                    let regack = SnPacket::RegAck {
-                        topic_id: 0,
-                        msg_id,
-                        return_code: 0x02, // Rejected-Invalid-Topic-ID
-                    };
-                    let mut buf = BytesMut::new();
-                    regack.encode(&mut buf);
-                    let _ = outbound.send((peer, buf)).await;
-                    return;
-                }
-
-                let mut assigned_id = 0u16;
-                {
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.get_mut(&peer) {
-                        assigned_id = session.register_topic(&topic_name);
+                let Some(link) = link else { return };
+                let (topic_id, rc) = if !is_valid_topic_name(&topic_name) {
+                    (0, return_code::REJECTED_INVALID_TOPIC_ID)
+                } else {
+                    match link.st().topic_id(&topic_name, true) {
+                        Some(id) => (id, return_code::ACCEPTED),
+                        None => (0, return_code::REJECTED_CONGESTION),
                     }
-                }
-
-                let regack = SnPacket::RegAck {
-                    topic_id: assigned_id,
-                    msg_id,
-                    return_code: 0x00,
                 };
-                let mut buf = BytesMut::new();
-                regack.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
+                self.send(
+                    &key,
+                    &SnPacket::RegAck {
+                        topic_id,
+                        msg_id,
+                        return_code: rc,
+                    },
+                )
+                .await;
             }
-
+            SnPacket::RegAck {
+                topic_id,
+                msg_id,
+                return_code: rc,
+            } => {
+                let Some(link) = link else { return };
+                let pending = {
+                    let mut st = link.st();
+                    match st.inflight.take() {
+                        Some(Inflight {
+                            msg_id: m,
+                            kind: InflightKind::Register { topic_id: t, then },
+                            ..
+                        }) if m == msg_id && t == topic_id => Some(then),
+                        other => {
+                            st.inflight = other;
+                            None
+                        }
+                    }
+                };
+                if let Some(delivery) = pending {
+                    if rc == return_code::ACCEPTED {
+                        self.publish_to_client(&link, *delivery, TopicIdType::Normal, topic_id)
+                            .await;
+                    } else {
+                        let mut st = link.st();
+                        if let Some(name) = st.topics_by_id.remove(&topic_id) {
+                            st.topics_by_name.remove(&name);
+                        }
+                    }
+                    self.after_progress(&link).await;
+                }
+            }
             SnPacket::Publish {
+                dup: _,
                 qos,
                 retain,
                 topic_id_type,
                 topic_id,
                 msg_id,
                 data,
-                dup,
             } => {
-                // Guard: must be authenticated (i.e., CONNECT received), unless anonymous access is enabled or QoS -1
-                let session_info = {
-                    let lock = self.sessions.read().await;
-                    lock.get(&peer)
-                        .map(|s| (s.is_authenticated, s.user.clone(), s.client_id_str.clone()))
+                self.on_publish(
+                    key,
+                    link,
+                    qos,
+                    retain,
+                    topic_id_type,
+                    topic_id,
+                    msg_id,
+                    data,
+                )
+                .await
+            }
+            SnPacket::PubAck { msg_id, .. } => {
+                let Some(link) = link else { return };
+                let done = {
+                    let mut st = link.st();
+                    let hit = matches!(&st.inflight, Some(i) if i.msg_id == msg_id
+                        && matches!(i.kind, InflightKind::Publish { .. }));
+                    if hit {
+                        st.inflight = None;
+                    }
+                    hit
                 };
-                let (is_auth, user_opt, client_id_str) = match session_info {
-                    Some(info) => info,
-                    None if self.context.acl.allow_anonymous() || qos == 3 => (
-                        true,
-                        Some(Arc::new(UserAccount {
-                            username: "anonymous".into(),
-                            password_hash: String::new(),
-                            role: crate::auth::UserRole::Custom("anonymous".into()),
-                            allowed_rooms: Vec::new(),
-                            custom_rules: Vec::new(),
-                        })),
-                        format!("anon-{}", peer),
-                    ),
-                    None => {
-                        warn!("MQTT-SN PUBLISH from {} without session; ignoring", peer);
-                        return;
-                    }
-                };
-                if !is_auth && !self.context.acl.allow_anonymous() && qos != 3 {
-                    warn!("MQTT-SN PUBLISH from {} without CONNECT; ignoring", peer);
-                    return;
-                }
-
-                // Resolve Topic Name
-                let resolved_topic = match topic_id_type {
-                    TopicIdType::Predefined => self.predefined_id_to_name.get(&topic_id).cloned(),
-                    TopicIdType::Short => {
-                        let bytes = topic_id.to_be_bytes();
-                        // Short topic names are 2 ASCII bytes; validate they contain no wildcards
-                        if bytes.iter().any(|&b| b == b'+' || b == b'#') {
-                            warn!("MQTT-SN PUBLISH rejected from {}: short topic ID contains wildcard byte", peer);
-                            return;
-                        }
-                        String::from_utf8(bytes.to_vec()).ok()
-                    }
-                    TopicIdType::Normal => {
-                        let lock = self.sessions.read().await;
-                        lock.get(&peer)
-                            .and_then(|s| s.topic_id_to_name.get(&topic_id).cloned())
-                    }
-                    _ => None,
-                };
-
-                if let Some(topic) = resolved_topic {
-                    // ACL: Check publish authorization
-                    let acl_allowed = if let Some(ref user) = user_opt {
-                        self.context
-                            .acl
-                            .check_publish(user.as_ref(), &client_id_str, &topic)
-                    } else {
-                        false
-                    };
-                    if !acl_allowed {
-                        warn!(
-                            "MQTT-SN PUBLISH denied for client '{}' ({}): topic '{}'",
-                            client_id_str, peer, topic
-                        );
-                        if qos == 1 {
-                            let puback = SnPacket::PubAck {
-                                topic_id,
-                                msg_id,
-                                return_code: 0x03, // Rejected: Not supported / unauthorized
-                            };
-                            let mut buf = BytesMut::new();
-                            puback.encode(&mut buf);
-                            let _ = outbound.send((peer, buf)).await;
-                        }
-                        return;
-                    }
-
-                    debug!(
-                        "MQTT-SN PUBLISH from {} on topic '{}' (qos: {}, len: {})",
-                        peer,
-                        topic,
-                        qos,
-                        data.len()
-                    );
-
-                    let qos_mapped = match qos {
-                        1 => QoS::AtLeastOnce,
-                        2 => QoS::ExactlyOnce,
-                        _ => QoS::AtMostOnce,
-                    };
-
-                    // OASIS MQTT-SN v1.2 §5.4.10: Deduplicate re-transmitted QoS 2 publishes
-                    if qos == 2 {
-                        let is_dup = {
-                            let mut lock = self.sessions.write().await;
-                            if let Some(session) = lock.get_mut(&peer) {
-                                !session.inflight_qos2_msg_ids.insert(msg_id)
-                            } else {
-                                false
-                            }
-                        };
-
-                        if is_dup {
-                            debug!(
-                                "Duplicate QoS 2 packet #{} from SN peer {}; acknowledging with PUBREC without re-dispatching",
-                                msg_id, peer
-                            );
-                            let pubrec = SnPacket::PubRec { msg_id };
-                            let mut buf = BytesMut::new();
-                            pubrec.encode(&mut buf);
-                            let _ = outbound.send((peer, buf)).await;
-                            return;
-                        }
-                    }
-
-                    let pub_pkt = PublishPacket {
-                        topic: topic.clone(),
-                        qos: qos_mapped,
-                        retain,
-                        dup,
-                        packet_id: if qos > 0 { Some(msg_id) } else { None },
-                        payload: data.clone(),
-                    };
-
-                    dispatch_publish(&self.context, pub_pkt).await;
-
-                    // QoS 1 Acknowledgment
-                    if qos == 1 {
-                        let puback = SnPacket::PubAck {
-                            topic_id,
-                            msg_id,
-                            return_code: 0x00,
-                        };
-                        let mut buf = BytesMut::new();
-                        puback.encode(&mut buf);
-                        let _ = outbound.send((peer, buf)).await;
-                    } else if qos == 2 {
-                        // OASIS MQTT-SN v1.2 §5.4.10: QoS 2 Handshake step 1 - Gateway sends PubRec
-                        let pubrec = SnPacket::PubRec { msg_id };
-                        let mut buf = BytesMut::new();
-                        pubrec.encode(&mut buf);
-                        let _ = outbound.send((peer, buf)).await;
-                    }
-                } else {
-                    warn!(
-                        "MQTT-SN PUBLISH rejected from {}: unknown topic_id {} (type: {:?})",
-                        peer, topic_id, topic_id_type
-                    );
-                    if qos == 1 {
-                        let puback = SnPacket::PubAck {
-                            topic_id,
-                            msg_id,
-                            return_code: 0x02, // Rejected-Invalid-Topic-ID
-                        };
-                        let mut buf = BytesMut::new();
-                        puback.encode(&mut buf);
-                        let _ = outbound.send((peer, buf)).await;
-                    }
+                if done {
+                    self.after_progress(&link).await;
                 }
             }
-
+            SnPacket::PubRec { msg_id } => {
+                let Some(link) = link else {
+                    return;
+                };
+                let rel = {
+                    let mut st = link.st();
+                    match st.inflight.as_mut() {
+                        Some(i)
+                            if i.msg_id == msg_id
+                                && matches!(
+                                    i.kind,
+                                    InflightKind::Publish { qos: 2 } | InflightKind::PubRel
+                                ) =>
+                        {
+                            i.kind = InflightKind::PubRel;
+                            i.packet = SnPacket::PubRel { msg_id };
+                            i.sent_at = Instant::now();
+                            i.retries = 0;
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if rel {
+                    self.send(&key, &SnPacket::PubRel { msg_id }).await;
+                }
+            }
+            SnPacket::PubComp { msg_id } => {
+                let Some(link) = link else { return };
+                let done = {
+                    let mut st = link.st();
+                    let hit = matches!(&st.inflight, Some(i) if i.msg_id == msg_id && matches!(i.kind, InflightKind::PubRel));
+                    if hit {
+                        st.inflight = None;
+                    }
+                    hit
+                };
+                if done {
+                    self.after_progress(&link).await;
+                }
+            }
+            SnPacket::PubRel { msg_id } => {
+                if let Some(link) = &link {
+                    link.session.state().inbound_qos2.remove(&msg_id);
+                }
+                self.send(&key, &SnPacket::PubComp { msg_id }).await;
+            }
             SnPacket::Subscribe {
                 qos,
                 topic_id_type,
+                msg_id,
                 topic_id,
                 topic_name,
-                msg_id,
                 ..
             } => {
-                // Guard: must have a valid authenticated session (CONNECT received)
-                let session_info = {
-                    let lock = self.sessions.read().await;
-                    lock.get(&peer).map(|s| {
-                        (
-                            s.is_authenticated,
-                            s.user.clone(),
-                            s.client_id_str.clone(),
-                            s.internal_id,
-                        )
-                    })
-                };
-                let (is_auth, user_opt, client_id_str, internal_id) = match session_info {
-                    Some(info) => info,
-                    None => {
-                        warn!(
-                            "MQTT-SN SUBSCRIBE from {} without session (no CONNECT); ignoring",
-                            peer
-                        );
-                        let suback = SnPacket::SubAck {
-                            qos,
-                            topic_id: 0,
-                            msg_id,
-                            return_code: 0x03,
-                        };
-                        let mut buf = BytesMut::new();
-                        suback.encode(&mut buf);
-                        let _ = outbound.send((peer, buf)).await;
-                        return;
-                    }
-                };
-                if !is_auth {
-                    warn!("MQTT-SN SUBSCRIBE from {} without CONNECT; ignoring", peer);
-                    let suback = SnPacket::SubAck {
-                        qos,
-                        topic_id: 0,
-                        msg_id,
-                        return_code: 0x03,
-                    };
-                    let mut buf = BytesMut::new();
-                    suback.encode(&mut buf);
-                    let _ = outbound.send((peer, buf)).await;
-                    return;
-                }
-
-                let resolved_topic = match topic_id_type {
-                    TopicIdType::Normal => topic_name,
-                    TopicIdType::Predefined => self.predefined_id_to_name.get(&topic_id).cloned(),
-                    TopicIdType::Short => {
-                        let bytes = topic_id.to_be_bytes();
-                        if bytes.iter().any(|&b| b == b'+' || b == b'#') {
-                            warn!("MQTT-SN SUBSCRIBE rejected from {}: short topic ID contains wildcard byte", peer);
-                            let suback = SnPacket::SubAck {
-                                qos,
-                                topic_id: 0,
-                                msg_id,
-                                return_code: 0x02,
-                            };
-                            let mut buf = BytesMut::new();
-                            suback.encode(&mut buf);
-                            let _ = outbound.send((peer, buf)).await;
-                            return;
-                        }
-                        String::from_utf8(bytes.to_vec()).ok()
-                    }
-                    _ => None,
-                };
-
-                if let Some(topic) = resolved_topic {
-                    // ACL: Check subscribe authorization
-                    let acl_allowed = if let Some(ref user) = user_opt {
-                        self.context
-                            .acl
-                            .check_subscribe(user.as_ref(), &client_id_str, &topic)
-                    } else {
-                        false
-                    };
-                    if !acl_allowed {
-                        warn!(
-                            "MQTT-SN SUBSCRIBE denied for client '{}' ({}): topic '{}'",
-                            client_id_str, peer, topic
-                        );
-                        let suback = SnPacket::SubAck {
-                            qos,
-                            topic_id: 0,
-                            msg_id,
-                            return_code: 0x03,
-                        };
-                        let mut buf = BytesMut::new();
-                        suback.encode(&mut buf);
-                        let _ = outbound.send((peer, buf)).await;
-                        return;
-                    }
-
-                    let mut assigned_id = topic_id;
-
-                    {
-                        let mut lock = self.sessions.write().await;
-                        if let Some(session) = lock.get_mut(&peer) {
-                            if topic_id_type == TopicIdType::Normal {
-                                assigned_id = session.register_topic(&topic);
-                            }
-                            session.subscribed_topics.push(topic.clone());
-                        }
-                    }
-
-                    // Register client channel in central context (reuse existing if present)
-                    let (tx, mut rx) = mpsc::channel::<Bytes>(1024);
-                    {
-                        let mut clients_guard = self.context.clients.write().await;
-                        clients_guard.insert(internal_id, tx);
-                    }
-
-                    {
-                        let mut router_guard = self.context.router.write().await;
-                        let _ = router_guard.subscribe(&topic, internal_id);
-                    }
-
-                    // Spawn forwarder task for this UDP subscriber
-                    let forward_outbound = outbound.clone();
-                    let forward_predefined = Arc::clone(&self.predefined_name_to_id);
-                    let forward_sessions = Arc::clone(&self.sessions);
-                    let target_peer = peer;
-
-                    tokio::spawn(async move {
-                        while let Some(raw_mqtt_bytes) = rx.recv().await {
-                            let mut slice = &raw_mqtt_bytes[..];
-                            if let Ok(MqttPacket::Publish(p)) = MqttPacket::decode(&mut slice) {
-                                // Find topic id for this topic
-                                let (tid_type, tid) = if let Some(&pid) =
-                                    forward_predefined.get(&p.topic)
-                                {
-                                    (TopicIdType::Predefined, pid)
-                                } else if p.topic.len() == 2 {
-                                    let bytes = p.topic.as_bytes();
-                                    let short_id = u16::from_be_bytes([bytes[0], bytes[1]]);
-                                    (TopicIdType::Short, short_id)
-                                } else {
-                                    let mut lock = forward_sessions.write().await;
-                                    if let Some(s) = lock.get_mut(&target_peer) {
-                                        if let Some(&nid) = s.name_to_topic_id.get(&p.topic) {
-                                            (TopicIdType::Normal, nid)
-                                        } else {
-                                            let nid = s.register_topic(&p.topic);
-                                            // Dynamic registration per OASIS MQTT-SN v1.2 §5.4.8
-                                            let reg_pkt = SnPacket::Register {
-                                                topic_id: nid,
-                                                msg_id: 0,
-                                                topic_name: p.topic.clone(),
-                                            };
-                                            let mut reg_buf = BytesMut::new();
-                                            reg_pkt.encode(&mut reg_buf);
-                                            let _ =
-                                                forward_outbound.send((target_peer, reg_buf)).await;
-                                            (TopicIdType::Normal, nid)
-                                        }
-                                    } else {
-                                        // Session gone; forwarder task should exit
-                                        break;
-                                    }
-                                };
-
-                                let fwd_pkt = SnPacket::Publish {
-                                    dup: p.dup,
-                                    qos: p.qos as i8,
-                                    retain: p.retain,
-                                    topic_id_type: tid_type,
-                                    topic_id: tid,
-                                    msg_id: p.packet_id.unwrap_or(0),
-                                    data: p.payload,
-                                };
-
-                                let mut buf = BytesMut::new();
-                                fwd_pkt.encode(&mut buf);
-
-                                let is_asleep = {
-                                    let lock = forward_sessions.read().await;
-                                    lock.get(&target_peer).map(|s| s.asleep).unwrap_or(false)
-                                };
-
-                                if is_asleep {
-                                    let mut lock = forward_sessions.write().await;
-                                    if let Some(s) = lock.get_mut(&target_peer) {
-                                        // Cap sleeping buffer to prevent memory exhaustion
-                                        if s.buffered_messages.len() < MAX_SLEEPING_BUFFER {
-                                            s.buffered_messages.push(buf);
-                                        } else {
-                                            debug!(
-                                                "Sleeping buffer full ({} msgs) for MQTT-SN peer {}; dropping oldest",
-                                                MAX_SLEEPING_BUFFER, target_peer
-                                            );
-                                            s.buffered_messages.remove(0);
-                                            s.buffered_messages.push(buf);
-                                        }
-                                    }
-                                } else if forward_outbound.send((target_peer, buf)).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    });
-
-                    let suback = SnPacket::SubAck {
-                        qos,
-                        topic_id: assigned_id,
-                        msg_id,
-                        return_code: 0x00,
-                    };
-                    let mut buf = BytesMut::new();
-                    suback.encode(&mut buf);
-                    let _ = outbound.send((peer, buf)).await;
-                } else {
-                    let suback = SnPacket::SubAck {
-                        qos,
-                        topic_id: 0,
-                        msg_id,
-                        return_code: 0x02, // Rejected-Invalid-Topic-ID
-                    };
-                    let mut buf = BytesMut::new();
-                    suback.encode(&mut buf);
-                    let _ = outbound.send((peer, buf)).await;
-                }
+                self.on_subscribe(key, link, qos, topic_id_type, msg_id, topic_id, topic_name)
+                    .await
             }
-
-            SnPacket::PubRel { msg_id } => {
-                // OASIS MQTT-SN v1.2 §5.4.12: QoS 2 Handshake step 2 - Gateway responds with PubComp
-                {
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.get_mut(&peer) {
-                        session.inflight_qos2_msg_ids.remove(&msg_id);
-                    }
-                }
-                let pubcomp = SnPacket::PubComp { msg_id };
-                let mut buf = BytesMut::new();
-                pubcomp.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
-            }
-
-            SnPacket::PubRec { msg_id } => {
-                let pubrel = SnPacket::PubRel { msg_id };
-                let mut buf = BytesMut::new();
-                pubrel.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
-            }
-
             SnPacket::Unsubscribe {
                 topic_id_type,
                 msg_id,
                 topic_id,
                 topic_name,
             } => {
-                let resolved_topic = match topic_id_type {
-                    TopicIdType::Normal => topic_name,
-                    TopicIdType::Predefined => self.predefined_id_to_name.get(&topic_id).cloned(),
-                    TopicIdType::Short => {
-                        let bytes = topic_id.to_be_bytes();
-                        Some(String::from_utf8_lossy(&bytes).to_string())
-                    }
-                    _ => None,
-                };
-
-                if let Some(topic) = resolved_topic {
-                    let mut internal_id = None;
-                    {
-                        let mut lock = self.sessions.write().await;
-                        if let Some(session) = lock.get_mut(&peer) {
-                            session.subscribed_topics.retain(|t| t != &topic);
-                            internal_id = Some(session.internal_id);
-                        }
-                    }
-                    if let Some(id) = internal_id {
-                        let mut router_guard = self.context.router.write().await;
-                        let _ = router_guard.unsubscribe(&topic, &id);
-                    }
-                }
-
-                let unsuback = SnPacket::UnsubAck { msg_id };
-                let mut buf = BytesMut::new();
-                unsuback.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
-            }
-
-            SnPacket::PingReq { client_id } => {
-                let buffered = {
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.get_mut(&peer) {
-                        session.last_seen = Instant::now();
-                        if client_id.is_some() {
-                            // OASIS MQTT-SN v1.2 §5.4.18 & §5.4.20: Sleeping client wakes up
-                            session.asleep = false;
-                        }
-                        std::mem::take(&mut session.buffered_messages)
-                    } else {
-                        Vec::new()
-                    }
-                };
-
-                // Flush buffered messages to awakening sleeping client
-                for msg in buffered {
-                    let _ = outbound.send((peer, msg)).await;
-                }
-
-                let mut buf = BytesMut::new();
-                SnPacket::PingResp.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
-            }
-
-            SnPacket::Disconnect { duration } => {
-                if duration.is_none() {
-                    // Permanent disconnect: clean up session, client channel, AND router subscriptions
-                    let cleanup = {
-                        let mut lock = self.sessions.write().await;
-                        lock.remove(&peer)
-                            .map(|s| (s.internal_id, s.subscribed_topics))
+                if let Some(link) = &link {
+                    let filter = match topic_id_type {
+                        TopicIdType::Normal => topic_name,
+                        other => self.resolve_topic(Some(link), other, topic_id),
                     };
-                    if let Some((id, subscribed_topics)) = cleanup {
-                        // Remove from active clients map
-                        {
-                            let mut clients_guard = self.context.clients.write().await;
-                            clients_guard.remove(&id);
-                        }
-                        // CRITICAL: Also remove all router subscriptions to prevent trie leaks
-                        {
-                            let mut router_guard = self.context.router.write().await;
-                            for topic in &subscribed_topics {
-                                router_guard.unsubscribe(topic, &id);
-                            }
-                        }
+                    if let Some(f) = filter {
+                        self.ctx.unsubscribe(link.session.id, &f);
                     }
+                }
+                self.send(&key, &SnPacket::UnsubAck { msg_id }).await;
+            }
+            SnPacket::PingReq { client_id } => {
+                let Some(link) = link else {
+                    // Unknown client: reply anyway so it can detect the gateway (§6.11).
+                    self.send(&key, &SnPacket::PingResp).await;
+                    return;
+                };
+                let woke = {
+                    let mut st = link.st();
+                    match st.mode {
+                        Mode::Asleep { duration } if client_id.is_some() => {
+                            st.mode = Mode::Awake { duration };
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if woke {
+                    link.session.queue.wake();
+                    self.after_progress(&link).await;
                 } else {
-                    // OASIS MQTT-SN v1.2 §5.4.20: Client enters Asleep state; retain session & subscriptions
-                    let mut lock = self.sessions.write().await;
-                    if let Some(session) = lock.get_mut(&peer) {
-                        session.last_seen = Instant::now();
-                        session.asleep = true;
+                    self.send(&key, &SnPacket::PingResp).await;
+                }
+            }
+            SnPacket::Disconnect { duration } => {
+                let Some(link) = link else {
+                    self.send(&key, &SnPacket::Disconnect { duration: None })
+                        .await;
+                    return;
+                };
+                match duration {
+                    Some(d) if d > 0 => {
+                        let mut st = link.st();
+                        st.mode = Mode::Asleep { duration: d };
+                        st.last_seen = Instant::now();
                     }
+                    _ => self.close_link(&link, false),
                 }
-                let mut buf = BytesMut::new();
-                SnPacket::Disconnect { duration: None }.encode(&mut buf);
-                let _ = outbound.send((peer, buf)).await;
+                self.send(&key, &SnPacket::Disconnect { duration: None })
+                    .await;
             }
-
-            SnPacket::EncapMsg {
-                ctrl: _,
-                wireless_node_id: _,
-                payload,
-            } => {
-                // OASIS MQTT-SN v1.2 §5.5: Forwarder Encapsulation unwrapping
-                let mut slice = &payload[..];
-                if let Ok(inner) = SnPacket::decode(&mut slice) {
-                    Box::pin(self.handle_packet(inner, peer, outbound)).await;
-                }
-            }
-
-            SnPacket::RegAck {
-                topic_id,
-                msg_id,
-                return_code,
-            } => {
-                debug!(
-                    "MQTT-SN REGACK from {} (topic_id: {}, msg_id: {}, rc: {})",
-                    peer, topic_id, msg_id, return_code
-                );
-            }
-
-            SnPacket::PubAck {
-                topic_id,
-                msg_id,
-                return_code,
-            } => {
-                debug!(
-                    "MQTT-SN PUBACK from {} (topic_id: {}, msg_id: {}, rc: {})",
-                    peer, topic_id, msg_id, return_code
-                );
-            }
-
-            SnPacket::PubComp { msg_id } => {
-                debug!("MQTT-SN PUBCOMP from {} (msg_id: {})", peer, msg_id);
-            }
-
-            _ => {}
+            SnPacket::PingResp
+            | SnPacket::Advertise { .. }
+            | SnPacket::GwInfo { .. }
+            | SnPacket::ConnAck { .. }
+            | SnPacket::WillTopicReq
+            | SnPacket::WillMsgReq
+            | SnPacket::SubAck { .. }
+            | SnPacket::UnsubAck { .. }
+            | SnPacket::WillTopicResp { .. }
+            | SnPacket::WillMsgResp { .. }
+            | SnPacket::EncapMsg { .. } => {}
         }
+    }
+
+    fn set_will(
+        &self,
+        link: &SnLink,
+        topic: String,
+        qos: QoS,
+        retain: bool,
+        payload: Bytes,
+    ) -> bool {
+        let user = link.session.user();
+        if !is_valid_topic_name(&topic)
+            || !self
+                .ctx
+                .acl
+                .check_publish(&user, &link.session.client_id, &topic)
+        {
+            warn!(
+                "MQTT-SN client '{}' Will topic '{}' rejected",
+                link.session.client_id, topic
+            );
+            return false;
+        }
+        let will = PublishPacket::new(topic, payload)
+            .with_qos(self.ctx.granted_qos(qos), None)
+            .with_retain(retain && self.ctx.options.allow_retained_messages);
+        link.st().will = Some(will);
+        true
+    }
+
+    async fn on_connect(
+        self: &Arc<Self>,
+        key: LinkKey,
+        existing: Option<Arc<SnLink>>,
+        will: bool,
+        clean_session: bool,
+        duration: u16,
+        client_id: String,
+    ) {
+        let reject = |rc: u8| SnPacket::ConnAck { return_code: rc };
+        if client_id.is_empty() || client_id.len() > MAX_SN_CLIENT_ID_LEN * 4 {
+            self.send(&key, &reject(return_code::REJECTED_NOT_SUPPORTED))
+                .await;
+            return;
+        }
+        if let Some(old) = existing {
+            // A client that reconnects from the same address replaces its previous link.
+            self.close_link(&old, false);
+        }
+        if self.links().len() >= self.config.max_sessions {
+            warn!("MQTT-SN session limit reached; rejecting '{}'", client_id);
+            self.send(&key, &reject(return_code::REJECTED_CONGESTION))
+                .await;
+            return;
+        }
+        let Some(user) = self.identity().await else {
+            warn!(
+                "MQTT-SN CONNECT from '{}' rejected: no acl_user configured and anonymous access disabled",
+                client_id
+            );
+            self.send(&key, &reject(return_code::REJECTED_NOT_SUPPORTED))
+                .await;
+            return;
+        };
+        let expiry = self.ctx.session_expiry_for(None, clean_session, false);
+        let opened = match self
+            .ctx
+            .open_session(&client_id, user, clean_session, expiry, Transport::MqttSn)
+            .await
+        {
+            Ok(o) => o,
+            Err(OpenError::ClientIdInUse) | Err(OpenError::Busy) => {
+                self.send(&key, &reject(return_code::REJECTED_CONGESTION))
+                    .await;
+                return;
+            }
+        };
+        let link = Arc::new(SnLink {
+            key: key.clone(),
+            session: Arc::clone(&opened.session),
+            epoch: opened.epoch,
+            closed: AtomicBool::new(false),
+            wake: Notify::new(),
+            st: Mutex::new(LinkState {
+                keep_alive: duration,
+                last_seen: Instant::now(),
+                mode: if will { Mode::WillSetup } else { Mode::Active },
+                will_topic: None,
+                will: None,
+                topics_by_id: HashMap::new(),
+                topics_by_name: HashMap::new(),
+                next_topic_id: 1,
+                next_msg_id: 1,
+                inflight: None,
+                release: Some(opened.release),
+            }),
+        });
+        self.links().insert(key.clone(), Arc::clone(&link));
+        let fw = Arc::clone(self);
+        let fw_link = Arc::clone(&link);
+        tokio::spawn(async move { fw.forwarder(fw_link, opened.kick).await });
+
+        debug!(
+            "MQTT-SN client '{}' connected from {} (will: {}, keep alive: {}s)",
+            client_id, key.addr, will, duration
+        );
+        if will {
+            self.send(&key, &SnPacket::WillTopicReq).await;
+        } else {
+            self.send(
+                &key,
+                &SnPacket::ConnAck {
+                    return_code: return_code::ACCEPTED,
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn finish_connect(&self, link: &Arc<SnLink>, ok: bool) {
+        if !ok {
+            self.send(
+                &link.key,
+                &SnPacket::ConnAck {
+                    return_code: return_code::REJECTED_NOT_SUPPORTED,
+                },
+            )
+            .await;
+            self.close_link(link, false);
+            return;
+        }
+        link.st().mode = Mode::Active;
+        link.session.queue.wake();
+        self.send(
+            &link.key,
+            &SnPacket::ConnAck {
+                return_code: return_code::ACCEPTED,
+            },
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn on_publish(
+        &self,
+        key: LinkKey,
+        link: Option<Arc<SnLink>>,
+        qos: i8,
+        retain: bool,
+        topic_id_type: TopicIdType,
+        topic_id: u16,
+        msg_id: u16,
+        data: Bytes,
+    ) {
+        let puback = |rc: u8| SnPacket::PubAck {
+            topic_id,
+            msg_id,
+            return_code: rc,
+        };
+
+        // QoS -1: connectionless publish with a predefined or short topic id (§6.8).
+        if qos < 0 {
+            if !self.config.allow_qos_minus1 || topic_id_type == TopicIdType::Normal {
+                return;
+            }
+            let (Some(topic), Some(user)) = (
+                self.resolve_topic(None, topic_id_type, topic_id),
+                self.identity().await,
+            ) else {
+                return;
+            };
+            if !self
+                .ctx
+                .acl
+                .check_publish(&user, &format!("sn-{}", key.addr.ip()), &topic)
+            {
+                debug!("QoS -1 publish to '{}' from {} denied", topic, key.addr);
+                return;
+            }
+            let retain = retain && self.ctx.options.allow_retained_messages;
+            self.ctx
+                .publish(None, PublishPacket::new(topic, data).with_retain(retain));
+            return;
+        }
+
+        let Some(link) = link.filter(|l| matches!(l.st().mode, Mode::Active | Mode::Awake { .. }))
+        else {
+            debug!("MQTT-SN PUBLISH from unconnected client {}", key.addr);
+            if qos > 0 {
+                self.send(&key, &puback(return_code::REJECTED_NOT_SUPPORTED))
+                    .await;
+            }
+            return;
+        };
+        let Some(topic) = self.resolve_topic(Some(&link), topic_id_type, topic_id) else {
+            if qos > 0 {
+                self.send(&key, &puback(return_code::REJECTED_INVALID_TOPIC_ID))
+                    .await;
+            }
+            return;
+        };
+        let user = link.session.user();
+        let qos = qos_from_sn(qos as u8);
+        if qos > self.ctx.options.maximum_qos
+            || !self
+                .ctx
+                .acl
+                .check_publish(&user, &link.session.client_id, &topic)
+        {
+            warn!(
+                "MQTT-SN publish by '{}' to '{}' denied",
+                link.session.client_id, topic
+            );
+            if qos != QoS::AtMostOnce {
+                self.send(&key, &puback(return_code::REJECTED_NOT_SUPPORTED))
+                    .await;
+            }
+            return;
+        }
+
+        if qos == QoS::ExactlyOnce {
+            // Duplicate of a message already accepted: acknowledge without redelivery (§6.7).
+            if !link.session.state().inbound_qos2.insert(msg_id) {
+                self.send(&key, &SnPacket::PubRec { msg_id }).await;
+                return;
+            }
+        }
+        let retain = retain && self.ctx.options.allow_retained_messages;
+        let msg = PublishPacket::new(topic, data)
+            .with_retain(retain)
+            .with_qos(qos, None);
+        self.ctx.publish(Some(link.session.id), msg);
+        match qos {
+            QoS::AtLeastOnce => self.send(&key, &puback(return_code::ACCEPTED)).await,
+            QoS::ExactlyOnce => self.send(&key, &SnPacket::PubRec { msg_id }).await,
+            QoS::AtMostOnce => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn on_subscribe(
+        &self,
+        key: LinkKey,
+        link: Option<Arc<SnLink>>,
+        qos: u8,
+        topic_id_type: TopicIdType,
+        msg_id: u16,
+        topic_id: u16,
+        topic_name: Option<String>,
+    ) {
+        let suback = |rc: u8, tid: u16, q: u8| SnPacket::SubAck {
+            qos: q,
+            topic_id: tid,
+            msg_id,
+            return_code: rc,
+        };
+        let Some(link) = link.filter(|l| matches!(l.st().mode, Mode::Active | Mode::Awake { .. }))
+        else {
+            self.send(&key, &suback(return_code::REJECTED_NOT_SUPPORTED, 0, 0))
+                .await;
+            return;
+        };
+        let filter = match topic_id_type {
+            TopicIdType::Normal => topic_name,
+            other => self.resolve_topic(Some(&link), other, topic_id),
+        };
+        let Some(filter) = filter.filter(|f| crate::routing::validate_topic_filter(f).is_ok())
+        else {
+            self.send(&key, &suback(return_code::REJECTED_INVALID_TOPIC_ID, 0, 0))
+                .await;
+            return;
+        };
+        let wildcard = has_wildcards(&filter);
+        let user = link.session.user();
+        if (wildcard && !self.ctx.options.allow_wildcard_subscriptions)
+            || !self
+                .ctx
+                .acl
+                .check_subscribe(&user, &link.session.client_id, &filter)
+        {
+            warn!(
+                "MQTT-SN subscription of '{}' to '{}' denied",
+                link.session.client_id, filter
+            );
+            self.send(&key, &suback(return_code::REJECTED_NOT_SUPPORTED, 0, 0))
+                .await;
+            return;
+        }
+        let sub = Subscription::new(SubscriptionOptions::new(
+            self.ctx.granted_qos(qos_from_sn(qos)),
+        ));
+        if self.ctx.subscribe(link.session.id, &filter, sub).is_err() {
+            self.send(&key, &suback(return_code::REJECTED_INVALID_TOPIC_ID, 0, 0))
+                .await;
+            return;
+        }
+        // Topic id returned in SUBACK (§5.4.16): assigned id for a plain topic name, 0 for a
+        // wildcard filter, the request's id for predefined topics.
+        let returned_id = match topic_id_type {
+            TopicIdType::Normal if !wildcard => link.st().topic_id(&filter, true).unwrap_or(0),
+            TopicIdType::Predefined => topic_id,
+            _ => 0,
+        };
+        self.send(
+            &key,
+            &suback(return_code::ACCEPTED, returned_id, sub.options.qos as u8),
+        )
+        .await;
+        self.ctx.deliver_retained(&link.session, &filter, &sub);
+    }
+
+    /// Called whenever inflight state frees up: lets the forwarder continue and completes the
+    /// awake cycle of a sleeping client once its buffer is drained.
+    async fn after_progress(&self, link: &Arc<SnLink>) {
+        let finish_awake = {
+            let mut st = link.st();
+            match st.mode {
+                Mode::Awake { duration }
+                    if st.inflight.is_none() && link.session.queue.queued_messages() == 0 =>
+                {
+                    st.mode = Mode::Asleep { duration };
+                    true
+                }
+                _ => false,
+            }
+        };
+        if finish_awake {
+            self.send(&link.key, &SnPacket::PingResp).await;
+        }
+        link.session.queue.wake();
+        link.wake.notify_one();
+    }
+
+    /// Drains the session queue to one MQTT-SN client.
+    async fn forwarder(self: Arc<Self>, link: Arc<SnLink>, mut kick: oneshot::Receiver<u8>) {
+        loop {
+            if link.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let item = tokio::select! {
+                biased;
+                _ = &mut kick => {
+                    self.close_link(&link, true);
+                    return;
+                }
+                _ = link.wake.notified() => continue,
+                item = link.session.queue.pop(|| link.can_send()) => item,
+            };
+            match item {
+                None => {
+                    // The session was discarded (e.g. taken over with clean start).
+                    self.close_link(&link, false);
+                    return;
+                }
+                Some(Outbound::Control(_)) => {}
+                Some(Outbound::Publish(d)) => {
+                    self.deliver(&link, d).await;
+                    self.after_progress(&link).await;
+                }
+            }
+        }
+    }
+
+    async fn deliver(&self, link: &Arc<SnLink>, d: Delivery) {
+        if d.is_expired(Instant::now()) {
+            return;
+        }
+        let topic = d.publish.topic.clone();
+        if let Some(&id) = self.predef_by_name.get(&topic) {
+            return self
+                .publish_to_client(link, d, TopicIdType::Predefined, id)
+                .await;
+        }
+        if topic.len() == 2 {
+            let b = topic.as_bytes();
+            return self
+                .publish_to_client(
+                    link,
+                    d,
+                    TopicIdType::Short,
+                    u16::from_be_bytes([b[0], b[1]]),
+                )
+                .await;
+        }
+        let register = {
+            let mut st = link.st();
+            if let Some(id) = st.topics_by_name.get(&topic).copied() {
+                Err(id)
+            } else {
+                match st.topic_id(&topic, true) {
+                    Some(topic_id) => {
+                        let msg_id = st.next_msg_id();
+                        let packet = SnPacket::Register {
+                            topic_id,
+                            msg_id,
+                            topic_name: topic.clone(),
+                        };
+                        st.inflight = Some(Inflight {
+                            msg_id,
+                            packet: packet.clone(),
+                            kind: InflightKind::Register {
+                                topic_id,
+                                then: Box::new(d.clone()),
+                            },
+                            sent_at: Instant::now(),
+                            retries: 0,
+                        });
+                        Ok(Some(packet))
+                    }
+                    None => Ok(None),
+                }
+            }
+        };
+        match register {
+            Err(id) => {
+                self.publish_to_client(link, d, TopicIdType::Normal, id)
+                    .await
+            }
+            Ok(Some(packet)) => self.send(&link.key, &packet).await,
+            Ok(None) => warn!(
+                "MQTT-SN client '{}' has too many topics; message dropped",
+                link.session.client_id
+            ),
+        }
+    }
+
+    async fn publish_to_client(
+        &self,
+        link: &Arc<SnLink>,
+        d: Delivery,
+        id_type: TopicIdType,
+        topic_id: u16,
+    ) {
+        let qos = d.publish.qos as i8;
+        let packet = {
+            let mut st = link.st();
+            let msg_id = if qos > 0 { st.next_msg_id() } else { 0 };
+            let packet = SnPacket::Publish {
+                dup: false,
+                qos,
+                retain: d.publish.retain,
+                topic_id_type: id_type,
+                topic_id,
+                msg_id,
+                data: d.publish.payload.clone(),
+            };
+            if qos > 0 {
+                st.inflight = Some(Inflight {
+                    msg_id,
+                    packet: packet.clone(),
+                    kind: InflightKind::Publish { qos },
+                    sent_at: Instant::now(),
+                    retries: 0,
+                });
+            }
+            packet
+        };
+        let mut probe = BytesMut::new();
+        if packet.encode(&mut probe).is_err() {
+            warn!(
+                "Message on '{}' too large for MQTT-SN; dropped",
+                d.publish.topic
+            );
+            link.st().inflight = None;
+            return;
+        }
+        self.ctx
+            .metrics
+            .messages_sent
+            .fetch_add(1, Ordering::Relaxed);
+        self.send(&link.key, &packet).await;
+    }
+}
+
+impl std::fmt::Debug for Gateway {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gateway")
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> LinkState {
+        LinkState {
+            keep_alive: 0,
+            last_seen: Instant::now(),
+            mode: Mode::Active,
+            will_topic: None,
+            will: None,
+            topics_by_id: HashMap::new(),
+            topics_by_name: HashMap::new(),
+            next_topic_id: 0xFFFE,
+            next_msg_id: u16::MAX,
+            inflight: None,
+            release: None,
+        }
+    }
+
+    #[test]
+    fn topic_ids_skip_reserved_values() {
+        let mut st = state();
+        assert_eq!(st.topic_id("a", true), Some(0xFFFE));
+        // 0xFFFF and 0x0000 are reserved.
+        assert_eq!(st.topic_id("b", true), Some(1));
+        assert_eq!(st.topic_id("a", false), Some(0xFFFE));
+        assert_eq!(st.topic_id("c", false), None);
+    }
+
+    #[test]
+    fn msg_ids_never_wrap_to_zero() {
+        let mut st = state();
+        assert_eq!(st.next_msg_id(), u16::MAX);
+        assert_eq!(st.next_msg_id(), 1);
     }
 }

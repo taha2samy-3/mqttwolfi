@@ -1,14 +1,16 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use wolf_mqtt::auth::AclEngine;
+use wolf_mqtt::broker::BrokerContext;
 use wolf_mqtt::protocol::sn::{SnPacket, TopicIdType};
 use wolf_mqtt::protocol::{
     decode_variable_byte_integer, encode_variable_byte_integer, ConnectPacket, MqttPacket,
-    ProtocolVersion, PublishPacket, QoS,
+    ProtocolVersion, PublishPacket, QoS, SubscriptionOptions,
 };
 use wolf_mqtt::routing::retained::RetainedStore;
 use wolf_mqtt::routing::TopicTrie;
@@ -55,7 +57,7 @@ fn bench_vbi_codec() {
     let encode_ops_sec = (iterations as f64) / encode_duration.as_secs_f64();
     let encode_ns_op = (encode_duration.as_nanos() as f64) / (iterations as f64);
 
-    let mut read_slice = &buf[..];
+    let mut read_slice = buf.clone();
     let start_decode = Instant::now();
     for _ in 0..iterations {
         let decoded = decode_variable_byte_integer(&mut read_slice);
@@ -105,22 +107,25 @@ fn bench_payload_size_scaling() {
             dup: false,
             packet_id: None,
             payload: bytes_payload.clone(),
+            properties: Default::default(),
         });
 
         // Encode benchmark
         let mut buf = BytesMut::with_capacity(count * (size + 32));
         let start_enc = Instant::now();
         for _ in 0..count {
-            let _ = pub_pkt.encode(&mut buf);
+            let _ = pub_pkt.encode(ProtocolVersion::V500, &mut buf);
         }
         let enc_dur = start_enc.elapsed();
         let enc_pkts_sec = (count as f64) / enc_dur.as_secs_f64();
 
         // Decode benchmark
-        let mut read_slice = &buf[..];
+        let mut read_slice = buf.clone();
         let start_dec = Instant::now();
         for _ in 0..count {
-            let _ = MqttPacket::decode(&mut read_slice).unwrap();
+            let _ = MqttPacket::decode_from(&mut read_slice, ProtocolVersion::V500, usize::MAX)
+                .unwrap()
+                .unwrap();
         }
         let dec_dur = start_dec.elapsed();
         let dec_pkts_sec = (count as f64) / dec_dur.as_secs_f64();
@@ -268,6 +273,7 @@ fn bench_all_packet_codecs_diversity() {
         dup: false,
         packet_id: None,
         payload: Bytes::from_static(b"DISCONNECTED_ABNORMALLY"),
+        properties: Default::default(),
     };
     let connect_pkt = MqttPacket::Connect(ConnectPacket {
         version: ProtocolVersion::V500,
@@ -277,31 +283,41 @@ fn bench_all_packet_codecs_diversity() {
         will: Some(will),
         username: None,
         password: None,
+        properties: Default::default(),
     });
 
     // 2. Subscribe Packet with 4 Topics
-    let sub_pkt = MqttPacket::Subscribe {
-        packet_id: 42,
-        topics: vec![
-            ("sensors/temp/#".into(), QoS::AtLeastOnce),
-            ("telemetry/voltage".into(), QoS::AtMostOnce),
-            ("alerts/+/critical".into(), QoS::AtLeastOnce),
-            ("system/heartbeat".into(), QoS::AtMostOnce),
+    let sub_pkt = MqttPacket::subscribe(
+        42,
+        vec![
+            (
+                "sensors/temp/#".into(),
+                SubscriptionOptions::new(QoS::AtLeastOnce),
+            ),
+            (
+                "telemetry/voltage".into(),
+                SubscriptionOptions::new(QoS::AtMostOnce),
+            ),
+            (
+                "alerts/+/critical".into(),
+                SubscriptionOptions::new(QoS::AtLeastOnce),
+            ),
+            (
+                "system/heartbeat".into(),
+                SubscriptionOptions::new(QoS::AtMostOnce),
+            ),
         ],
-    };
+    );
 
     // 3. ConnAck
-    let connack_pkt = MqttPacket::ConnAck {
-        session_present: true,
-        reason_code: 0x00,
-    };
+    let connack_pkt = MqttPacket::connack(true, 0x00);
 
     // 4. PingReq & PingResp
     let pingreq_pkt = MqttPacket::PingReq;
     let pingresp_pkt = MqttPacket::PingResp;
 
     // 5. PubAck
-    let puback_pkt = MqttPacket::PubAck { packet_id: 888 };
+    let puback_pkt = MqttPacket::puback(888);
 
     let packets = [
         ("Connect (with LWT)", connect_pkt),
@@ -322,15 +338,17 @@ fn bench_all_packet_codecs_diversity() {
         let mut buf = BytesMut::with_capacity(iterations * 128);
         let start_enc = Instant::now();
         for _ in 0..iterations {
-            pkt.encode(&mut buf).unwrap();
+            pkt.encode(ProtocolVersion::V500, &mut buf).unwrap();
         }
         let enc_dur = start_enc.elapsed();
         let enc_speed = (iterations as f64) / enc_dur.as_secs_f64();
 
-        let mut read_slice = &buf[..];
+        let mut read_slice = buf.clone();
         let start_dec = Instant::now();
         for _ in 0..iterations {
-            let _ = MqttPacket::decode(&mut read_slice).unwrap();
+            let _ = MqttPacket::decode_from(&mut read_slice, ProtocolVersion::V500, usize::MAX)
+                .unwrap()
+                .unwrap();
         }
         let dec_dur = start_dec.elapsed();
         let dec_speed = (iterations as f64) / dec_dur.as_secs_f64();
@@ -354,21 +372,24 @@ fn bench_packet_serialization() {
         dup: false,
         packet_id: Some(1024),
         payload: payload.clone(),
+        properties: Default::default(),
     });
 
     let mut buf = BytesMut::with_capacity(iterations * 64);
     let start_encode = Instant::now();
     for _ in 0..iterations {
-        pub_pkt.encode(&mut buf).unwrap();
+        pub_pkt.encode(ProtocolVersion::V500, &mut buf).unwrap();
     }
     let encode_duration = start_encode.elapsed();
     let encode_ops_sec = (iterations as f64) / encode_duration.as_secs_f64();
     let encode_ns_op = (encode_duration.as_nanos() as f64) / (iterations as f64);
 
-    let mut read_slice = &buf[..];
+    let mut read_slice = buf.clone();
     let start_decode = Instant::now();
     for _ in 0..iterations {
-        let _ = MqttPacket::decode(&mut read_slice).unwrap();
+        let _ = MqttPacket::decode_from(&mut read_slice, ProtocolVersion::V500, usize::MAX)
+            .unwrap()
+            .unwrap();
     }
     let decode_duration = start_decode.elapsed();
     let decode_ops_sec = (iterations as f64) / decode_duration.as_secs_f64();
@@ -437,8 +458,9 @@ fn bench_retained_store() {
             dup: false,
             packet_id: None,
             payload: Bytes::from_static(b"ACTIVE_ONLINE"),
+            properties: Default::default(),
         };
-        store.update(packet);
+        store.update(packet, None);
     }
     let insert_dur = start_insert.elapsed();
     let insert_ops_sec = (iterations as f64) / insert_dur.as_secs_f64();
@@ -556,7 +578,8 @@ fn bench_live_tcp_loopback_throughput() {
         .unwrap();
 
     rt.block_on(async {
-        let server = BrokerServer::bind("127.0.0.1:0").await.unwrap();
+        let ctx = BrokerContext::new(Arc::new(AclEngine::new(true)));
+        let server = BrokerServer::bind("127.0.0.1:0", ctx).await.unwrap();
         let addr = server.local_addr().unwrap();
 
         tokio::spawn(async move {
@@ -575,20 +598,24 @@ fn bench_live_tcp_loopback_throughput() {
             will: None,
             username: None,
             password: None,
+            properties: Default::default(),
         });
         let mut enc = BytesMut::new();
-        conn_pkt.encode(&mut enc).unwrap();
+        conn_pkt.encode(ProtocolVersion::V500, &mut enc).unwrap();
         sub_stream.write_all(&enc).await.unwrap();
 
         let _ = read_next_packet(&mut sub_stream, &mut sub_buf).await;
 
         // Subscribe to "network/bench"
-        let sub_pkt = MqttPacket::Subscribe {
-            packet_id: 1,
-            topics: vec![("network/bench".into(), QoS::AtMostOnce)],
-        };
+        let sub_pkt = MqttPacket::subscribe(
+            1,
+            vec![(
+                "network/bench".into(),
+                SubscriptionOptions::new(QoS::AtMostOnce),
+            )],
+        );
         enc.clear();
-        sub_pkt.encode(&mut enc).unwrap();
+        sub_pkt.encode(ProtocolVersion::V500, &mut enc).unwrap();
         sub_stream.write_all(&enc).await.unwrap();
         let _ = read_next_packet(&mut sub_stream, &mut sub_buf).await;
 
@@ -603,9 +630,10 @@ fn bench_live_tcp_loopback_throughput() {
             will: None,
             username: None,
             password: None,
+            properties: Default::default(),
         });
         enc.clear();
-        pub_conn.encode(&mut enc).unwrap();
+        pub_conn.encode(ProtocolVersion::V500, &mut enc).unwrap();
         pub_stream.write_all(&enc).await.unwrap();
         let _ = read_next_packet(&mut pub_stream, &mut pub_buf).await;
 
@@ -617,10 +645,13 @@ fn bench_live_tcp_loopback_throughput() {
             dup: false,
             packet_id: None,
             payload: Bytes::from_static(b"E2E_TCP_BENCHMARK_PAYLOAD"),
+            properties: Default::default(),
         });
 
         let mut out_msg_buf = BytesMut::new();
-        pub_packet.encode(&mut out_msg_buf).unwrap();
+        pub_packet
+            .encode(ProtocolVersion::V500, &mut out_msg_buf)
+            .unwrap();
         let frozen_msg = out_msg_buf.freeze();
 
         let start = Instant::now();
@@ -657,13 +688,9 @@ fn bench_live_tcp_loopback_throughput() {
 
 async fn read_next_packet(stream: &mut TcpStream, buf: &mut BytesMut) -> MqttPacket {
     loop {
-        if !buf.is_empty() {
-            let mut slice = &buf[..];
-            if let Ok(pkt) = MqttPacket::decode(&mut slice) {
-                let consumed = buf.len() - slice.len();
-                buf.advance(consumed);
-                return pkt;
-            }
+        if let Some(pkt) = MqttPacket::decode_from(buf, ProtocolVersion::V500, usize::MAX).unwrap()
+        {
+            return pkt;
         }
         let n = stream.read_buf(buf).await.expect("Socket read failed");
         assert!(n > 0, "Unexpected EOF during socket read");
@@ -688,18 +715,22 @@ fn bench_latency_percentiles() {
         dup: false,
         packet_id: Some(101),
         payload: Bytes::from_static(b"26.8"),
+        properties: Default::default(),
     });
 
     let mut encode_buf = BytesMut::with_capacity(128);
-    pub_pkt.encode(&mut encode_buf).unwrap();
+    pub_pkt
+        .encode(ProtocolVersion::V500, &mut encode_buf)
+        .unwrap();
     let frozen_bytes = encode_buf.freeze();
 
     for _ in 0..sample_count {
         let start = Instant::now();
 
         // 1. Packet Decode
-        let mut slice = &frozen_bytes[..];
-        let decoded = MqttPacket::decode(&mut slice).unwrap();
+        let (decoded, _) = MqttPacket::decode(&frozen_bytes, ProtocolVersion::V500, usize::MAX)
+            .unwrap()
+            .unwrap();
 
         // 2. Trie Route Lookup
         if let MqttPacket::Publish(ref p) = decoded {
@@ -708,7 +739,7 @@ fn bench_latency_percentiles() {
 
         // 3. Packet Re-encode (fanout preparation)
         let mut out_buf = BytesMut::with_capacity(64);
-        decoded.encode(&mut out_buf).unwrap();
+        decoded.encode(ProtocolVersion::V500, &mut out_buf).unwrap();
 
         let elapsed_ns = start.elapsed().as_nanos() as u64;
         latencies_ns.push(elapsed_ns);
@@ -792,12 +823,14 @@ fn bench_qos2_state_machine_throughput() {
             dup: false,
             packet_id: Some(pid),
             payload: payload.clone(),
+            properties: Default::default(),
         });
-        pub_pkt.encode(&mut pub_buf).unwrap();
+        pub_pkt.encode(ProtocolVersion::V500, &mut pub_buf).unwrap();
 
         // Broker receives and decodes
-        let mut slice = &pub_buf[..];
-        let decoded_pub = MqttPacket::decode(&mut slice).unwrap();
+        let (decoded_pub, _) = MqttPacket::decode(&pub_buf, ProtocolVersion::V500, usize::MAX)
+            .unwrap()
+            .unwrap();
         if let MqttPacket::Publish(p) = decoded_pub {
             let p_id = p.packet_id.unwrap();
             let _is_dup = !inflight_set.insert(p_id);
@@ -805,28 +838,32 @@ fn bench_qos2_state_machine_throughput() {
 
         // Step 2: Broker replies PUBREC
         rec_buf.clear();
-        let pubrec = MqttPacket::PubRec { packet_id: pid };
-        pubrec.encode(&mut rec_buf).unwrap();
+        let pubrec = MqttPacket::pubrec(pid);
+        pubrec.encode(ProtocolVersion::V500, &mut rec_buf).unwrap();
 
         // Step 3: Publisher replies PUBREL
         rel_buf.clear();
-        let pubrel = MqttPacket::PubRel { packet_id: pid };
-        pubrel.encode(&mut rel_buf).unwrap();
+        let pubrel = MqttPacket::pubrel(pid);
+        pubrel.encode(ProtocolVersion::V500, &mut rel_buf).unwrap();
 
         // Broker receives PUBREL and clears inflight
-        let mut rel_slice = &rel_buf[..];
-        let decoded_rel = MqttPacket::decode(&mut rel_slice).unwrap();
-        if let MqttPacket::PubRel { packet_id } = decoded_rel {
+        let (decoded_rel, _) = MqttPacket::decode(&rel_buf, ProtocolVersion::V500, usize::MAX)
+            .unwrap()
+            .unwrap();
+        if let MqttPacket::PubRel { packet_id, .. } = decoded_rel {
             inflight_set.remove(&packet_id);
         }
 
         // Step 4: Broker replies PUBCOMP
         comp_buf.clear();
-        let pubcomp = MqttPacket::PubComp { packet_id: pid };
-        pubcomp.encode(&mut comp_buf).unwrap();
+        let pubcomp = MqttPacket::pubcomp(pid);
+        pubcomp
+            .encode(ProtocolVersion::V500, &mut comp_buf)
+            .unwrap();
 
-        let mut comp_slice = &comp_buf[..];
-        let _ = std::hint::black_box(MqttPacket::decode(&mut comp_slice).unwrap());
+        let _ = std::hint::black_box(
+            MqttPacket::decode(&comp_buf, ProtocolVersion::V500, usize::MAX).unwrap(),
+        );
     }
     let duration = start.elapsed();
     let handshakes_sec = (iterations as f64) / duration.as_secs_f64();
@@ -867,7 +904,7 @@ fn bench_mqtt_sn_telemetry_throughput() {
             msg_id: 0,
             data: data.clone(),
         };
-        pkt.encode(&mut enc_buf);
+        pkt.encode(&mut enc_buf).unwrap();
 
         let mut slice = &enc_buf[..];
         let decoded = SnPacket::decode(&mut slice).unwrap();

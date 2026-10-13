@@ -1,210 +1,118 @@
-name: Continuous Integration (CI)
+name: CI
 
 on:
   push:
-    branches: [ "main", "master", "develop" ]
+    branches: ["main", "master", "develop"]
   pull_request:
-    branches: [ "main", "master", "develop" ]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Job 1: Code Quality (format + clippy)
-  # ─────────────────────────────────────────────────────────────────────────────
-  lint-and-format:
-    name: Code Formatting & Clippy Lints
+  lint:
+    name: Format & Clippy
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository (with submodules)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Install Build Dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
 
-      - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Task Runner
-        uses: arduino/setup-task@v2
-        with:
-          version: 3.x
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Check Code Formatting
-        run: task fmt
-
-      - name: Run Clippy Linter (standard wolfSSL only)
-        run: task lint
-
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Job 2: Standard Tests (always runs)
-  # ─────────────────────────────────────────────────────────────────────────────
-  test-standard:
-    name: Tests - wolfSSL Standard
-    runs-on: ubuntu-latest
+  test:
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
-      - name: Checkout Repository (with submodules)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake openssl
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Unit tests, CLI tests and the live TCP / TLS / MQTT-SN integration suites.
+      - run: cargo test --lib --bins --tests
 
-      - name: Install Build Dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Task Runner
-        uses: arduino/setup-task@v2
-        with:
-          version: 3.x
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Generate Testing Certificates (mTLS)
-        run: task certs:gen
-
-      - name: Run All Tests (Standard wolfSSL)
-        run: cargo test --test '*' -- --test-threads=4
-
-      - name: Run E2E Network Tests
-        run: cargo test --test test_e2e_network -- --nocapture
-
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Job 3: FIPS-Ready Tests (disabled by default - requires FIPS bundle)
-  # To enable: remove the `if: false` line below and ensure
-  # external/wolfssl-fips-bundle/ is present in the repository or
-  # restored from the WOLFSSL_FIPS_BUNDLE_B64 secret.
-  # ─────────────────────────────────────────────────────────────────────────────
-  test-fips:
-    name: Tests - wolfSSL FIPS-Ready
+  msrv:
+    name: Minimum supported Rust version
     runs-on: ubuntu-latest
-    # Disabled: FIPS bundle (external/wolfssl-fips-bundle/) not included in repo.
-    # Remove this line once you have the FIPS bundle configured.
-    if: false
     steps:
-      - name: Checkout Repository (with submodules)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - run: sudo apt-get update -qq && sudo apt-get install -y cmake
+      - uses: dtolnay/rust-toolchain@1.82
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --lib --bins
 
-      - name: Install Build Dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@v2
+  cross:
+    name: Cross build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-unknown-linux-gnu, x86_64-pc-windows-gnu]
+    steps:
+      - uses: actions/checkout@v4
         with:
-          key: fips
-
-      - name: Install Task Runner
-        uses: arduino/setup-task@v2
+          submodules: recursive
+      - run: sudo apt-get update -qq && sudo apt-get install -y cmake
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          version: 3.x
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-${{ matrix.target }}
+      - name: Install zig and cargo-zigbuild
+        run: |
+          pip install ziglang==0.13.0
+          cargo install cargo-zigbuild --locked
+      - run: cargo zigbuild --target ${{ matrix.target }} --bin wolf-broker
 
-      - name: Restore FIPS Bundle
-        env:
-          WOLFSSL_FIPS_BUNDLE_B64: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 }}
-        run: echo "${WOLFSSL_FIPS_BUNDLE_B64}" | base64 -d | tar -xz -C .
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build dependencies and Mosquitto (for comparison)
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake openssl mosquitto
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+      - name: Run benchmark suites
+        run: bash scripts/ci_benchmarks.sh BENCHMARKS.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: BENCHMARKS.md
 
-      - name: Generate Testing Certificates (mTLS)
-        run: task certs:gen
-
-      - name: Run All Tests (FIPS-Ready wolfSSL)
-        run: cargo test --test '*' --no-default-features --features wolfssl-fips -- --test-threads=4
-
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Job 4: Security Audit
-  # ─────────────────────────────────────────────────────────────────────────────
-  security-audit:
-    name: Security & Vulnerability Audit
+  audit:
+    name: Dependency audit
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Run Cargo Audit
-        uses: rustsec/audit-check@v2.0.0
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Job 5: Performance Benchmarks
-  # ─────────────────────────────────────────────────────────────────────────────
-  benchmarks:
-    name: Performance Benchmarks
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository (with submodules)
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install Build Dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Task Runner
-        uses: arduino/setup-task@v2
-        with:
-          version: 3.x
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Execute High-Precision Benchmarks
-        run: task bench
-
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Job 6: Comparative TLS Benchmarks
-  # ─────────────────────────────────────────────────────────────────────────────
-  comparative-tls-benchmarks:
-    name: Comparative TLS Benchmarks (WolfiMQ vs Mosquitto)
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository (with submodules)
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install Build Dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y cmake build-essential mosquitto mosquitto-clients openssl
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install Task Runner
-        uses: arduino/setup-task@v2
-        with:
-          version: 3.x
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Generate mTLS Test Certificates
-        run: task certs:gen
-
-      - name: Execute Comparative TLS Benchmark
-        run: task bench:tls:compare

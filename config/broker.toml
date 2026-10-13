@@ -1,182 +1,140 @@
 # ==============================================================================
-# WolfMQTT Broker - Advanced Configuration File
+# WolfiMQ broker configuration
 # ==============================================================================
+# Every key can be overridden from the environment:
+#   WOLFIMQ_<SECTION>__<KEY>=<value>     e.g. WOLFIMQ_LISTENERS__TCP__PORT=1884
+# Values are parsed as TOML literals (true, 42, ["a","b"], "text").
+# The configuration file itself can be selected with WOLFIMQ_CONFIG=/path/broker.toml.
+# Run `wolf-broker --print-config` to see the effective configuration.
 
 [broker]
-# Unique identifier for this broker instance
 node_id = "wolf-broker-node-01"
-
-# Maximum number of concurrent active client connections (0 = unlimited)
+# Maximum simultaneous TCP + TLS connections (0 = unlimited).
 max_connections = 100000
-
-# Worker thread pool size (0 = auto-detect CPU cores)
+# Tokio worker threads (0 = one per CPU core).
 worker_threads = 0
+# Seconds a new connection may take to send its CONNECT packet.
+connect_timeout_sec = 10
+# Seconds to wait for connections to close on SIGINT / SIGTERM.
+shutdown_grace_sec = 5
 
-# ==============================================================================
-# Structured Logging & Observability
-# ==============================================================================
 [logging]
-# Log verbosity level: "trace", "debug", "info", "warn", "error"
+# trace | debug | info | warn | error   (RUST_LOG overrides this when set)
 level = "info"
-
-# Log output format:
-# - "pretty": Human-readable colored output for local development
-# - "compact": High-density single-line console output
-# - "json": Structured JSON output for cloud/Datadog/Elasticsearch ingest
+# pretty | compact | json
 format = "pretty"
-
-# Include source module/target in log records
 target = true
-
-# Include OS thread IDs in log records
 thread_ids = false
-
-# Include file names and line numbers in log records
 line_numbers = false
 
-# ==============================================================================
-# Network Listeners (Plain TCP and wolfSSL TLS)
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Listeners
+# ------------------------------------------------------------------------------
 [listeners.tcp]
-# Plain-text MQTT listener. DISABLED by default — production MUST use TLS (port 8883).
-# Only enable for internal trusted LANs or explicit debug/development sessions.
-# WARNING: Enabling this over untrusted networks transmits credentials in clear text.
+# Plain-text MQTT. Keep it on loopback or a trusted network: credentials are not encrypted.
 enabled = false
 bind_address = "127.0.0.1"
 port = 1883
 
 [listeners.tls]
-# Secure encrypted MQTT listener using wolfSSL (MQTTS)
+# MQTT over wolfSSL TLS (MQTTS).
 enabled = true
 bind_address = "0.0.0.0"
 port = 8883
 
 [listeners.mqtt_sn]
-# MQTT-SN UDP Listener for wireless radios, UAVs/Drones, and sensor networks
+# MQTT-SN v1.2 over UDP for sensor networks and constrained radios.
 enabled = true
 bind_address = "0.0.0.0"
 port = 1884
 gateway_id = 1
-advertise_interval_sec = 15
+# Seconds between ADVERTISE broadcasts (0 disables them).
+advertise_interval_sec = 900
+advertise_address = "255.255.255.255"
+# MQTT-SN v1.2 has no credentials: SN clients act as this ACL user (must exist in acl.conf).
+# Empty = anonymous identity (requires security.auth.allow_anonymous = true).
+acl_user = "sn_gateway"
+max_sessions = 10000
+# Accept connectionless QoS -1 publishes on predefined / short topic ids.
+allow_qos_minus1 = true
+# Retransmission of unacknowledged QoS 1/2 messages (Tretry seconds, Nretry attempts).
+retry_interval_sec = 10
+max_retries = 3
 
-# Predefined topics mapped directly to 2-byte Topic IDs (avoids in-air text overhead)
 [listeners.mqtt_sn.predefined_topics]
 "1" = "uav/drone_01/telemetry/gps"
 "2" = "uav/drone_01/telemetry/battery"
 "3" = "uav/drone_01/telemetry/attitude"
 "10" = "uav/drone_01/commands"
 
-# ==============================================================================
-# wolfSSL Security & TLS Configuration
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# TLS (wolfSSL)
+# ------------------------------------------------------------------------------
 [security.tls]
-# Path to Trusted Root Certificate Authority (CA) file (PEM format)
 ca_cert_file = "certs/ca-cert.pem"
-
-# Path to Broker Server Certificate file (PEM format)
 server_cert_file = "certs/server-cert.pem"
-
-# Path to Broker Server Private Key file (PEM format)
 server_key_file = "certs/server-key.pem"
-
-# Enforce Mutual TLS (mTLS): Require every connecting client to present a valid certificate
+# Mutual TLS: every client must present a certificate signed by ca_cert_file.
 require_client_cert = true
-
-# Verify client certificate Common Name (CN) / SAN against ClientID
+# Require the MQTT ClientID to equal the client certificate CN or one of its SANs.
 verify_client_identity = false
-
-# Minimum allowed TLS protocol version: "TLSv1.2", "TLSv1.3"
+# "TLSv1.2" or "TLSv1.3"
 min_tls_version = "TLSv1.3"
-
-# Preferred TLS 1.3 cipher suites
-ciphers = "TLS13-AES128-GCM-SHA256,TLS13-AES256-GCM-SHA384,TLS13-CHACHA20-POLY1305-SHA256"
-
-# Application-Layer Protocol Negotiation (ALPN) protocol IDs
+# wolfSSL cipher list (":" or "," separated). Empty = wolfSSL defaults.
+ciphers = "TLS13-AES128-GCM-SHA256:TLS13-AES256-GCM-SHA384:TLS13-CHACHA20-POLY1305-SHA256"
 alpn_protocols = ["mqtt"]
+handshake_timeout_sec = 10
 
-# Enable Pre-Shared Key (PSK) authentication for ultra-constrained devices
-psk_enabled = false
-psk_identity_hint = "wolf-broker-psk"
+# ------------------------------------------------------------------------------
+# Authentication & authorization
+# ------------------------------------------------------------------------------
+[security.auth]
+# Allow clients without a user name. They use the "anonymous" account from acl.conf.
+allow_anonymous = false
+# Algorithm used by `wolf-broker --hash-password`: "argon2id" (recommended) or "sha256" (legacy).
+password_hash_algorithm = "argon2id"
+acl_file = "config/acl.conf"
+# Concurrent Argon2 verifications (0 = number of CPU cores).
+max_concurrent_auth = 0
+# Who may take over a connected ClientID: "same_user" (default) or "any" (MQTT default behavior).
+client_id_takeover = "same_user"
 
-# Enable TLS Session Resumption / Session Tickets for ultra-fast reconnects
-session_tickets_enabled = true
-
-# Lifetime of TLS session tickets in seconds
-session_ticket_lifetime_sec = 7200
-
-# Optional: Hardware Crypto acceleration engine (e.g. "none", "intel_qat", "cavium")
-hardware_crypto_engine = "none"
-
-# ==============================================================================
-# Advanced MQTT Protocol Settings (v3.1.1 and v5.0)
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# MQTT protocol
+# ------------------------------------------------------------------------------
 [mqtt.protocol]
-# Enable support for MQTT v3.1.1 clients
 allow_v311 = true
-
-# Enable support for MQTT v5.0 clients
 allow_v500 = true
-
-# Maximum allowable packet size in bytes (4 MB = 4194304 bytes)
+# Largest accepted packet in bytes, fixed header included.
 max_packet_size = 4194304
-
-# Maximum in-flight unacknowledged QoS 1 and QoS 2 messages per client (Flow Control)
+# Unacknowledged inbound QoS 2 messages per MQTT v5.0 client.
 receive_maximum = 65535
-
-# Maximum number of Topic Aliases allowed per client (MQTT 5.0)
+# Topic aliases a v5.0 client may use (0 disables them).
 topic_alias_maximum = 20
-
-# Maximum allowable Keep-Alive interval in seconds (0 = follow client request)
+# Upper bound announced to v5.0 clients via Server Keep Alive (0 = no limit).
 max_keep_alive_sec = 3600
-
-# Allow clients to subscribe using wildcards ('+' and '#')
+# Highest QoS granted: 0, 1 or 2.
+maximum_qos = 2
 allow_wildcard_subscriptions = true
-
-# Allow publishers to set the RETAIN flag on messages
 allow_retained_messages = true
-
-# Allow shared subscriptions ($share/group/topic)
 allow_shared_subscriptions = true
 
-# ==============================================================================
-# Memory Protection & Slow Consumer Prevention (Queue Management)
-# ==============================================================================
 [mqtt.queues]
-# Maximum offline/in-flight message queue size per client (prevents OOM crashes)
+# Per-session buffer for slow or offline subscribers.
 max_queued_messages = 5000
-
-# Maximum memory buffer allocation in bytes per client session (8 MB = 8388608 bytes)
 max_queued_bytes = 8388608
-
-# Drop policy when a slow consumer's queue is full:
-# Options: "drop_oldest", "drop_newest", "reject_publisher"
+# "drop_oldest" or "drop_newest"
 queue_full_policy = "drop_oldest"
+# Drop messages without a Message Expiry Interval after waiting this long in a queue (0 = never).
+default_message_expiry_sec = 0
+# Upper bound for Session Expiry Interval; lifetime of MQTT v3.1.1 CleanSession=0 sessions.
+max_session_expiry_sec = 86400
 
-# Default message expiration time in seconds if not specified by publisher (86400 = 24h, 0 = no expiry)
-default_message_expiry_sec = 86400
+[mqtt.retained]
+max_messages = 100000
+max_bytes = 67108864
 
-# Maximum session expiry interval for offline persistent sessions in seconds (7 days)
-max_session_expiry_sec = 604800
-
-# ==============================================================================
-# Authentication & Authorization (AuthN / AuthZ)
-# ==============================================================================
-[security.auth]
-# Allow anonymous clients without username/password when TLS certificate is valid
-allow_anonymous = false
-
-# Password hashing algorithm for local accounts: "sha256", "bcrypt", "argon2"
-password_hash_algorithm = "sha256"
-
-# Path to optional Access Control List (ACL) file
-acl_file = "config/acl.conf"
-
-# ==============================================================================
-# System Metrics & Monitoring ($SYS Topics)
-# ==============================================================================
 [monitoring]
-# Publish internal broker statistics to $SYS/broker/... topics
+# Publish broker statistics under $SYS/broker/...
 sys_topics_enabled = true
-
-# Interval in seconds between $SYS metric updates
 sys_update_interval_sec = 30

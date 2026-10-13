@@ -1,13 +1,18 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use std::env;
 use std::fs::File;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS};
+use wolf_mqtt::auth::AclEngine;
+use wolf_mqtt::broker::{BrokerContext, BrokerOptions};
+use wolf_mqtt::protocol::{
+    ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS, SubscriptionOptions,
+};
 use wolf_mqtt::server::BrokerServer;
-use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector, WolfTlsStream};
+use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector, TlsServerConfig, WolfTlsStream};
 
 #[allow(dead_code)]
 #[derive(Default, Debug, Clone)]
@@ -17,6 +22,7 @@ struct BenchmarkResult {
     concurrency: usize,
     handshake_ms: f64,
     total_messages: usize,
+    expected_messages: usize,
     throughput_msgs_sec: f64,
     bandwidth_mb_sec: f64,
     mean_latency_us: f64,
@@ -132,18 +138,22 @@ async fn benchmark_wolfimq(
     concurrency: usize,
     payload_size: usize,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error + Send + Sync>> {
-    let acceptor = create_tls_acceptor(
-        "certs/server-cert.pem",
-        "certs/server-key.pem",
-        Some("certs/ca-cert.pem"),
-    )?;
+    let mut tls = TlsServerConfig::new("certs/server-cert.pem", "certs/server-key.pem");
+    tls.client_ca_file = Some("certs/ca-cert.pem".into());
+    let acceptor = create_tls_acceptor(&tls)?;
 
-    let server = BrokerServer::bind("127.0.0.1:0").await?;
+    // Size the per-session queue for the whole workload so the benchmark measures throughput,
+    // not the overflow policy.
+    let mut options = BrokerOptions::permissive();
+    options.queue_limits.max_messages = msg_count.max(5000);
+    options.queue_limits.max_bytes = (msg_count * (payload_size + 64)).max(8 << 20);
+    let ctx = BrokerContext::with_options(Arc::new(AclEngine::new(true)), options);
+    let server = BrokerServer::bind("127.0.0.1:0", ctx)
+        .await?
+        .with_tls(acceptor);
     let addr = server.local_addr()?;
 
-    tokio::spawn(async move {
-        let _ = server.run_tls(acceptor).await;
-    });
+    tokio::spawn(server.run());
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -227,6 +237,7 @@ async fn run_tls_client_workload(
                     will: None,
                     username: None,
                     password: None,
+                    properties: Default::default(),
                 }),
             )
             .await?;
@@ -235,10 +246,10 @@ async fn run_tls_client_workload(
             let topic = format!("bench/tls/w{}_{}", worker_id, std::process::id());
             send_packet(
                 &mut tls,
-                MqttPacket::Subscribe {
-                    packet_id: 1,
-                    topics: vec![(topic.clone(), QoS::AtMostOnce)],
-                },
+                MqttPacket::subscribe(
+                    1,
+                    vec![(topic.clone(), SubscriptionOptions::new(QoS::AtMostOnce))],
+                ),
             )
             .await?;
             let _ = read_next_packet(&mut tls, &mut buf).await?;
@@ -285,7 +296,16 @@ async fn run_tls_client_workload(
                 let mut lats = Vec::with_capacity(msgs_per_worker);
 
                 for _ in 0..msgs_per_worker {
-                    let pkt = read_next_packet(&mut read_half, &mut in_buf).await?;
+                    // A lost message must not hang the benchmark: stop after 10 s of silence.
+                    let Ok(pkt) = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        read_next_packet(&mut read_half, &mut in_buf),
+                    )
+                    .await
+                    else {
+                        break;
+                    };
+                    let pkt = pkt?;
                     if let MqttPacket::Publish(pub_pkt) = pkt {
                         if pub_pkt.payload.len() >= 8 {
                             let sent_nanos =
@@ -307,17 +327,13 @@ async fn run_tls_client_workload(
                 let now_nanos = start_epoch.elapsed().as_nanos() as u64;
                 payload_buf[0..8].copy_from_slice(&now_nanos.to_le_bytes());
 
-                let pub_pkt = MqttPacket::Publish(PublishPacket {
-                    topic: topic.clone(),
-                    qos: QoS::AtMostOnce,
-                    retain: false,
-                    dup: false,
-                    packet_id: None,
-                    payload: Bytes::copy_from_slice(&payload_buf),
-                });
+                let pub_pkt = MqttPacket::Publish(PublishPacket::new(
+                    topic.clone(),
+                    Bytes::copy_from_slice(&payload_buf),
+                ));
 
                 let mut enc_buf = BytesMut::new();
-                pub_pkt.encode(&mut enc_buf)?;
+                pub_pkt.encode(ProtocolVersion::V311, &mut enc_buf)?;
                 write_half.write_all(&enc_buf).await?;
             }
             write_half.flush().await?;
@@ -360,6 +376,7 @@ async fn run_tls_client_workload(
         concurrency,
         handshake_ms,
         total_messages: total_received,
+        expected_messages: actual_total,
         throughput_msgs_sec,
         bandwidth_mb_sec,
         mean_latency_us,
@@ -384,7 +401,7 @@ async fn send_packet<W: AsyncWriteExt + Unpin>(
     packet: MqttPacket,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut buf = BytesMut::new();
-    packet.encode(&mut buf)?;
+    packet.encode(ProtocolVersion::V311, &mut buf)?;
     stream.write_all(&buf).await?;
     stream.flush().await?;
     Ok(())
@@ -395,13 +412,8 @@ async fn read_next_packet<R: AsyncReadExt + Unpin>(
     buf: &mut BytesMut,
 ) -> Result<MqttPacket, Box<dyn std::error::Error + Send + Sync>> {
     loop {
-        if !buf.is_empty() {
-            let mut slice = &buf[..];
-            if let Ok(pkt) = MqttPacket::decode(&mut slice) {
-                let consumed = buf.len() - slice.len();
-                buf.advance(consumed);
-                return Ok(pkt);
-            }
+        if let Some(pkt) = MqttPacket::decode_from(buf, ProtocolVersion::V311, usize::MAX)? {
+            return Ok(pkt);
         }
         let n = stream.read_buf(buf).await?;
         if n == 0 {
@@ -417,7 +429,10 @@ fn print_single_result(res: &BenchmarkResult) {
         "  Concurrency      : {} concurrent clients",
         res.concurrency
     );
-    println!("  Total Messages   : {}", res.total_messages);
+    println!(
+        "  Delivered        : {} / {} messages",
+        res.total_messages, res.expected_messages
+    );
     println!("  TLS Handshake    : {:.2} ms", res.handshake_ms);
     println!(
         "  TLS Throughput   : {:.2} msgs/sec",
@@ -461,25 +476,34 @@ fn print_comparison_table(results: &[BenchmarkResult]) {
 
 fn write_markdown_summary(path: &str, results: &[BenchmarkResult]) -> std::io::Result<()> {
     let mut file = File::create(path)?;
+    writeln!(file, "### MQTT over TLS 1.3 (mutual TLS) throughput\n")?;
     writeln!(
         file,
-        "### 🔒 Empirical MQTT over TLS 1.3 / mTLS High-Load Benchmark Comparison\n"
+        "| Broker | TLS engine | Clients | Handshakes (total) | Delivered | Throughput | Bandwidth | Mean RTT | p90 RTT | p99 RTT | Max RTT |"
     )?;
-    writeln!(file, "| Broker | Cryptographic Engine | Concurrency | TLS Handshake | Throughput (msgs/sec) | Bandwidth | Mean Latency | p90 Latency | p99 Latency | Max Latency |")?;
-    writeln!(
-        file,
-        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
-    )?;
+    writeln!(file, "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")?;
     for r in results {
         writeln!(
             file,
-            "| **{}** | {} | `{} clients` | `{:.2} ms` | **{:.2} msgs/sec** | `{:.2} MB/s` | `{:.2} µs` | `{:.2} µs` | `{:.2} µs` | `{:.2} µs` |",
-            r.broker_name, r.tls_engine, r.concurrency, r.handshake_ms, r.throughput_msgs_sec, r.bandwidth_mb_sec, r.mean_latency_us, r.p90_latency_us, r.p99_latency_us, r.max_latency_us
+            "| **{}** | {} | {} | {:.1} ms | {} / {} | **{:.0} msg/s** | {:.2} MB/s | {:.1} µs | {:.1} µs | {:.1} µs | {:.1} µs |",
+            r.broker_name,
+            r.tls_engine,
+            r.concurrency,
+            r.handshake_ms,
+            r.total_messages,
+            r.expected_messages,
+            r.throughput_msgs_sec,
+            r.bandwidth_mb_sec,
+            r.mean_latency_us,
+            r.p90_latency_us,
+            r.p99_latency_us,
+            r.max_latency_us
         )?;
     }
     writeln!(
         file,
-        "\n*Standardized Conditions: RFC 8446 TLS 1.3, Mutual TLS (mTLS), identical payload buffers, identical network loopback, zero message drops.*"
+        "\n*QoS 0, pipelined publish/subscribe through the broker over loopback; RTT includes queueing \
+         under load. Throughput counts delivered messages only.*"
     )?;
     Ok(())
 }

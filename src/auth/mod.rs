@@ -1,27 +1,56 @@
+//! Authentication (Argon2id / legacy SHA-256 credentials) and topic authorization (ACL / RBAC).
+//!
+//! # Rule evaluation
+//!
+//! Every identity has an ordered rule list: the rules declared for the user in the ACL file come
+//! first (in file order), followed by the defaults of the user's role. The **first matching rule
+//! wins**, like firewall rules: put specific `deny` rules before broader allow rules.
+//!
+//! * PUBLISH to a topic is allowed by the first rule whose pattern matches the topic.
+//!   A matching `deny` rule stops evaluation; a rule that lacks write permission is skipped.
+//! * SUBSCRIBE to a filter is allowed by the first rule whose pattern *covers* the whole filter
+//!   (every topic the filter can match is matched by the pattern). Any `deny` rule that merely
+//!   *overlaps* the filter, and comes earlier, rejects the subscription. This guarantees that a
+//!   granted subscription never delivers a message a rule would deny.
+//!
+//! Anonymous clients (allowed only with `allow_anonymous = true`) use the `anonymous` account
+//! from the ACL file if one is declared, otherwise the engine's default rules.
+
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::Semaphore;
 use tracing::{debug, warn};
+
+use crate::routing::topic::{filter_covered_by, filters_intersect, topic_matches_filter};
+
+/// Name of the identity used for clients that connect without a user name.
+pub const ANONYMOUS_USER: &str = "anonymous";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AuthError {
-    #[error("Authentication failed: invalid username or password")]
+    #[error("authentication failed: invalid username or password")]
     BadCredentials,
-    #[error("Authentication failed: user '{0}' not found")]
-    UserNotFound(String),
-    #[error("Authentication failed: anonymous connections are disabled")]
+    #[error("authentication failed: anonymous connections are disabled")]
     AnonymousNotAllowed,
-    #[error("Access denied: client '{client_id}' is not authorized on topic '{topic}'")]
-    AccessDenied { client_id: String, topic: String },
+    #[error("authentication failed: client identifier does not match the device account")]
+    ClientIdMismatch,
+}
+
+#[derive(Debug, Error)]
+pub enum AclFileError {
+    #[error("failed to read ACL file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("ACL file line {line}: {message}")]
+    Syntax { line: usize, message: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,10 +81,45 @@ pub enum UserRole {
     Custom(String),
 }
 
+impl UserRole {
+    /// Built-in rules applied after the user's own rules.
+    fn default_rules(&self) -> &'static [(&'static str, Permission)] {
+        match self {
+            UserRole::Admin | UserRole::Custom(_) => &[],
+            UserRole::Moderator => &[
+                ("rooms/%r/#", Permission::ReadWrite),
+                ("users/%u/#", Permission::ReadWrite),
+            ],
+            UserRole::Member => &[
+                ("rooms/%r/admin/#", Permission::Deny),
+                ("rooms/%r/chat", Permission::ReadWrite),
+                ("rooms/%r/presence", Permission::ReadWrite),
+                ("rooms/%r/announcements", Permission::Read),
+                ("users/%u/private", Permission::ReadWrite),
+            ],
+            UserRole::Viewer => &[
+                ("rooms/%r/chat", Permission::Read),
+                ("rooms/%r/announcements", Permission::Read),
+                ("rooms/%r/#", Permission::Deny),
+            ],
+            UserRole::Device => &[
+                ("devices/%c/telemetry", Permission::Write),
+                ("devices/%c/commands", Permission::Read),
+                ("#", Permission::Deny),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AclRule {
     pub pattern: String,
     pub permission: Permission,
+}
+
+/// A substitution value is unusable when it could inject wildcards or extra topic levels.
+fn safe_substitution(value: &str) -> bool {
+    !value.is_empty() && !value.contains(['+', '#', '/', '\0'])
 }
 
 impl AclRule {
@@ -66,206 +130,204 @@ impl AclRule {
         }
     }
 
-    /// Evaluates whether the rule pattern matches the candidate topic.
-    /// Evaluates if an MQTT topic matches this rule pattern.
-    /// Supports `%u` (username), `%c` (client_id), `%r` (room_id), and MQTT wildcards (`+`, `#`).
+    /// Expands `%u`, `%c` and `%r` into the concrete patterns this rule stands for.
+    /// Returns an empty list when a substitution value is unsafe (the rule then never matches).
+    fn expand(&self, user: &UserAccount, client_id: &str) -> Vec<String> {
+        let mut base = self.pattern.clone();
+        if base.contains("%u") {
+            if !safe_substitution(&user.username) {
+                return Vec::new();
+            }
+            base = base.replace("%u", &user.username);
+        }
+        if base.contains("%c") {
+            if !safe_substitution(client_id) {
+                return Vec::new();
+            }
+            base = base.replace("%c", client_id);
+        }
+        if !base.contains("%r") {
+            return vec![base];
+        }
+        if user.role == UserRole::Admin || user.allowed_rooms.iter().any(|r| r == "*") {
+            return vec![base.replace("%r", "+")];
+        }
+        user.allowed_rooms
+            .iter()
+            .filter(|room| safe_substitution(room))
+            .map(|room| base.replace("%r", room))
+            .collect()
+    }
+
+    /// Returns true when the (expanded) rule pattern matches a concrete topic name.
     pub fn matches_topic(&self, user: &UserAccount, client_id: &str, topic: &str) -> bool {
-        // Sanitize client_id to prevent wildcard or path injection when %c is used in pattern
-        if self.pattern.contains("%c")
-            && (client_id.contains('+') || client_id.contains('#') || client_id.contains('/'))
-        {
-            return false;
-        }
+        self.expand(user, client_id)
+            .iter()
+            .any(|p| topic_matches_filter(p, topic))
+    }
 
-        // If pattern contains %r, evaluate against all allowed rooms for this user
-        if self.pattern.contains("%r") {
-            if user.role == UserRole::Admin || user.allowed_rooms.iter().any(|r| r == "*") {
-                // Admin or global room user: replace %r with '+' to match any single room segment
-                let expanded = self
-                    .pattern
-                    .replace("%u", &user.username)
-                    .replace("%c", client_id)
-                    .replace("%r", "+");
-                return mqtt_topic_match(&expanded, topic);
-            }
+    fn covers_filter(&self, user: &UserAccount, client_id: &str, filter: &str) -> bool {
+        self.expand(user, client_id)
+            .iter()
+            .any(|p| filter_covered_by(p, filter))
+    }
 
-            for room in &user.allowed_rooms {
-                let expanded = self
-                    .pattern
-                    .replace("%u", &user.username)
-                    .replace("%c", client_id)
-                    .replace("%r", room);
-                if mqtt_topic_match(&expanded, topic) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        let expanded = self
-            .pattern
-            .replace("%u", &user.username)
-            .replace("%c", client_id);
-        mqtt_topic_match(&expanded, topic)
+    fn overlaps_filter(&self, user: &UserAccount, client_id: &str, filter: &str) -> bool {
+        self.expand(user, client_id)
+            .iter()
+            .any(|p| filters_intersect(p, filter))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserAccount {
     pub username: String,
+    /// `$argon2id$...` PHC string or a 64-character lowercase SHA-256 hex digest.
     pub password_hash: String,
     pub role: UserRole,
     pub allowed_rooms: Vec<String>,
+    /// Rules declared for this user; evaluated before the role defaults.
     pub custom_rules: Vec<AclRule>,
 }
 
+/// Constant-time comparison so the legacy SHA-256 path does not leak matching prefixes.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 impl UserAccount {
-    /// Computes SHA-256 hexadecimal digest of input password.
-    pub fn hash_password(password: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(password);
-        let result = hasher.finalize();
-        result.iter().map(|b| format!("{:02x}", b)).collect()
+    fn with_role(
+        username: impl Into<String>,
+        password: &str,
+        role: UserRole,
+        rooms: Vec<String>,
+    ) -> Self {
+        Self {
+            username: username.into(),
+            password_hash: Self::hash_password_secure(password.as_bytes()),
+            role,
+            allowed_rooms: rooms,
+            custom_rules: Vec::new(),
+        }
     }
 
-    /// Computes secure password hash using Argon2id with random salt (falling back to SHA-256 only if Argon2 fails).
+    /// Computes the legacy unsalted SHA-256 hexadecimal digest. Prefer Argon2id.
+    pub fn hash_password(password: &[u8]) -> String {
+        Sha256::digest(password)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Computes an Argon2id PHC string with a random salt. Empty passwords yield an empty hash
+    /// (an account that can never authenticate).
     pub fn hash_password_secure(password: &[u8]) -> String {
         if password.is_empty() {
             return String::new();
         }
-        Self::hash_password_argon2(password).unwrap_or_else(|_| Self::hash_password(password))
+        Self::hash_password_argon2(password).unwrap_or_default()
     }
 
-    /// Creates a Superuser Administrator account with unrestricted access across all topics.
-    pub fn new_admin(username: impl Into<String>, password: &str) -> Self {
-        Self {
-            username: username.into(),
-            password_hash: Self::hash_password_secure(password.as_bytes()),
-            role: UserRole::Admin,
-            allowed_rooms: vec!["*".into()],
-            custom_rules: vec![
-                AclRule::new("#", Permission::ReadWrite),
-                AclRule::new("$SYS/#", Permission::Read),
-            ],
-        }
-    }
-
-    /// Creates a Room Moderator account with full management over assigned rooms.
-    pub fn new_moderator(
-        username: impl Into<String>,
-        password: &str,
-        allowed_rooms: Vec<String>,
-    ) -> Self {
-        Self {
-            username: username.into(),
-            password_hash: Self::hash_password_secure(password.as_bytes()),
-            role: UserRole::Moderator,
-            allowed_rooms,
-            custom_rules: vec![
-                AclRule::new("rooms/%r/#", Permission::ReadWrite),
-                AclRule::new("users/%u/#", Permission::ReadWrite),
-            ],
-        }
-    }
-
-    /// Creates a standard Room Member account (can chat & share presence in assigned rooms).
-    pub fn new_member(
-        username: impl Into<String>,
-        password: &str,
-        allowed_rooms: Vec<String>,
-    ) -> Self {
-        Self {
-            username: username.into(),
-            password_hash: Self::hash_password_secure(password.as_bytes()),
-            role: UserRole::Member,
-            allowed_rooms,
-            custom_rules: vec![
-                AclRule::new("rooms/%r/chat", Permission::ReadWrite),
-                AclRule::new("rooms/%r/presence", Permission::ReadWrite),
-                AclRule::new("rooms/%r/announcements", Permission::Read), // Read-only
-                AclRule::new("rooms/%r/admin/#", Permission::Deny),       // Explicit deny
-                AclRule::new("users/%u/private", Permission::ReadWrite),
-            ],
-        }
-    }
-
-    /// Creates a read-only Room Viewer account (can read chat and announcements, cannot publish).
-    pub fn new_viewer(
-        username: impl Into<String>,
-        password: &str,
-        allowed_rooms: Vec<String>,
-    ) -> Self {
-        Self {
-            username: username.into(),
-            password_hash: Self::hash_password_secure(password.as_bytes()),
-            role: UserRole::Viewer,
-            allowed_rooms,
-            custom_rules: vec![
-                AclRule::new("rooms/%r/chat", Permission::Read),
-                AclRule::new("rooms/%r/announcements", Permission::Read),
-                AclRule::new("rooms/%r/#", Permission::Deny), // Deny everything else in room
-            ],
-        }
-    }
-
-    /// Creates an IoT Device account strictly scoped to its own ClientID topic.
-    pub fn new_device(client_id: impl Into<String>, secret_token: &str) -> Self {
-        let cid = client_id.into();
-        Self {
-            username: cid.clone(),
-            password_hash: Self::hash_password_secure(secret_token.as_bytes()),
-            role: UserRole::Device,
-            allowed_rooms: Vec::new(),
-            custom_rules: vec![
-                AclRule::new("devices/%c/telemetry", Permission::Write),
-                AclRule::new("devices/%c/commands", Permission::Read),
-                AclRule::new("#", Permission::Deny), // Cannot access rooms or other devices
-            ],
-        }
-    }
-
-    /// Computes Argon2id PHC string of input password using random salt.
+    /// Computes an Argon2id PHC string of the password using a random salt.
     pub fn hash_password_argon2(password: &[u8]) -> Result<String, String> {
         let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        argon2
+        Argon2::default()
             .hash_password(password, &salt)
             .map(|h| h.to_string())
             .map_err(|e| e.to_string())
     }
 
-    /// Verifies provided candidate password against the stored credential.
-    /// Supports Argon2id and SHA-256 hashed passwords (strictly no plaintext comparison).
+    /// Superuser with unrestricted access (ACL checks are bypassed).
+    pub fn new_admin(username: impl Into<String>, password: &str) -> Self {
+        Self::with_role(username, password, UserRole::Admin, vec!["*".into()])
+    }
+
+    /// Room moderator: full access to `rooms/%r/#` and `users/%u/#`.
+    pub fn new_moderator(username: impl Into<String>, password: &str, rooms: Vec<String>) -> Self {
+        Self::with_role(username, password, UserRole::Moderator, rooms)
+    }
+
+    /// Room member: chat and presence, read-only announcements, no `rooms/%r/admin/#`.
+    pub fn new_member(username: impl Into<String>, password: &str, rooms: Vec<String>) -> Self {
+        Self::with_role(username, password, UserRole::Member, rooms)
+    }
+
+    /// Read-only room observer.
+    pub fn new_viewer(username: impl Into<String>, password: &str, rooms: Vec<String>) -> Self {
+        Self::with_role(username, password, UserRole::Viewer, rooms)
+    }
+
+    /// IoT device; its user name must equal the MQTT client identifier.
+    pub fn new_device(client_id: impl Into<String>, secret_token: &str) -> Self {
+        Self::with_role(client_id, secret_token, UserRole::Device, Vec::new())
+    }
+
+    /// Account with only explicit rules.
+    pub fn new_custom(username: impl Into<String>, password: &str, rules: Vec<AclRule>) -> Self {
+        let mut account = Self::with_role(
+            username,
+            password,
+            UserRole::Custom("custom".into()),
+            Vec::new(),
+        );
+        account.custom_rules = rules;
+        account
+    }
+
+    /// Verifies a candidate password against the stored Argon2id or SHA-256 credential.
     pub fn verify_password(&self, candidate: &[u8]) -> bool {
         if self.password_hash.is_empty() || candidate.is_empty() {
             return false;
         }
-
         if self.password_hash.starts_with("$argon2") {
-            if let Ok(parsed_hash) = PasswordHash::new(&self.password_hash) {
-                return Argon2::default()
-                    .verify_password(candidate, &parsed_hash)
-                    .is_ok();
-            }
-            return false;
+            return PasswordHash::new(&self.password_hash)
+                .map(|parsed| {
+                    Argon2::default()
+                        .verify_password(candidate, &parsed)
+                        .is_ok()
+                })
+                .unwrap_or(false);
         }
-
-        let candidate_hash = Self::hash_password(candidate);
-        candidate_hash == self.password_hash
+        constant_time_eq(
+            Self::hash_password(candidate).as_bytes(),
+            self.password_hash.as_bytes(),
+        )
     }
 
     pub fn can_access_room(&self, room_id: &str) -> bool {
-        if self.role == UserRole::Admin {
-            return true;
-        }
-        self.allowed_rooms.iter().any(|r| r == "*" || r == room_id)
+        self.role == UserRole::Admin || self.allowed_rooms.iter().any(|r| r == "*" || r == room_id)
+    }
+
+    /// The full ordered rule list: explicit rules, then role defaults.
+    fn effective_rules(&self) -> impl Iterator<Item = AclRule> + '_ {
+        self.custom_rules.iter().cloned().chain(
+            self.role
+                .default_rules()
+                .iter()
+                .map(|(p, perm)| AclRule::new(*p, *perm)),
+        )
     }
 }
 
+/// A real Argon2id hash (default parameters) used to equalize the cost of rejecting unknown users.
+fn dummy_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let mut secret = [0u8; 32];
+        OsRng.fill_bytes(&mut secret);
+        UserAccount::hash_password_argon2(&secret).unwrap_or_default()
+    })
+}
+
 pub struct AclEngine {
-    users: Arc<RwLock<HashMap<String, Arc<UserAccount>>>>,
+    users: RwLock<Arc<HashMap<String, Arc<UserAccount>>>>,
     allow_anonymous: bool,
     default_rules: Vec<AclRule>,
+    /// Bounds concurrent password verifications (Argon2 is CPU and memory heavy).
+    verify_permits: Arc<Semaphore>,
 }
 
 impl Default for AclEngine {
@@ -275,23 +337,26 @@ impl Default for AclEngine {
 }
 
 impl AclEngine {
+    /// Creates an engine. With `allow_anonymous`, anonymous clients get full read/write access
+    /// unless the ACL file declares an `anonymous` user with narrower rules.
     pub fn new(allow_anonymous: bool) -> Self {
-        Self {
-            users: Arc::new(RwLock::new(HashMap::new())),
-            allow_anonymous,
-            default_rules: if allow_anonymous {
-                vec![AclRule::new("#", Permission::ReadWrite)]
-            } else {
-                Vec::new()
-            },
-        }
+        let default_rules = if allow_anonymous {
+            vec![AclRule::new("#", Permission::ReadWrite)]
+        } else {
+            Vec::new()
+        };
+        Self::new_with_rules(allow_anonymous, default_rules)
     }
 
     pub fn new_with_rules(allow_anonymous: bool, default_rules: Vec<AclRule>) -> Self {
+        let permits = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         Self {
-            users: Arc::new(RwLock::new(HashMap::new())),
+            users: RwLock::new(Arc::new(HashMap::new())),
             allow_anonymous,
             default_rules,
+            verify_permits: Arc::new(Semaphore::new(permits)),
         }
     }
 
@@ -300,23 +365,58 @@ impl AclEngine {
         self
     }
 
+    /// Limits how many password verifications may run at the same time.
+    pub fn with_max_concurrent_verifications(mut self, n: usize) -> Self {
+        self.verify_permits = Arc::new(Semaphore::new(n.max(1)));
+        self
+    }
+
     pub fn allow_anonymous(&self) -> bool {
         self.allow_anonymous
     }
 
+    fn snapshot(&self) -> Arc<HashMap<String, Arc<UserAccount>>> {
+        self.users.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub async fn add_user(&self, account: UserAccount) {
-        let mut guard = self.users.write().await;
-        guard.insert(account.username.clone(), Arc::new(account));
+        let mut guard = self.users.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = (**guard).clone();
+        map.insert(account.username.clone(), Arc::new(account));
+        *guard = Arc::new(map);
     }
 
     pub async fn remove_user(&self, username: &str) -> bool {
-        let mut guard = self.users.write().await;
-        guard.remove(username).is_some()
+        let mut guard = self.users.write().unwrap_or_else(|e| e.into_inner());
+        let mut map = (**guard).clone();
+        let removed = map.remove(username).is_some();
+        *guard = Arc::new(map);
+        removed
     }
 
     pub async fn get_user(&self, username: &str) -> Option<Arc<UserAccount>> {
-        let guard = self.users.read().await;
-        guard.get(username).cloned()
+        self.snapshot().get(username).cloned()
+    }
+
+    pub fn user_count(&self) -> usize {
+        self.snapshot().len()
+    }
+
+    /// The identity used for anonymous clients, if anonymous access is enabled.
+    pub fn anonymous_identity(&self) -> Option<Arc<UserAccount>> {
+        if !self.allow_anonymous {
+            return None;
+        }
+        if let Some(declared) = self.snapshot().get(ANONYMOUS_USER) {
+            return Some(Arc::clone(declared));
+        }
+        Some(Arc::new(UserAccount {
+            username: ANONYMOUS_USER.into(),
+            password_hash: String::new(),
+            role: UserRole::Custom(ANONYMOUS_USER.into()),
+            allowed_rooms: Vec::new(),
+            custom_rules: self.default_rules.clone(),
+        }))
     }
 
     /// Authenticates a client connection.
@@ -326,212 +426,180 @@ impl AclEngine {
         password: Option<&[u8]>,
         client_id: &str,
     ) -> Result<Arc<UserAccount>, AuthError> {
-        match username {
-            Some(u) => {
-                let user_opt = {
-                    let guard = self.users.read().await;
-                    guard.get(u).cloned()
-                };
-                let pass_bytes = match password {
-                    Some(p) if !p.is_empty() => p.to_vec(),
-                    _ => return Err(AuthError::BadCredentials),
-                };
+        let Some(name) = username else {
+            return self.anonymous_identity().ok_or_else(|| {
+                warn!("Anonymous connection rejected for client '{}'", client_id);
+                AuthError::AnonymousNotAllowed
+            });
+        };
 
-                if let Some(user) = user_opt {
-                    let user_clone = Arc::clone(&user);
-                    let verified = tokio::task::spawn_blocking(move || {
-                        user_clone.verify_password(&pass_bytes)
-                    })
-                    .await
-                    .unwrap_or(false);
+        let candidate = password.filter(|p| !p.is_empty()).map(<[u8]>::to_vec);
+        let user = self.snapshot().get(name).cloned();
 
-                    if !verified {
-                        warn!(
-                            "Authentication failed for user '{}': invalid credentials",
-                            u
-                        );
-                        return Err(AuthError::BadCredentials);
-                    }
+        // Always run one full verification, even for unknown users or missing passwords, so the
+        // response time does not reveal which user names exist.
+        let hash_owner = user.clone().unwrap_or_else(|| {
+            Arc::new(UserAccount {
+                username: String::new(),
+                password_hash: dummy_hash().to_owned(),
+                role: UserRole::Custom(String::new()),
+                allowed_rooms: Vec::new(),
+                custom_rules: Vec::new(),
+            })
+        });
+        let probe = candidate.clone().unwrap_or_else(|| b"\0".to_vec());
+        let permit = Arc::clone(&self.verify_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthError::BadCredentials)?;
+        let verified = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            hash_owner.verify_password(&probe)
+        })
+        .await
+        .unwrap_or(false);
 
-                    if user.role == UserRole::Device && user.username != client_id {
-                        warn!(
-                            "Device '{}' attempted to connect with mismatched client ID '{}'",
-                            user.username, client_id
-                        );
-                        return Err(AuthError::BadCredentials);
-                    }
+        let (Some(user), true, Some(_)) = (user, verified, candidate) else {
+            warn!(
+                "Authentication failed for user '{}' (client '{}')",
+                name, client_id
+            );
+            return Err(AuthError::BadCredentials);
+        };
 
-                    debug!(
-                        "User '{}' authenticated successfully (role: {:?})",
-                        u, user.role
-                    );
-                    Ok(user)
-                } else {
-                    // Timing attack mitigation: verify dummy hash to prevent username enumeration
-                    tokio::task::spawn_blocking(move || {
-                        let dummy_hash = "$argon2id$v=19$m=19456,t=2,p=1$eHh4eHh4eHh4eHh4eHh4$xxxx";
-                        let dummy_user = UserAccount {
-                            username: "dummy".into(),
-                            password_hash: dummy_hash.into(),
-                            role: UserRole::Member,
-                            allowed_rooms: Vec::new(),
-                            custom_rules: Vec::new(),
-                        };
-                        let _ = dummy_user.verify_password(&pass_bytes);
-                    })
-                    .await
-                    .unwrap_or(());
-
-                    warn!(
-                        "Authentication failed for user '{}': invalid credentials",
-                        u
-                    );
-                    Err(AuthError::BadCredentials)
-                }
-            }
-            None => {
-                if self.allow_anonymous {
-                    debug!("Anonymous connection accepted for client '{}'", client_id);
-                    // Check if explicit anonymous user was declared in acl.conf
-                    let anon_configured = {
-                        let guard = self.users.read().await;
-                        guard.get("anonymous").cloned()
-                    };
-                    if let Some(user) = anon_configured {
-                        Ok(user)
-                    } else {
-                        Ok(Arc::new(UserAccount {
-                            username: "anonymous".into(),
-                            password_hash: String::new(),
-                            role: UserRole::Custom("anonymous".into()),
-                            allowed_rooms: Vec::new(),
-                            custom_rules: self.default_rules.clone(),
-                        }))
-                    }
-                } else {
-                    warn!("Anonymous connection rejected for client '{}'", client_id);
-                    Err(AuthError::AnonymousNotAllowed)
-                }
-            }
+        if user.role == UserRole::Device && user.username != client_id {
+            warn!(
+                "Device '{}' attempted to connect with mismatched client ID '{}'",
+                user.username, client_id
+            );
+            return Err(AuthError::ClientIdMismatch);
         }
+
+        debug!("User '{}' authenticated (role: {:?})", name, user.role);
+        Ok(user)
     }
 
-    /// Validates whether a client is authorized to PUBLISH to a given topic.
+    /// Returns true when `user` may PUBLISH to the concrete topic name.
     pub fn check_publish(&self, user: &UserAccount, client_id: &str, topic: &str) -> bool {
         if user.role == UserRole::Admin {
             return true;
         }
-
-        // 1. Check custom user rules (first match takes precedence; Deny explicitly overrides)
-        for rule in &user.custom_rules {
-            if rule.matches_topic(user, client_id, topic) {
-                if rule.permission == Permission::Deny {
-                    debug!(
-                        "Publish denied by explicit Deny rule: '{}' on '{}'",
-                        user.username, topic
-                    );
-                    return false;
-                }
-                if rule.permission.can_write() {
-                    return true;
-                }
+        for rule in user.effective_rules() {
+            if !rule.matches_topic(user, client_id, topic) {
+                continue;
+            }
+            if rule.permission == Permission::Deny {
+                debug!(
+                    "Publish denied by deny rule '{}' for '{}' on '{}'",
+                    rule.pattern, user.username, topic
+                );
+                return false;
+            }
+            if rule.permission.can_write() {
+                return true;
             }
         }
-
-        // 2. Check fallback default rules
-        for rule in &self.default_rules {
-            if rule.matches_topic(user, client_id, topic) {
-                if rule.permission == Permission::Deny {
-                    return false;
-                }
-                if rule.permission.can_write() {
-                    return true;
-                }
-            }
-        }
-
         debug!(
-            "Publish denied (no matching rule): '{}' on '{}'",
+            "Publish denied (no matching rule) for '{}' on '{}'",
             user.username, topic
         );
         false
     }
 
-    /// Validates whether a client is authorized to SUBSCRIBE to a given topic filter.
+    /// Returns true when `user` may receive messages for the concrete topic name.
+    pub fn check_read(&self, user: &UserAccount, client_id: &str, topic: &str) -> bool {
+        if user.role == UserRole::Admin {
+            return true;
+        }
+        for rule in user.effective_rules() {
+            if !rule.matches_topic(user, client_id, topic) {
+                continue;
+            }
+            if rule.permission == Permission::Deny {
+                return false;
+            }
+            if rule.permission.can_read() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns true when `user` may SUBSCRIBE to `topic_filter` (see module docs).
     pub fn check_subscribe(&self, user: &UserAccount, client_id: &str, topic_filter: &str) -> bool {
         if user.role == UserRole::Admin {
             return true;
         }
-
-        // 1. Check custom user rules
-        for rule in &user.custom_rules {
-            if rule.matches_topic(user, client_id, topic_filter) {
-                if rule.permission == Permission::Deny {
+        for rule in user.effective_rules() {
+            if rule.permission == Permission::Deny {
+                if rule.overlaps_filter(user, client_id, topic_filter) {
                     debug!(
-                        "Subscribe denied by explicit Deny rule: '{}' on '{}'",
-                        user.username, topic_filter
+                        "Subscribe denied by deny rule '{}' for '{}' on '{}'",
+                        rule.pattern, user.username, topic_filter
                     );
                     return false;
                 }
-                if rule.permission.can_read() {
-                    return true;
-                }
+            } else if rule.permission.can_read()
+                && rule.covers_filter(user, client_id, topic_filter)
+            {
+                return true;
             }
         }
-
-        // 2. Check fallback default rules
-        for rule in &self.default_rules {
-            if rule.matches_topic(user, client_id, topic_filter) {
-                if rule.permission == Permission::Deny {
-                    return false;
-                }
-                if rule.permission.can_read() {
-                    return true;
-                }
-            }
-        }
-
         debug!(
-            "Subscribe denied (no matching rule): '{}' on '{}'",
+            "Subscribe denied (no covering rule) for '{}' on '{}'",
             user.username, topic_filter
         );
         false
     }
 
-    /// Parses an ACL file and loads user credentials, roles, room memberships, and pattern rules.
-    pub async fn load_from_acl_file<P: AsRef<Path>>(&self, path: P) -> Result<(), std::io::Error> {
-        let content = fs::read_to_string(path)?;
-        let mut current_user: Option<UserAccount> = None;
-
-        for line in content.lines() {
-            let line = line.trim();
+    /// Parses ACL file content into accounts without touching the engine.
+    pub fn parse_acl(content: &str) -> Result<Vec<UserAccount>, AclFileError> {
+        let mut accounts: Vec<UserAccount> = Vec::new();
+        for (idx, raw_line) in content.lines().enumerate() {
+            let line_no = idx + 1;
+            let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-
+            let syntax = |message: String| AclFileError::Syntax {
+                line: line_no,
+                message,
+            };
             match parts[0] {
-                "user" if parts.len() >= 2 => {
-                    if let Some(user) = current_user.take() {
-                        self.add_user(user).await;
+                "user" => {
+                    let username = parts
+                        .get(1)
+                        .ok_or_else(|| syntax("'user' requires a user name".into()))?;
+                    if accounts.iter().any(|a| a.username == *username) {
+                        return Err(syntax(format!("user '{username}' declared twice")));
                     }
-
-                    let username = parts[1].to_string();
                     let mut password_hash = String::new();
-                    let mut role = UserRole::Member;
+                    let mut role = UserRole::Custom("custom".into());
                     let mut rooms = Vec::new();
-
-                    for &arg in &parts[2..] {
+                    for arg in &parts[2..] {
                         if let Some(pass) = arg.strip_prefix("password:") {
+                            warn!(
+                                "ACL file line {}: plaintext 'password:' for user '{}'; prefer 'password_hash:' (see --hash-password)",
+                                line_no, username
+                            );
                             password_hash = UserAccount::hash_password_secure(pass.as_bytes());
                         } else if let Some(hash) = arg.strip_prefix("password_hash:") {
-                            password_hash = hash.to_string();
-                        } else if let Some(r_str) = arg.strip_prefix("role:") {
-                            role = match r_str.to_lowercase().as_str() {
+                            let is_argon2 =
+                                hash.starts_with("$argon2") && PasswordHash::new(hash).is_ok();
+                            let is_sha256 =
+                                hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+                            password_hash = if is_argon2 {
+                                hash.to_string()
+                            } else if is_sha256 {
+                                hash.to_ascii_lowercase()
+                            } else {
+                                return Err(syntax(format!(
+                                    "invalid password_hash for user '{username}'"
+                                )));
+                            };
+                        } else if let Some(r) = arg.strip_prefix("role:") {
+                            role = match r.to_ascii_lowercase().as_str() {
                                 "admin" => UserRole::Admin,
                                 "moderator" => UserRole::Moderator,
                                 "member" => UserRole::Member,
@@ -539,64 +607,68 @@ impl AclEngine {
                                 "device" => UserRole::Device,
                                 custom => UserRole::Custom(custom.to_string()),
                             };
-                        } else if let Some(rooms_str) = arg.strip_prefix("rooms:") {
-                            rooms = rooms_str.split(',').map(|s| s.trim().to_string()).collect();
+                        } else if let Some(list) = arg.strip_prefix("rooms:") {
+                            rooms = list
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from)
+                                .collect();
+                        } else {
+                            return Err(syntax(format!("unknown user attribute '{arg}'")));
                         }
                     }
-
-                    let mut account = match role {
-                        UserRole::Admin => UserAccount::new_admin(&username, ""),
-                        UserRole::Moderator => UserAccount::new_moderator(&username, "", rooms),
-                        UserRole::Member => UserAccount::new_member(&username, "", rooms),
-                        UserRole::Viewer => UserAccount::new_viewer(&username, "", rooms),
-                        UserRole::Device => UserAccount::new_device(&username, ""),
-                        UserRole::Custom(_) => UserAccount {
-                            username: username.clone(),
-                            password_hash: password_hash.clone(),
-                            role,
-                            allowed_rooms: rooms,
-                            custom_rules: Vec::new(),
-                        },
-                    };
-                    account.password_hash = password_hash;
-                    current_user = Some(account);
+                    accounts.push(UserAccount {
+                        username: (*username).to_string(),
+                        password_hash,
+                        role,
+                        allowed_rooms: rooms,
+                        custom_rules: Vec::new(),
+                    });
                 }
-                "topic" | "pattern" if parts.len() >= 3 => {
-                    let perm = match parts[1].to_lowercase().as_str() {
+                "topic" | "pattern" => {
+                    if parts.len() != 3 {
+                        return Err(syntax(
+                            "expected: topic <read|write|readwrite|deny> <pattern>".into(),
+                        ));
+                    }
+                    let permission = match parts[1].to_ascii_lowercase().as_str() {
                         "read" => Permission::Read,
                         "write" => Permission::Write,
                         "readwrite" => Permission::ReadWrite,
                         "deny" => Permission::Deny,
-                        unknown => {
-                            warn!(
-                                "Unknown permission '{}' in ACL file; ignoring invalid rule",
-                                unknown
-                            );
-                            continue;
-                        }
+                        other => return Err(syntax(format!("unknown permission '{other}'"))),
                     };
-                    let pattern = parts[2].to_string();
-                    let rule = AclRule::new(pattern, perm);
-
-                    if let Some(ref mut user) = current_user {
-                        // IMPORTANT: Append rules in file-declaration order.
-                        // Semantics: "first matching rule wins."
-                        // Previously this used insert(0, rule) which REVERSED the file order,
-                        // causing the last line (e.g. `topic deny #`) to be evaluated first,
-                        // silently denying all access even when specific allow rules were present.
-                        // Fix (F2): use push() to preserve file ordering.
-                        user.custom_rules.push(rule);
+                    let pattern = parts[2];
+                    let probe = pattern
+                        .replace("%u", "u")
+                        .replace("%c", "c")
+                        .replace("%r", "r");
+                    if crate::routing::topic::validate_topic_filter(&probe).is_err() {
+                        return Err(syntax(format!("invalid topic pattern '{pattern}'")));
                     }
+                    let account = accounts
+                        .last_mut()
+                        .ok_or_else(|| syntax("rule appears before any 'user' line".into()))?;
+                    account.custom_rules.push(AclRule::new(pattern, permission));
                 }
-                _ => {}
+                other => return Err(syntax(format!("unknown directive '{other}'"))),
             }
         }
+        Ok(accounts)
+    }
 
-        if let Some(user) = current_user {
-            self.add_user(user).await;
-        }
-
-        Ok(())
+    /// Loads an ACL file, atomically replacing all previously loaded accounts.
+    pub async fn load_from_acl_file<P: AsRef<Path>>(&self, path: P) -> Result<usize, AclFileError> {
+        let content = fs::read_to_string(path)?;
+        let accounts = Self::parse_acl(&content)?;
+        let count = accounts.len();
+        let map: HashMap<String, Arc<UserAccount>> = accounts
+            .into_iter()
+            .map(|a| (a.username.clone(), Arc::new(a)))
+            .collect();
+        *self.users.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(map);
+        Ok(count)
     }
 }
 
@@ -621,160 +693,210 @@ impl RoomManager {
     }
 
     pub fn extract_room(topic: &str) -> Option<&str> {
-        let parts: Vec<&str> = topic.split('/').collect();
-        if parts.len() >= 3 && parts[0] == "rooms" {
-            Some(parts[1])
-        } else {
-            None
+        let mut parts = topic.split('/');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("rooms"), Some(room), Some(_)) => Some(room),
+            _ => None,
         }
     }
 }
 
-/// Evaluates standard MQTT topic wildcard matching.
-/// `+` matches single topic level. `#` matches all remaining levels.
+/// Standard MQTT topic matching (kept for API compatibility; see [`topic_matches_filter`]).
 pub fn mqtt_topic_match(pattern: &str, candidate: &str) -> bool {
-    let p_segments: Vec<&str> = pattern.split('/').collect();
-    let c_segments: Vec<&str> = candidate.split('/').collect();
-
-    let mut p_idx = 0;
-    let mut c_idx = 0;
-
-    while p_idx < p_segments.len() && c_idx < c_segments.len() {
-        match p_segments[p_idx] {
-            "#" => return true,
-            "+" => {
-                p_idx += 1;
-                c_idx += 1;
-            }
-            exact => {
-                if exact != c_segments[c_idx] {
-                    return false;
-                }
-                p_idx += 1;
-                c_idx += 1;
-            }
-        }
-    }
-
-    if p_idx < p_segments.len() && p_segments[p_idx] == "#" {
-        return true;
-    }
-
-    p_idx == p_segments.len() && c_idx == c_segments.len()
+    topic_matches_filter(pattern, candidate)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_topic_matcher() {
-        assert!(mqtt_topic_match("rooms/+/chat", "rooms/living_room/chat"));
-        assert!(!mqtt_topic_match(
-            "rooms/+/chat",
-            "rooms/living_room/presence"
-        ));
-        assert!(mqtt_topic_match("rooms/#", "rooms/a/b/c"));
-        assert!(mqtt_topic_match("devices/%c/data", "devices/%c/data"));
+    fn rooms(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
     }
 
     #[tokio::test]
-    async fn test_room_based_credentials_and_permissions() {
+    async fn authentication_paths() {
         let engine = AclEngine::new(false);
+        engine
+            .add_user(UserAccount::new_admin("alice", "admin_secret"))
+            .await;
+        engine
+            .add_user(UserAccount::new_device("sensor_101", "dev_secret"))
+            .await;
 
-        // 1. Admin
-        let admin = UserAccount::new_admin("alice_admin", "admin_secret");
-        engine.add_user(admin.clone()).await;
-
-        // 2. Moderator for Room A & Room B
-        let mod_user = UserAccount::new_moderator(
-            "bob_mod",
-            "mod_secret",
-            vec!["room_alpha".into(), "room_beta".into()],
-        );
-        engine.add_user(mod_user.clone()).await;
-
-        // 3. Member for Room A only
-        let member =
-            UserAccount::new_member("charlie_member", "member_secret", vec!["room_alpha".into()]);
-        engine.add_user(member.clone()).await;
-
-        // 4. Viewer for Room A only
-        let viewer =
-            UserAccount::new_viewer("dave_viewer", "viewer_secret", vec!["room_alpha".into()]);
-        engine.add_user(viewer.clone()).await;
-
-        // 5. Device
-        let device = UserAccount::new_device("sensor_101", "dev_secret");
-        engine.add_user(device.clone()).await;
-
-        // --- Authentication Verification ---
         assert!(engine
-            .authenticate(Some("alice_admin"), Some(b"admin_secret"), "c1")
+            .authenticate(Some("alice"), Some(b"admin_secret"), "c1")
             .await
             .is_ok());
+        assert_eq!(
+            engine
+                .authenticate(Some("alice"), Some(b"wrong"), "c1")
+                .await,
+            Err(AuthError::BadCredentials)
+        );
+        assert_eq!(
+            engine.authenticate(Some("alice"), None, "c1").await,
+            Err(AuthError::BadCredentials)
+        );
+        assert_eq!(
+            engine.authenticate(Some("nobody"), Some(b"x"), "c1").await,
+            Err(AuthError::BadCredentials)
+        );
+        assert_eq!(
+            engine.authenticate(None, None, "c1").await,
+            Err(AuthError::AnonymousNotAllowed)
+        );
+        assert_eq!(
+            engine
+                .authenticate(Some("sensor_101"), Some(b"dev_secret"), "other")
+                .await,
+            Err(AuthError::ClientIdMismatch)
+        );
         assert!(engine
-            .authenticate(Some("alice_admin"), Some(b"wrong_pass"), "c1")
+            .authenticate(Some("sensor_101"), Some(b"dev_secret"), "sensor_101")
             .await
-            .is_err());
-        assert!(engine.authenticate(None, None, "c1").await.is_err()); // Anon disabled
-
-        // --- Room A Chat (Member vs Viewer vs Cross-Room) ---
-        // Member can publish and subscribe in Room Alpha
-        assert!(engine.check_publish(&member, "c_charlie", "rooms/room_alpha/chat"));
-        assert!(engine.check_subscribe(&member, "c_charlie", "rooms/room_alpha/chat"));
-
-        // Viewer can SUBSCRIBE to Room Alpha chat, but CANNOT PUBLISH!
-        assert!(engine.check_subscribe(&viewer, "c_dave", "rooms/room_alpha/chat"));
-        assert!(!engine.check_publish(&viewer, "c_dave", "rooms/room_alpha/chat"));
-
-        // Member cannot publish or subscribe to Room Beta (Room Isolation!)
-        assert!(!engine.check_publish(&member, "c_charlie", "rooms/room_beta/chat"));
-        assert!(!engine.check_subscribe(&member, "c_charlie", "rooms/room_beta/chat"));
-
-        // Moderator can publish and subscribe to both Room Alpha and Beta
-        assert!(engine.check_publish(&mod_user, "c_bob", "rooms/room_alpha/chat"));
-        assert!(engine.check_publish(&mod_user, "c_bob", "rooms/room_beta/chat"));
-
-        // Member is DENIED from Room Alpha admin topics
-        assert!(!engine.check_publish(&member, "c_charlie", "rooms/room_alpha/admin/secret"));
-        assert!(!engine.check_subscribe(&member, "c_charlie", "rooms/room_alpha/admin/secret"));
-
-        // Moderator CAN access Room Alpha admin topics
-        assert!(engine.check_publish(&mod_user, "c_bob", "rooms/room_alpha/admin/secret"));
-
-        // --- Device Isolation ---
-        // Device can publish its own telemetry
-        assert!(engine.check_publish(&device, "sensor_101", "devices/sensor_101/telemetry"));
-        // Device cannot publish to another device's telemetry
-        assert!(!engine.check_publish(&device, "sensor_101", "devices/sensor_999/telemetry"));
-        // Device cannot access human rooms
-        assert!(!engine.check_publish(&device, "sensor_101", "rooms/room_alpha/chat"));
-        assert!(!engine.check_subscribe(&device, "sensor_101", "rooms/room_alpha/chat"));
-
-        // Admin has universal access
-        assert!(engine.check_publish(&admin, "c_alice", "rooms/room_alpha/chat"));
-        assert!(engine.check_publish(&admin, "c_alice", "rooms/room_beta/chat"));
-        assert!(engine.check_publish(&admin, "c_alice", "$SYS/broker/uptime"));
+            .is_ok());
     }
 
     #[test]
-    fn test_argon2id_password_hashing() {
-        let password = b"complex_secret_passphrase_42!";
-        let argon2_hash = UserAccount::hash_password_argon2(password).unwrap();
-        assert!(argon2_hash.starts_with("$argon2id$"));
+    fn dummy_hash_is_a_valid_argon2_hash() {
+        assert!(PasswordHash::new(dummy_hash()).is_ok());
+    }
 
-        let account = UserAccount {
-            username: "sec_user".into(),
-            password_hash: argon2_hash,
-            role: UserRole::Member,
-            allowed_rooms: vec!["lobby".into()],
-            custom_rules: Vec::new(),
-        };
-
-        // Correct password verifies successfully
-        assert!(account.verify_password(password));
-        // Wrong password fails
+    #[test]
+    fn password_hashing() {
+        let hash = UserAccount::hash_password_argon2(b"complex_secret_passphrase_42!").unwrap();
+        assert!(hash.starts_with("$argon2id$"));
+        let mut account = UserAccount::new_custom("u", "x", vec![]);
+        account.password_hash = hash;
+        assert!(account.verify_password(b"complex_secret_passphrase_42!"));
         assert!(!account.verify_password(b"wrong_passphrase"));
+        account.password_hash = UserAccount::hash_password(b"legacy");
+        assert!(account.verify_password(b"legacy"));
+        assert!(!account.verify_password(b"legacx"));
+        assert!(!account.verify_password(b""));
+    }
+
+    #[test]
+    fn room_roles_and_isolation() {
+        let engine = AclEngine::new(false);
+        let moderator = UserAccount::new_moderator("bob", "p", rooms(&["alpha", "beta"]));
+        let member = UserAccount::new_member("charlie", "p", rooms(&["alpha"]));
+        let viewer = UserAccount::new_viewer("dave", "p", rooms(&["alpha"]));
+        let device = UserAccount::new_device("sensor_101", "p");
+        let admin = UserAccount::new_admin("alice", "p");
+
+        assert!(engine.check_publish(&member, "c", "rooms/alpha/chat"));
+        assert!(engine.check_subscribe(&member, "c", "rooms/alpha/chat"));
+        assert!(!engine.check_publish(&member, "c", "rooms/alpha/announcements"));
+        assert!(engine.check_subscribe(&member, "c", "rooms/alpha/announcements"));
+        assert!(!engine.check_publish(&member, "c", "rooms/beta/chat"));
+        assert!(!engine.check_subscribe(&member, "c", "rooms/beta/chat"));
+        assert!(!engine.check_publish(&member, "c", "rooms/alpha/admin/secret"));
+        assert!(!engine.check_subscribe(&member, "c", "rooms/alpha/admin/secret"));
+        // A wildcard that would reach the admin subtree is refused as a whole.
+        assert!(!engine.check_subscribe(&member, "c", "rooms/alpha/#"));
+        assert!(engine.check_publish(&member, "c", "users/charlie/private"));
+        assert!(!engine.check_publish(&member, "c", "users/bob/private"));
+
+        assert!(engine.check_subscribe(&viewer, "c", "rooms/alpha/chat"));
+        assert!(!engine.check_publish(&viewer, "c", "rooms/alpha/chat"));
+        assert!(!engine.check_subscribe(&viewer, "c", "rooms/alpha/#"));
+
+        assert!(engine.check_publish(&moderator, "c", "rooms/alpha/admin/secret"));
+        assert!(engine.check_subscribe(&moderator, "c", "rooms/beta/#"));
+        assert!(!engine.check_subscribe(&moderator, "c", "rooms/gamma/#"));
+        assert!(!engine.check_subscribe(&moderator, "c", "rooms/#"));
+
+        assert!(engine.check_publish(&device, "sensor_101", "devices/sensor_101/telemetry"));
+        assert!(!engine.check_publish(&device, "sensor_101", "devices/sensor_999/telemetry"));
+        assert!(engine.check_subscribe(&device, "sensor_101", "devices/sensor_101/commands"));
+        assert!(!engine.check_subscribe(&device, "sensor_101", "devices/+/commands"));
+        assert!(!engine.check_subscribe(&device, "sensor_101", "#"));
+
+        assert!(engine.check_publish(&admin, "c", "anything/at/all"));
+    }
+
+    #[test]
+    fn wildcard_rule_does_not_grant_broader_wildcard_subscription() {
+        let engine = AclEngine::new(false);
+        let user = UserAccount::new_custom("u", "p", vec![AclRule::new("a/+", Permission::Read)]);
+        assert!(engine.check_subscribe(&user, "c", "a/b"));
+        assert!(engine.check_subscribe(&user, "c", "a/+"));
+        // Previously '+' in the rule matched the '#' level of the filter.
+        assert!(!engine.check_subscribe(&user, "c", "a/#"));
+    }
+
+    #[test]
+    fn substitution_values_cannot_inject_wildcards() {
+        let engine = AclEngine::new(false);
+        let rules = vec![
+            AclRule::new("users/%u/#", Permission::ReadWrite),
+            AclRule::new("clients/%c/data", Permission::ReadWrite),
+        ];
+        let evil = UserAccount::new_custom("+", "p", rules.clone());
+        assert!(!engine.check_subscribe(&evil, "c", "users/+/#"));
+        assert!(!engine.check_publish(&evil, "c", "users/bob/x"));
+        let user = UserAccount::new_custom("bob", "p", rules);
+        assert!(!engine.check_publish(&user, "a/b", "clients/a/b/data"));
+        assert!(!engine.check_subscribe(&user, "#", "clients/#/data"));
+        assert!(engine.check_publish(&user, "dev1", "clients/dev1/data"));
+    }
+
+    #[tokio::test]
+    async fn anonymous_fallback_only_applies_to_anonymous_clients() {
+        let engine = AclEngine::new(true);
+        let anon = engine.authenticate(None, None, "c").await.unwrap();
+        assert!(engine.check_publish(&anon, "c", "any/topic"));
+        // An authenticated user without rules gets nothing from the anonymous defaults.
+        let user = UserAccount::new_custom("u", "p", vec![]);
+        assert!(!engine.check_publish(&user, "c", "any/topic"));
+        assert!(!engine.check_subscribe(&user, "c", "#"));
+    }
+
+    #[tokio::test]
+    async fn declared_anonymous_account_replaces_default_rules() {
+        let engine = AclEngine::new(true);
+        let accounts = AclEngine::parse_acl("user anonymous\ntopic read public/#\n").unwrap();
+        for a in accounts {
+            engine.add_user(a).await;
+        }
+        let anon = engine.authenticate(None, None, "c").await.unwrap();
+        assert!(engine.check_subscribe(&anon, "c", "public/news"));
+        assert!(!engine.check_publish(&anon, "c", "public/news"));
+        assert!(!engine.check_publish(&anon, "c", "private/x"));
+    }
+
+    #[test]
+    fn file_rules_precede_role_defaults() {
+        let content = "user v password:pw role:viewer rooms:ops\ntopic readwrite rooms/%r/notes\n";
+        let accounts = AclEngine::parse_acl(content).unwrap();
+        let engine = AclEngine::new(false);
+        let viewer = &accounts[0];
+        // The viewer role denies rooms/%r/# by default, but the explicit rule comes first.
+        assert!(engine.check_publish(viewer, "c", "rooms/ops/notes"));
+        assert!(!engine.check_publish(viewer, "c", "rooms/ops/chat"));
+        assert!(engine.check_subscribe(viewer, "c", "rooms/ops/chat"));
+    }
+
+    #[test]
+    fn acl_parser_reports_errors_with_line_numbers() {
+        let err = AclEngine::parse_acl("topic read a/b\n").unwrap_err();
+        assert!(matches!(err, AclFileError::Syntax { line: 1, .. }));
+        let err = AclEngine::parse_acl("user a\ntopic maybe a/b\n").unwrap_err();
+        assert!(matches!(err, AclFileError::Syntax { line: 2, .. }));
+        let err = AclEngine::parse_acl("user a colour:blue\n").unwrap_err();
+        assert!(matches!(err, AclFileError::Syntax { line: 1, .. }));
+        let err = AclEngine::parse_acl("user a\ntopic read a/#/b\n").unwrap_err();
+        assert!(matches!(err, AclFileError::Syntax { line: 2, .. }));
+        let err = AclEngine::parse_acl("user a password_hash:nothex\n").unwrap_err();
+        assert!(matches!(err, AclFileError::Syntax { line: 1, .. }));
+    }
+
+    #[test]
+    fn shipped_acl_file_parses() {
+        let content = std::fs::read_to_string("config/acl.conf").unwrap();
+        let accounts = AclEngine::parse_acl(&content).unwrap();
+        assert!(accounts.iter().any(|a| a.username == ANONYMOUS_USER));
     }
 }

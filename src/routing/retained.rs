@@ -1,10 +1,30 @@
+//! Retained message store (OASIS MQTT v5.0 §3.3.1.3) with count/byte quotas and
+//! Message Expiry Interval support (§3.3.2.3.3).
+
 use crate::protocol::PublishPacket;
-use crate::routing::TopicTrie;
+use crate::routing::topic::{has_wildcards, topic_matches_filter};
 use std::collections::HashMap;
+use std::time::Instant;
+
+#[derive(Debug, Clone)]
+struct RetainedEntry {
+    packet: PublishPacket,
+    expires_at: Option<Instant>,
+}
+
+/// Outcome of [`RetainedStore::update`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainOutcome {
+    Stored,
+    Cleared,
+    /// Nothing changed (e.g. clearing a topic that had no retained message).
+    Unchanged,
+    RejectedQuota,
+}
 
 #[derive(Debug, Clone)]
 pub struct RetainedStore {
-    messages: HashMap<String, PublishPacket>,
+    messages: HashMap<String, RetainedEntry>,
     max_messages: usize,
     current_bytes: usize,
     max_bytes: usize,
@@ -14,6 +34,10 @@ impl Default for RetainedStore {
     fn default() -> Self {
         Self::with_limits(100_000, 64 * 1024 * 1024)
     }
+}
+
+fn entry_size(p: &PublishPacket) -> usize {
+    p.payload.len() + p.topic.len()
 }
 
 impl RetainedStore {
@@ -42,81 +66,102 @@ impl RetainedStore {
         self.max_bytes
     }
 
-    /// Stores or deletes a retained message according to MQTT specifications.
-    /// If payload is empty (zero-length), the retained message for this topic is deleted.
-    pub fn update(&mut self, mut packet: PublishPacket) -> bool {
+    /// Stores or deletes the retained message for `packet.topic`.
+    /// A zero-length payload deletes the retained message (§3.3.1.3).
+    /// `expires_at` is derived from the Message Expiry Interval, if any.
+    pub fn update(
+        &mut self,
+        mut packet: PublishPacket,
+        expires_at: Option<Instant>,
+    ) -> RetainOutcome {
         let old_size = self
             .messages
             .get(&packet.topic)
-            .map(|p| p.payload.len() + p.topic.len())
+            .map(|e| entry_size(&e.packet))
             .unwrap_or(0);
 
         if packet.payload.is_empty() {
-            // OASIS Spec: Empty payload clears the retained message
-            if self.messages.remove(&packet.topic).is_some() {
-                self.current_bytes = self.current_bytes.saturating_sub(old_size);
-                true
-            } else {
-                false
-            }
-        } else {
-            let new_size = packet.payload.len() + packet.topic.len();
-            if self.messages.len() >= self.max_messages
-                && !self.messages.contains_key(&packet.topic)
-            {
-                tracing::warn!(
-                    "Retained store count quota exceeded ({}/{}). Rejecting new topic '{}'",
-                    self.messages.len(),
-                    self.max_messages,
-                    packet.topic
-                );
-                return false;
-            }
-
-            let new_total = self.current_bytes.saturating_sub(old_size) + new_size;
-            if new_total > self.max_bytes {
-                tracing::warn!(
-                    "Retained store byte quota exceeded ({}/{} bytes). Rejecting topic '{}'",
-                    new_total,
-                    self.max_bytes,
-                    packet.topic
-                );
-                return false;
-            }
-
-            self.current_bytes = new_total;
-            // Ensure retain flag is true in the stored message
-            packet.retain = true;
-            self.messages.insert(packet.topic.clone(), packet);
-            true
-        }
-    }
-
-    /// Queries all retained messages that match a newly subscribed topic filter (supports wildcards).
-    pub fn get_matches_for_filter(&self, topic_filter: &str) -> Vec<PublishPacket> {
-        // Fast-path: O(1) direct lookup if no wildcards are present
-        if !topic_filter.contains('+') && !topic_filter.contains('#') {
-            return match self.messages.get(topic_filter) {
-                Some(pkt) => vec![pkt.clone()],
-                None => Vec::new(),
+            return match self.messages.remove(&packet.topic) {
+                Some(_) => {
+                    self.current_bytes = self.current_bytes.saturating_sub(old_size);
+                    RetainOutcome::Cleared
+                }
+                None => RetainOutcome::Unchanged,
             };
         }
 
-        let mut matching_packets = Vec::new();
-
-        // Create a transient trie node to match the incoming filter against stored concrete topics
-        let mut trie = TopicTrie::new();
-        if trie.subscribe(topic_filter, 1u32).is_err() {
-            return matching_packets;
+        if self.messages.len() >= self.max_messages && !self.messages.contains_key(&packet.topic) {
+            tracing::warn!(
+                "Retained store count quota exceeded ({}/{}); rejecting topic '{}'",
+                self.messages.len(),
+                self.max_messages,
+                packet.topic
+            );
+            return RetainOutcome::RejectedQuota;
         }
 
-        for (topic, packet) in &self.messages {
-            if trie.matches(topic).contains(&1u32) {
-                matching_packets.push(packet.clone());
+        let new_total = self.current_bytes.saturating_sub(old_size) + entry_size(&packet);
+        if new_total > self.max_bytes {
+            tracing::warn!(
+                "Retained store byte quota exceeded ({}/{} bytes); rejecting topic '{}'",
+                new_total,
+                self.max_bytes,
+                packet.topic
+            );
+            return RetainOutcome::RejectedQuota;
+        }
+
+        self.current_bytes = new_total;
+        packet.retain = true;
+        packet.dup = false;
+        packet.packet_id = None;
+        self.messages
+            .insert(packet.topic.clone(), RetainedEntry { packet, expires_at });
+        RetainOutcome::Stored
+    }
+
+    /// Returns all live retained messages matching `topic_filter`, with their expiry instants.
+    pub fn matches_for_filter(&self, topic_filter: &str) -> Vec<(PublishPacket, Option<Instant>)> {
+        let now = Instant::now();
+        let live = |e: &&RetainedEntry| e.expires_at.is_none_or(|t| t > now);
+        if !has_wildcards(topic_filter) {
+            return self
+                .messages
+                .get(topic_filter)
+                .filter(live)
+                .map(|e| vec![(e.packet.clone(), e.expires_at)])
+                .unwrap_or_default();
+        }
+        self.messages
+            .iter()
+            .filter(|(topic, _)| topic_matches_filter(topic_filter, topic))
+            .map(|(_, e)| e)
+            .filter(live)
+            .map(|e| (e.packet.clone(), e.expires_at))
+            .collect()
+    }
+
+    /// Convenience wrapper returning only the packets.
+    pub fn get_matches_for_filter(&self, topic_filter: &str) -> Vec<PublishPacket> {
+        self.matches_for_filter(topic_filter)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    /// Drops every message whose expiry interval has elapsed. Returns how many were removed.
+    pub fn purge_expired(&mut self, now: Instant) -> usize {
+        let before = self.messages.len();
+        let mut freed = 0;
+        self.messages.retain(|_, e| {
+            let keep = e.expires_at.is_none_or(|t| t > now);
+            if !keep {
+                freed += entry_size(&e.packet);
             }
-        }
-
-        matching_packets
+            keep
+        });
+        self.current_bytes = self.current_bytes.saturating_sub(freed);
+        before - self.messages.len()
     }
 
     /// Total count of retained messages currently stored.
@@ -135,181 +180,115 @@ mod tests {
     use super::*;
     use crate::protocol::QoS;
     use bytes::Bytes;
+    use std::time::Duration;
+
+    fn msg(topic: &str, payload: &'static [u8]) -> PublishPacket {
+        PublishPacket::new(topic, Bytes::from_static(payload))
+    }
 
     #[test]
-    fn test_retained_store_and_match() {
+    fn store_and_match_with_wildcards() {
         let mut store = RetainedStore::new();
+        let p1 = msg("factory/line1/temp", b"25.0").with_qos(QoS::AtLeastOnce, Some(1));
+        assert_eq!(store.update(p1, None), RetainOutcome::Stored);
+        store.update(msg("factory/line2/temp", b"30.0"), None);
+        store.update(msg("factory", b"root"), None);
+        assert_eq!(store.count(), 3);
 
-        let p1 = PublishPacket {
-            topic: "factory/line1/temp".into(),
-            qos: QoS::AtLeastOnce,
-            retain: true,
-            dup: false,
-            packet_id: Some(1),
-            payload: Bytes::from_static(b"25.0"),
-        };
-        store.update(p1);
-
-        let p2 = PublishPacket {
-            topic: "factory/line2/temp".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"30.0"),
-        };
-        store.update(p2);
-
-        assert_eq!(store.count(), 2);
-
-        // Match wildcard 'factory/+/temp'
-        let matches = store.get_matches_for_filter("factory/+/temp");
-        assert_eq!(matches.len(), 2);
-
-        // Match single exact
+        assert_eq!(store.get_matches_for_filter("factory/+/temp").len(), 2);
+        // `factory/#` also matches the parent topic `factory`.
+        assert_eq!(store.get_matches_for_filter("factory/#").len(), 3);
         let single = store.get_matches_for_filter("factory/line1/temp");
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].payload, Bytes::from_static(b"25.0"));
+        // Stored copies never carry the publisher's packet id.
+        assert_eq!(single[0].packet_id, None);
+        assert!(single[0].retain);
     }
 
     #[test]
-    fn test_retained_empty_payload_erasure() {
+    fn root_wildcards_do_not_return_dollar_topics() {
         let mut store = RetainedStore::new();
+        store.update(msg("$SYS/broker/uptime", b"1"), None);
+        assert!(store.get_matches_for_filter("#").is_empty());
+        assert_eq!(store.get_matches_for_filter("$SYS/#").len(), 1);
+    }
 
-        let p1 = PublishPacket {
-            topic: "device/status".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"ONLINE"),
-        };
-        store.update(p1);
-        assert!(store.contains_topic("device/status"));
-
-        // Sending zero-length payload with retain=true clears the message
-        let clear_pkt = PublishPacket {
-            topic: "device/status".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::new(), // Empty payload
-        };
-        let removed = store.update(clear_pkt);
-        assert!(removed);
-        assert!(!store.contains_topic("device/status"));
+    #[test]
+    fn empty_payload_erases() {
+        let mut store = RetainedStore::new();
+        store.update(msg("device/status", b"ONLINE"), None);
+        assert_eq!(
+            store.update(msg("device/status", b""), None),
+            RetainOutcome::Cleared
+        );
+        assert_eq!(
+            store.update(msg("device/status", b""), None),
+            RetainOutcome::Unchanged
+        );
         assert_eq!(store.count(), 0);
+        assert_eq!(store.current_bytes(), 0);
     }
 
     #[test]
-    fn test_retained_store_capacity_quota() {
+    fn count_quota() {
         let mut store = RetainedStore::with_max_messages(2);
-
-        let p1 = PublishPacket {
-            topic: "topic/1".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"v1"),
-        };
-        let p2 = PublishPacket {
-            topic: "topic/2".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"v2"),
-        };
-        let p3 = PublishPacket {
-            topic: "topic/3".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"v3"),
-        };
-
-        assert!(store.update(p1));
-        assert!(store.update(p2));
-        assert_eq!(store.count(), 2);
-
-        // 3rd topic must be rejected because quota (2) is reached
-        assert!(!store.update(p3));
-        assert_eq!(store.count(), 2);
-        assert!(!store.contains_topic("topic/3"));
-
-        // Updating an existing topic should succeed even if quota is reached
-        let p1_updated = PublishPacket {
-            topic: "topic/1".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"v1_updated"),
-        };
-        assert!(store.update(p1_updated));
+        assert_eq!(
+            store.update(msg("topic/1", b"v1"), None),
+            RetainOutcome::Stored
+        );
+        assert_eq!(
+            store.update(msg("topic/2", b"v2"), None),
+            RetainOutcome::Stored
+        );
+        assert_eq!(
+            store.update(msg("topic/3", b"v3"), None),
+            RetainOutcome::RejectedQuota
+        );
+        // Replacing an existing topic is allowed at the quota.
+        assert_eq!(
+            store.update(msg("topic/1", b"v1b"), None),
+            RetainOutcome::Stored
+        );
         assert_eq!(store.count(), 2);
     }
 
     #[test]
-    fn test_retained_store_byte_quota() {
-        // max 100 messages, but only 30 bytes allowed
+    fn byte_quota() {
         let mut store = RetainedStore::with_limits(100, 30);
-
-        // topic len (4) + payload len (10) = 14 bytes
-        let p1 = PublishPacket {
-            topic: "t/01".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"0123456789"),
-        };
-        assert!(store.update(p1));
-        assert_eq!(store.current_bytes(), 14);
-
-        // topic len (4) + payload len (10) = 14 bytes -> total 28 bytes <= 30
-        let p2 = PublishPacket {
-            topic: "t/02".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"0123456789"),
-        };
-        assert!(store.update(p2));
+        assert_eq!(
+            store.update(msg("t/01", b"0123456789"), None),
+            RetainOutcome::Stored
+        );
+        assert_eq!(
+            store.update(msg("t/02", b"0123456789"), None),
+            RetainOutcome::Stored
+        );
         assert_eq!(store.current_bytes(), 28);
-
-        // topic len (4) + payload len (5) = 9 bytes -> 28 + 9 = 37 > 30 -> rejected!
-        let p3 = PublishPacket {
-            topic: "t/03".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::from_static(b"12345"),
-        };
-        assert!(!store.update(p3.clone()));
-        assert_eq!(store.count(), 2);
-        assert_eq!(store.current_bytes(), 28);
-
-        // Clearing t/01 frees 14 bytes -> total becomes 14
-        let clear_p1 = PublishPacket {
-            topic: "t/01".into(),
-            qos: QoS::AtMostOnce,
-            retain: true,
-            dup: false,
-            packet_id: None,
-            payload: Bytes::new(),
-        };
-        assert!(store.update(clear_p1));
+        assert_eq!(
+            store.update(msg("t/03", b"12345"), None),
+            RetainOutcome::RejectedQuota
+        );
+        store.update(msg("t/01", b""), None);
         assert_eq!(store.current_bytes(), 14);
-
-        // Now p3 fits (14 + 9 = 23 <= 30)
-        assert!(store.update(p3));
-        assert_eq!(store.count(), 2);
+        assert_eq!(
+            store.update(msg("t/03", b"12345"), None),
+            RetainOutcome::Stored
+        );
         assert_eq!(store.current_bytes(), 23);
+    }
+
+    #[test]
+    fn expired_messages_are_hidden_and_purged() {
+        let mut store = RetainedStore::new();
+        let past = Instant::now() - Duration::from_secs(1);
+        let future = Instant::now() + Duration::from_secs(60);
+        store.update(msg("a/old", b"x"), Some(past));
+        store.update(msg("a/new", b"y"), Some(future));
+        assert!(store.get_matches_for_filter("a/old").is_empty());
+        assert_eq!(store.get_matches_for_filter("a/#").len(), 1);
+        assert_eq!(store.purge_expired(Instant::now()), 1);
+        assert_eq!(store.count(), 1);
+        assert_eq!(store.current_bytes(), "a/new".len() + 1);
     }
 }
