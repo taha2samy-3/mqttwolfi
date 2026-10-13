@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -69,6 +70,7 @@ impl Default for LoggingConfig {
 pub struct ListenersConfig {
     pub tcp: TcpListenerConfig,
     pub tls: TlsListenerConfig,
+    pub mqtt_sn: MqttSnListenerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -103,6 +105,30 @@ impl Default for TlsListenerConfig {
             enabled: true,
             bind_address: "0.0.0.0".into(),
             port: 8883,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MqttSnListenerConfig {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub port: u16,
+    pub gateway_id: u8,
+    pub advertise_interval_sec: u16,
+    pub predefined_topics: HashMap<String, String>,
+}
+
+impl Default for MqttSnListenerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "0.0.0.0".into(),
+            port: 1884,
+            gateway_id: 1,
+            advertise_interval_sec: 15,
+            predefined_topics: HashMap::new(),
         }
     }
 }

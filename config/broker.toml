@@ -49,6 +49,21 @@ enabled = true
 bind_address = "0.0.0.0"
 port = 8883
 
+[listeners.mqtt_sn]
+# MQTT-SN UDP Listener for wireless radios, UAVs/Drones, and sensor networks
+enabled = true
+bind_address = "0.0.0.0"
+port = 1884
+gateway_id = 1
+advertise_interval_sec = 15
+
+# Predefined topics mapped directly to 2-byte Topic IDs (avoids in-air text overhead)
+[listeners.mqtt_sn.predefined_topics]
+"1" = "uav/drone_01/telemetry/gps"
+"2" = "uav/drone_01/telemetry/battery"
+"3" = "uav/drone_01/telemetry/attitude"
+"10" = "uav/drone_01/commands"
+
 # ==============================================================================
 # wolfSSL Security & TLS Configuration
 # ==============================================================================
