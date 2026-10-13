@@ -14,8 +14,7 @@ certs/*.pem
 #   Download: https://www.wolfssl.com/products/wolfcrypt-fips/
 #   Install : extract into external/wolfssl-fips-bundle/
 external/wolfssl/build/
-external/wolfssl/build_fips/
-external/wolfssl-fips-bundle/build/
+external/wolfssl-fips-bundle/
 external/wolfMQTT/
 
 # IDE files
@@ -24,7 +23,13 @@ external/wolfMQTT/
 
 # Release archives and distribution artifacts
 dist/
+wolfimq-*/
 *.tar.gz
-*.tar.gz.sha256
+*.zip
+*.sha256
 SHA256SUMS.txt
+
+# Generated benchmark reports (published by CI on each release)
+BENCHMARKS.md
+tls_benchmark_summary.md
 
