@@ -709,20 +709,31 @@ impl MqttPacket {
                 }
                 let packet_id = payload.get_u16();
                 // OASIS MQTT v5.0 §3.9.2.1: Properties in SubAck variable header
-                if (version == ProtocolVersion::V500 || payload.remaining() >= 2) && payload.has_remaining() {
+                if payload.has_remaining() {
                     let mut check = payload.clone();
-                    if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                    let has_v5_props = if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
                         let p_len = props_len as usize;
-                        if check.remaining() >= p_len && (version == ProtocolVersion::V500 || p_len + 1 <= payload.remaining()) {
-                            let is_v5 = if version == ProtocolVersion::V500 {
-                                true
+                        if check.remaining() >= p_len {
+                            if p_len == 0 {
+                                // If props_len == 0, there must be at least one reason code following it
+                                check.remaining() >= 1
                             } else {
-                                p_len > 0 || (payload.remaining() == 2 && check.remaining() == 1)
-                            };
-                            if is_v5 {
-                                payload.advance(payload.len() - check.len() + p_len);
+                                // SubAck properties can only be 0x1F (Reason String) or 0x26 (User Property)
+                                let first_prop = check.chunk()[0];
+                                first_prop == 0x1F || first_prop == 0x26
                             }
+                        } else {
+                            false
                         }
+                    } else {
+                        false
+                    };
+
+                    if has_v5_props {
+                        let props_len = decode_variable_byte_integer(&mut payload)
+                            .map_err(|_| PacketError::MalformedHeader)?
+                            as usize;
+                        payload.advance(props_len);
                     }
                 }
                 let codes_len = payload.remaining();
