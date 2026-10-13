@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // carry a formal CMVP certificate. For a formally validated build
                 // (CMVP #4718), use the wolfSSL commercial FIPS bundle.
                 // See: https://www.wolfssl.com/products/wolfcrypt-fips/
+                #[cfg(feature = "wolfssl-fips")]
                 println!("wolf-mqtt-broker v{} (wolfSSL FIPS-Ready build - FIPS-approved algorithms, TLS 1.3 / mTLS)", env!("CARGO_PKG_VERSION"));
                 #[cfg(not(feature = "wolfssl-fips"))]
                 println!(
