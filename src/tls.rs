@@ -5,9 +5,14 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::TcpStream;
-use tracing::info;
+use tracing::{info, warn};
+
+/// Maximum time allowed for a TLS handshake before the connection is dropped.
+/// Prevents SlowLoris-style resource exhaustion attacks.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[repr(C)]
 pub struct WOLFSSL_CTX {
@@ -187,12 +192,22 @@ impl Drop for WolfTlsStream {
 
 impl WolfTlsStream {
     pub async fn accept(stream: TcpStream, ctx: &Arc<WolfContext>) -> io::Result<Self> {
+        // Wrap the entire TLS handshake in a timeout to prevent SlowLoris resource exhaustion
+        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, Self::do_accept(stream, ctx))
+            .await
+            .map_err(|_| {
+                warn!("TLS handshake timed out after {}s", TLS_HANDSHAKE_TIMEOUT.as_secs());
+                io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timeout")
+            })?
+    }
+
+    async fn do_accept(stream: TcpStream, ctx: &Arc<WolfContext>) -> io::Result<Self> {
         let raw_ssl = unsafe { wolfSSL_new(ctx.as_ptr()) };
         if raw_ssl.is_null() {
             return Err(io::Error::other("wolfSSL_new failed"));
         }
 
-        // Set ALPN "mqtt"
+        // Set ALPN "mqtt" — required for MQTT over TLS (RFC 7301)
         let alpn = b"mqtt\0";
         unsafe {
             wolfSSL_UseALPN(raw_ssl, alpn.as_ptr() as *const _, 4, 4);
@@ -480,7 +495,8 @@ pub fn create_tls_acceptor(
         return Err(format!("Server private key file not found: {}", key_path).into());
     }
 
-    let method = unsafe { wolfSSLv23_server_method() };
+    // Use TLS 1.3 exclusively — wolfSSLv23_server_method would allow TLS 1.0/1.1/1.2
+    let method = unsafe { wolfTLSv1_3_server_method() };
     let raw_ctx = unsafe { wolfSSL_CTX_new(method) };
     if raw_ctx.is_null() {
         return Err("wolfSSL_CTX_new failed".into());
@@ -539,7 +555,8 @@ pub fn create_tls_connector(
         return Err(format!("CA certificate file not found: {}", ca_cert_path).into());
     }
 
-    let method = unsafe { wolfSSLv23_client_method() };
+    // Use TLS 1.3 exclusively for client connections
+    let method = unsafe { wolfTLSv1_3_client_method() };
     let raw_ctx = unsafe { wolfSSL_CTX_new(method) };
     if raw_ctx.is_null() {
         return Err("wolfSSL_CTX_new failed".into());

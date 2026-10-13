@@ -1,3 +1,4 @@
+use crate::auth::{AclEngine, UserAccount, UserRole};
 use crate::config::MqttSnListenerConfig;
 use crate::protocol::sn::{SnPacket, TopicIdType};
 use crate::protocol::{MqttPacket, PublishPacket, QoS};
@@ -10,6 +11,10 @@ use std::time::Instant;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// Maximum number of messages buffered for a sleeping MQTT-SN client.
+/// Prevents memory exhaustion by attackers sending large volumes to sleeping clients.
+const MAX_SLEEPING_BUFFER: usize = 100;
 
 #[derive(Debug)]
 pub struct SnClientSession {
@@ -26,10 +31,19 @@ pub struct SnClientSession {
     pub subscribed_topics: Vec<String>,
     pub buffered_messages: Vec<BytesMut>,
     pub inflight_qos2_msg_ids: HashSet<u16>,
+    /// True only after a successful CONNECT + optional auth
+    pub is_authenticated: bool,
+    /// Authenticated user account (None = anonymous denied)
+    pub user: Option<Arc<UserAccount>>,
 }
 
 impl SnClientSession {
-    pub fn new(client_id_str: String, internal_id: u64, duration_sec: u16) -> Self {
+    pub fn new(
+        client_id_str: String,
+        internal_id: u64,
+        duration_sec: u16,
+        user: Option<Arc<UserAccount>>,
+    ) -> Self {
         Self {
             client_id_str,
             internal_id,
@@ -44,6 +58,8 @@ impl SnClientSession {
             subscribed_topics: Vec::new(),
             buffered_messages: Vec::new(),
             inflight_qos2_msg_ids: HashSet::new(),
+            is_authenticated: true,
+            user,
         }
     }
 
@@ -104,7 +120,10 @@ impl MqttSnServer {
         context: BrokerContext,
     ) -> Result<Self, std::io::Error> {
         let bind_addr = format!("{}:{}", config.bind_address, config.port);
-        let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
+        let socket = UdpSocket::bind(&bind_addr).await?;
+        // SO_BROADCAST must be set before sending to 255.255.255.255
+        socket.set_broadcast(true)?;
+        let socket = Arc::new(socket);
         let mut id_to_name = HashMap::new();
         let mut name_to_id = HashMap::new();
 
@@ -191,6 +210,7 @@ impl MqttSnServer {
                                     peer,
                                     session.internal_id,
                                     session.will.clone(),
+                                    session.subscribed_topics.clone(),
                                 ));
                             }
                         }
@@ -199,11 +219,19 @@ impl MqttSnServer {
 
                 if !expired_peers.is_empty() {
                     let mut lock = reaper_sessions.write().await;
-                    for (peer, internal_id, will) in expired_peers {
+                    for (peer, internal_id, will, subscribed_topics) in expired_peers {
                         lock.remove(&peer);
+                        // Remove client from active map
                         {
                             let mut clients_guard = reaper_context.clients.write().await;
                             clients_guard.remove(&internal_id);
+                        }
+                        // CRITICAL: Also remove all router subscriptions to prevent trie leaks
+                        {
+                            let mut router_guard = reaper_context.router.write().await;
+                            for topic in &subscribed_topics {
+                                router_guard.unsubscribe(topic, &internal_id);
+                            }
                         }
                         if let Some(will_pkt) = will {
                             warn!(

@@ -38,9 +38,11 @@ line_numbers = false
 # Network Listeners (Plain TCP and wolfSSL TLS)
 # ==============================================================================
 [listeners.tcp]
-# Standard unencrypted MQTT listener (useful for internal LAN/debug)
-enabled = true
-bind_address = "0.0.0.0"
+# Plain-text MQTT listener. DISABLED by default — production MUST use TLS (port 8883).
+# Only enable for internal trusted LANs or explicit debug/development sessions.
+# WARNING: Enabling this over untrusted networks transmits credentials in clear text.
+enabled = false
+bind_address = "127.0.0.1"
 port = 1883
 
 [listeners.tls]

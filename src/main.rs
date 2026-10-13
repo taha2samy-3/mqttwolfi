@@ -26,8 +26,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             "-v" | "--version" => {
-                #[cfg(feature = "wolfssl-fips")]
-                println!("wolf-mqtt-broker v{} (wolfSSL FIPS 140-2/3 Validated Cryptographic Module - TLS 1.3 / mTLS)", env!("CARGO_PKG_VERSION"));
+                // "FIPS-Ready" = FIPS-approved algorithms only. This build does NOT
+                // carry a formal CMVP certificate. For a formally validated build
+                // (CMVP #4718), use the wolfSSL commercial FIPS bundle.
+                // See: https://www.wolfssl.com/products/wolfcrypt-fips/
+                println!("wolf-mqtt-broker v{} (wolfSSL FIPS-Ready build - FIPS-approved algorithms, TLS 1.3 / mTLS)", env!("CARGO_PKG_VERSION"));
                 #[cfg(not(feature = "wolfssl-fips"))]
                 println!(
                     "wolf-mqtt-broker v{} (wolfSSL TLS 1.3 / mTLS)",
@@ -64,7 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env!("CARGO_PKG_VERSION")
     );
     #[cfg(feature = "wolfssl-fips")]
-    info!("Cryptographic Engine: wolfSSL FIPS 140-2/3 Validated Cryptographic Module");
+    // NOTE: "FIPS-Ready" = FIPS-approved algorithms only; not a formal CMVP certificate.
+    info!("Cryptographic Engine: wolfSSL FIPS-Ready (FIPS-approved algorithms; no CMVP certificate — see wolfssl.com/products/wolfcrypt-fips/ for formally validated builds)");
     #[cfg(not(feature = "wolfssl-fips"))]
     info!("Cryptographic Engine: wolfSSL TLS 1.3 Standard Module");
     debug!("Log level initialized to: '{}'", config.logging.level);
