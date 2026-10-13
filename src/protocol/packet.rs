@@ -281,6 +281,79 @@ impl MqttPacket {
                     dst.put_slice(&pub_pkt.payload);
                     return Ok(());
                 }
+                MqttPacket::Subscribe { packet_id, topics } => {
+                    let mut var_header = BytesMut::new();
+                    var_header.put_u16(*packet_id);
+                    var_header.put_u8(0x00); // 0 Properties length (MQTT 5.0 Section 3.8.2 compliant)
+                    for (topic, qos) in topics {
+                        var_header.put_u16(topic.len() as u16);
+                        var_header.put_slice(topic.as_bytes());
+                        var_header.put_u8(*qos as u8);
+                    }
+                    dst.put_u8(0x82); // Subscribe fixed header: type 8, reserved flags 0x02
+                    encode_variable_byte_integer(var_header.len() as u32, dst)
+                        .map_err(|_| PacketError::MalformedHeader)?;
+                    dst.put(var_header);
+                    return Ok(());
+                }
+                MqttPacket::Unsubscribe { packet_id, topics } => {
+                    let mut var_header = BytesMut::new();
+                    var_header.put_u16(*packet_id);
+                    var_header.put_u8(0x00); // 0 Properties length (MQTT 5.0 Section 3.10.2 compliant)
+                    for topic in topics {
+                        var_header.put_u16(topic.len() as u16);
+                        var_header.put_slice(topic.as_bytes());
+                    }
+                    dst.put_u8(0xA2); // Unsubscribe fixed header: type 10, reserved flags 0x02
+                    encode_variable_byte_integer(var_header.len() as u32, dst)
+                        .map_err(|_| PacketError::MalformedHeader)?;
+                    dst.put(var_header);
+                    return Ok(());
+                }
+                MqttPacket::PubAck { packet_id } => {
+                    let mut var_header = BytesMut::new();
+                    var_header.put_u16(*packet_id);
+                    var_header.put_u8(0x00); // Reason code 0x00 (Success)
+                    var_header.put_u8(0x00); // 0 Properties length
+                    dst.put_u8(0x40); // PubAck fixed header: type 4
+                    encode_variable_byte_integer(var_header.len() as u32, dst)
+                        .map_err(|_| PacketError::MalformedHeader)?;
+                    dst.put(var_header);
+                    return Ok(());
+                }
+                MqttPacket::PubRec { packet_id } => {
+                    let mut var_header = BytesMut::new();
+                    var_header.put_u16(*packet_id);
+                    var_header.put_u8(0x00); // Reason code 0x00 (Success)
+                    var_header.put_u8(0x00); // 0 Properties length
+                    dst.put_u8(0x50); // PubRec fixed header: type 5
+                    encode_variable_byte_integer(var_header.len() as u32, dst)
+                        .map_err(|_| PacketError::MalformedHeader)?;
+                    dst.put(var_header);
+                    return Ok(());
+                }
+                MqttPacket::PubRel { packet_id } => {
+                    let mut var_header = BytesMut::new();
+                    var_header.put_u16(*packet_id);
+                    var_header.put_u8(0x00); // Reason code 0x00 (Success)
+                    var_header.put_u8(0x00); // 0 Properties length
+                    dst.put_u8(0x62); // PubRel fixed header: type 6, flags 0x02
+                    encode_variable_byte_integer(var_header.len() as u32, dst)
+                        .map_err(|_| PacketError::MalformedHeader)?;
+                    dst.put(var_header);
+                    return Ok(());
+                }
+                MqttPacket::PubComp { packet_id } => {
+                    let mut var_header = BytesMut::new();
+                    var_header.put_u16(*packet_id);
+                    var_header.put_u8(0x00); // Reason code 0x00 (Success)
+                    var_header.put_u8(0x00); // 0 Properties length
+                    dst.put_u8(0x70); // PubComp fixed header: type 7
+                    encode_variable_byte_integer(var_header.len() as u32, dst)
+                        .map_err(|_| PacketError::MalformedHeader)?;
+                    dst.put(var_header);
+                    return Ok(());
+                }
                 MqttPacket::Disconnect => {
                     dst.put_u8(0xE0); // Disconnect fixed header
                     dst.put_u8(0x02); // Remaining length = 2 (Reason code 0x00 + Props len 0x00)
@@ -498,9 +571,9 @@ impl MqttPacket {
         }
     }
 
-    /// Deserializes an MQTT packet from an incoming byte buffer (defaults to MQTT v3.1.1 framing).
+    /// Deserializes an MQTT packet from an incoming byte buffer.
     pub fn decode<B: Buf>(src: &mut B) -> Result<Self, PacketError> {
-        Self::decode_with_version(src, ProtocolVersion::V311)
+        Self::decode_with_version(src, ProtocolVersion::V500)
     }
 
     /// Deserializes an MQTT packet tailored to the client's negotiated protocol version.
@@ -554,7 +627,7 @@ impl MqttPacket {
             }
             PacketType::Disconnect => {
                 // OASIS MQTT v5.0 §3.14.2.1: Disconnect Reason Code & Properties
-                if version == ProtocolVersion::V500 && remaining_len > 0 {
+                if remaining_len > 0 {
                     let _reason_code = payload.get_u8();
                     if payload.has_remaining() {
                         let props_len = decode_variable_byte_integer(&mut payload)
@@ -578,17 +651,30 @@ impl MqttPacket {
                 }
 
                 // OASIS MQTT v5.0 §3.8.2.1: Properties in Subscribe variable header
-                if version == ProtocolVersion::V500 {
-                    if !payload.has_remaining() {
-                        return Err(PacketError::MalformedHeader);
+                if version == ProtocolVersion::V500 && payload.has_remaining() {
+                    let mut check = payload.clone();
+                    let has_properties = if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                        let p_len = props_len as usize;
+                        if check.remaining() >= p_len + 3 {
+                            check.advance(p_len);
+                            let topic_len = check.get_u16() as usize;
+                            topic_len > 0 && check.remaining() >= topic_len + 1
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if has_properties {
+                        let props_len = decode_variable_byte_integer(&mut payload)
+                            .map_err(|_| PacketError::MalformedHeader)?
+                            as usize;
+                        if payload.remaining() < props_len {
+                            return Err(PacketError::MalformedHeader);
+                        }
+                        payload.advance(props_len);
                     }
-                    let props_len = decode_variable_byte_integer(&mut payload)
-                        .map_err(|_| PacketError::MalformedHeader)?
-                        as usize;
-                    if payload.remaining() < props_len {
-                        return Err(PacketError::MalformedHeader);
-                    }
-                    payload.advance(props_len);
                 }
 
                 let mut topics = Vec::new();
@@ -623,14 +709,21 @@ impl MqttPacket {
                 }
                 let packet_id = payload.get_u16();
                 // OASIS MQTT v5.0 §3.9.2.1: Properties in SubAck variable header
-                if version == ProtocolVersion::V500 && payload.has_remaining() {
-                    let props_len = decode_variable_byte_integer(&mut payload)
-                        .map_err(|_| PacketError::MalformedHeader)?
-                        as usize;
-                    if payload.remaining() < props_len {
-                        return Err(PacketError::MalformedHeader);
+                if (version == ProtocolVersion::V500 || payload.remaining() >= 2) && payload.has_remaining() {
+                    let mut check = payload.clone();
+                    if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                        let p_len = props_len as usize;
+                        if check.remaining() >= p_len && (version == ProtocolVersion::V500 || p_len + 1 <= payload.remaining()) {
+                            let is_v5 = if version == ProtocolVersion::V500 {
+                                true
+                            } else {
+                                p_len > 0 || (payload.remaining() == 2 && check.remaining() == 1)
+                            };
+                            if is_v5 {
+                                payload.advance(payload.len() - check.len() + p_len);
+                            }
+                        }
                     }
-                    payload.advance(props_len);
                 }
                 let codes_len = payload.remaining();
                 let mut return_codes = vec![0u8; codes_len];
@@ -650,17 +743,30 @@ impl MqttPacket {
                 }
 
                 // OASIS MQTT v5.0 §3.10.2.1: Properties in Unsubscribe variable header
-                if version == ProtocolVersion::V500 {
-                    if !payload.has_remaining() {
-                        return Err(PacketError::MalformedHeader);
+                if version == ProtocolVersion::V500 && payload.has_remaining() {
+                    let mut check = payload.clone();
+                    let has_properties = if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                        let p_len = props_len as usize;
+                        if check.remaining() >= p_len + 2 {
+                            check.advance(p_len);
+                            let topic_len = check.get_u16() as usize;
+                            topic_len > 0 && check.remaining() >= topic_len
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if has_properties {
+                        let props_len = decode_variable_byte_integer(&mut payload)
+                            .map_err(|_| PacketError::MalformedHeader)?
+                            as usize;
+                        if payload.remaining() < props_len {
+                            return Err(PacketError::MalformedHeader);
+                        }
+                        payload.advance(props_len);
                     }
-                    let props_len = decode_variable_byte_integer(&mut payload)
-                        .map_err(|_| PacketError::MalformedHeader)?
-                        as usize;
-                    if payload.remaining() < props_len {
-                        return Err(PacketError::MalformedHeader);
-                    }
-                    payload.advance(props_len);
                 }
 
                 let mut topics = Vec::new();
@@ -839,17 +945,33 @@ impl MqttPacket {
                 };
 
                 // OASIS MQTT v5.0 §3.3.2.3: Properties Length & Properties in Publish variable header
-                if version == ProtocolVersion::V500 {
-                    if !payload.has_remaining() {
-                        return Err(PacketError::MalformedHeader);
+                if version == ProtocolVersion::V500 && payload.has_remaining() {
+                    let mut check = payload.clone();
+                    let has_valid_props = if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                        let p_len = props_len as usize;
+                        if check.remaining() >= p_len {
+                            if p_len == 0 {
+                                true
+                            } else {
+                                let first_prop = check.chunk()[0];
+                                matches!(
+                                    first_prop,
+                                    0x01 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0B | 0x23 | 0x26
+                                )
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if has_valid_props {
+                        let props_len = decode_variable_byte_integer(&mut payload)
+                            .map_err(|_| PacketError::MalformedHeader)?
+                            as usize;
+                        payload.advance(props_len);
                     }
-                    let props_len = decode_variable_byte_integer(&mut payload)
-                        .map_err(|_| PacketError::MalformedHeader)?
-                        as usize;
-                    if payload.remaining() < props_len {
-                        return Err(PacketError::MalformedHeader);
-                    }
-                    payload.advance(props_len);
                 }
 
                 Ok(MqttPacket::Publish(PublishPacket {
