@@ -1,7 +1,7 @@
-name: Release — Publish Binaries
+name: Release - Publish Binaries
 
-# Triggered automatically when a version tag is pushed: git tag v0.3.1 && git push --tags
-# Or manually from the GitHub Actions UI (workflow_dispatch)
+# Triggered by: git tag v0.3.2 && git push --tags
+# Or manually via GitHub Actions UI (Actions -> Release -> Run workflow)
 on:
   push:
     tags:
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release version tag (e.g. v0.3.1)'
+        description: 'Release version tag (e.g. v0.3.2)'
         required: true
         type: string
 
@@ -22,7 +22,7 @@ jobs:
   # Build Standard Release (wolfSSL open-source, full cipher suite)
   # ─────────────────────────────────────────────────────────────────────────────
   build-standard:
-    name: Build — wolfSSL Standard
+    name: Build - wolfSSL Standard
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository (with submodules)
@@ -58,20 +58,24 @@ jobs:
           cp README.md LICENSE CHANGELOG.md "${PKG}/"
           cp docs/CONFIGURATION_AND_CONTROL.md "${PKG}/docs/" 2>/dev/null || true
 
-          cat > "${PKG}/BUILD-INFO.txt" << EOF
-          WolfiMQ Standard Release -- wolfSSL Open-Source
+          VERSION_TAG=${VERSION}
+          BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > "${PKG}/BUILD-INFO.txt" << BUILDEOF
+          WolfiMQ Standard Release - wolfSSL Open-Source
           ================================================
-          Version : v${VERSION}
+          Version : v${VERSION_TAG}
           Variant : Standard (full cipher suite)
           wolfSSL : Open-source (github.com/wolfSSL/wolfssl)
           TLS     : TLS 1.3 with AES-GCM, ChaCha20-Poly1305, ECDH
           Build   : Release (LTO fat, codegen-units=1)
           Platform: Linux x86_64
-          Date    : $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          EOF
+          Date    : ${BUILD_DATE}
+          BUILDEOF
 
           tar -czf "${PKG}.tar.gz" "${PKG}"
           sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          echo "Packaged: ${PKG}.tar.gz"
+          cat "${PKG}.tar.gz.sha256"
 
       - name: Upload Standard Artifact
         uses: actions/upload-artifact@v4
@@ -82,11 +86,18 @@ jobs:
             *.tar.gz.sha256
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # Build FIPS-Ready Release (requires external/wolfssl-fips-bundle/)
+  # Build FIPS-Ready Release
+  # Skipped gracefully if WOLFSSL_FIPS_BUNDLE_B64 secret is not set.
+  # To enable: add the base64-encoded FIPS bundle as a repo secret.
+  #   tar -czf bundle.tar.gz external/wolfssl-fips-bundle/
+  #   base64 -w0 bundle.tar.gz
+  #   -> paste as WOLFSSL_FIPS_BUNDLE_B64 in Settings -> Secrets -> Actions
   # ─────────────────────────────────────────────────────────────────────────────
   build-fips:
-    name: Build — wolfSSL FIPS-Ready
+    name: Build - wolfSSL FIPS-Ready
     runs-on: ubuntu-latest
+    outputs:
+      built: ${{ steps.fips_check.outputs.available }}
     steps:
       - name: Checkout Repository (with submodules)
         uses: actions/checkout@v4
@@ -104,31 +115,26 @@ jobs:
         with:
           key: release-fips
 
-      # The FIPS-Ready bundle is stored as a GitHub Actions secret (base64 tar).
-      # Set WOLFSSL_FIPS_BUNDLE_B64 in:
-      #   GitHub Settings -> Secrets and variables -> Actions -> Repository secrets
-      #
-      # To encode your bundle:
-      #   tar -czf fips-bundle.tar.gz external/wolfssl-fips-bundle/
-      #   base64 -w0 fips-bundle.tar.gz  # paste output as the secret value
-      - name: Restore FIPS Bundle (from secret)
-        if: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 != '' }}
+      - name: Check FIPS Bundle Secret
+        id: fips_check
+        env:
+          HAS_FIPS: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 != '' }}
+        run: |
+          if [ "${HAS_FIPS}" = "true" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+            echo "FIPS bundle secret is configured - will build FIPS-Ready variant"
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+            echo "::notice title=FIPS Build Skipped::WOLFSSL_FIPS_BUNDLE_B64 secret not set. Only the standard release will be published. See README for FIPS setup."
+          fi
+
+      - name: Restore FIPS Bundle
+        if: steps.fips_check.outputs.available == 'true'
         env:
           WOLFSSL_FIPS_BUNDLE_B64: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 }}
         run: |
           echo "${WOLFSSL_FIPS_BUNDLE_B64}" | base64 -d | tar -xz -C .
-          echo "FIPS bundle extracted"
           ls external/wolfssl-fips-bundle/CMakeLists.txt
-
-      - name: Check FIPS Bundle Available
-        id: fips_check
-        run: |
-          if [ -f "external/wolfssl-fips-bundle/CMakeLists.txt" ]; then
-            echo "available=true" >> $GITHUB_OUTPUT
-          else
-            echo "available=false" >> $GITHUB_OUTPUT
-            echo "::notice title=FIPS Build Skipped::WOLFSSL_FIPS_BUNDLE_B64 secret not set. See README for FIPS setup instructions."
-          fi
 
       - name: Build Release Binaries (FIPS-Ready)
         if: steps.fips_check.outputs.available == 'true'
@@ -168,6 +174,7 @@ jobs:
 
           tar -czf "${PKG}.tar.gz" "${PKG}"
           sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          echo "Packaged: ${PKG}.tar.gz"
 
       - name: Upload FIPS-Ready Artifact
         if: steps.fips_check.outputs.available == 'true'
@@ -212,22 +219,22 @@ jobs:
         run: |
           awk '/^## \[/{found++} found==1{print} found==2{exit}' CHANGELOG.md \
             | tail -n +2 > release-notes.md
-          cat >> release-notes.md << 'EOF'
+          cat >> release-notes.md << 'RNEOF'
 
           ---
           ## Release Artifacts
 
           | File | Description |
           |------|-------------|
-          | `wolfimq-*-wolfssl.tar.gz` | Standard build — full TLS 1.3 cipher suite |
-          | `wolfimq-*-wolfssl-fips-ready.tar.gz` | FIPS-Ready build — FIPS 140-2/3 approved algorithms only |
+          | `wolfimq-*-wolfssl.tar.gz` | Standard build - full TLS 1.3 cipher suite |
+          | `wolfimq-*-wolfssl-fips-ready.tar.gz` | FIPS-Ready build - FIPS 140-2/3 algorithms only |
           | `*.sha256` | SHA-256 checksums for integrity verification |
 
-          ## Verification
+          ## Verify Checksums
           ```bash
           sha256sum -c wolfimq-*.sha256
           ```
-          EOF
+          RNEOF
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
