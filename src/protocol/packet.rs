@@ -20,7 +20,7 @@ impl TryFrom<u8> for ProtocolVersion {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum QoS {
     AtMostOnce = 0,
     AtLeastOnce = 1,
