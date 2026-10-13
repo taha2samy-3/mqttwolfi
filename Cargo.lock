@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "wolf-mqtt-broker"
-version = "0.2.1"
+version = "0.3.1"
 dependencies = [
  "argon2",
  "bitflags",

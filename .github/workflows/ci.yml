@@ -5,12 +5,23 @@ on:
     branches: [ "main", "master", "develop" ]
   pull_request:
     branches: [ "main", "master", "develop" ]
+  # Allow manually triggering releases
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub release after build'
+        required: false
+        default: 'false'
+        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 1: Code Quality (format + clippy)
+  # ─────────────────────────────────────────────────────────────────────────────
   lint-and-format:
     name: Code Formatting & Clippy Lints
     runs-on: ubuntu-latest
@@ -18,7 +29,7 @@ jobs:
       - name: Checkout Repository (with submodules)
         uses: actions/checkout@v4
         with:
-          submodules: recursive   # Fetches external/wolfssl
+          submodules: recursive
 
       - name: Install Build Dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
@@ -40,28 +51,41 @@ jobs:
       - name: Check Code Formatting
         run: task fmt
 
-      - name: Run Clippy Linter
+      - name: Run Clippy Linter (standard wolfSSL)
+        # Use --features wolfssl only — wolfssl-fips is a superset and will
+        # also be caught by the separate FIPS build job below.
         run: task lint
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 2: Tests matrix — one run per wolfSSL variant
+  # ─────────────────────────────────────────────────────────────────────────────
   test-suite:
-    name: Unit, Integration & E2E Tests (${{ matrix.variant }})
+    name: Tests — ${{ matrix.name }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Standard non-FIPS build
-          - variant: standard
-            cargo_features: --features wolfssl
-          # FIPS build — only runs when a validated FIPS source bundle is present
-          # Disabled by default; uncomment when a FIPS-validated wolfSSL bundle is available
-          # - variant: fips
-          #   cargo_features: --features wolfssl-fips
+          # ── Standard wolfSSL (full cipher suite, no algorithm restrictions) ──
+          - name: "wolfSSL Standard"
+            variant: standard
+            cargo_flags: ""
+            build_dir: build
+
+          # ── FIPS-Ready wolfSSL (FIPS 140-2/3 approved algorithms only) ──────
+          # Uses the same open-source wolfSSL tree but with -DWOLFSSL_FIPS=ON
+          # which restricts to FIPS-approved primitives (AES, SHA-2/3, RSA, ECC,
+          # HMAC-SHA, Hash-DRBG). Non-FIPS primitives (ChaCha20, MD5) are removed.
+          - name: "wolfSSL FIPS-Ready"
+            variant: fips
+            cargo_flags: "--no-default-features --features wolfssl-fips"
+            build_dir: build_fips
+
     steps:
       - name: Checkout Repository (with submodules)
         uses: actions/checkout@v4
         with:
-          submodules: recursive   # Fetches external/wolfssl
+          submodules: recursive
 
       - name: Install Build Dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
@@ -71,6 +95,8 @@ jobs:
 
       - name: Setup Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.variant }}
 
       - name: Install Task Runner
         uses: arduino/setup-task@v2
@@ -81,17 +107,132 @@ jobs:
       - name: Generate Testing Certificates (mTLS)
         run: task certs:gen
 
-      - name: Run Unit Tests (Packet Parser & Variables)
-        run: cargo test --test '*' ${{ matrix.cargo_features }} -- --test-threads=4
+      - name: Run All Tests (${{ matrix.name }})
+        run: cargo test --test '*' ${{ matrix.cargo_flags }} -- --test-threads=4
 
-      - name: Run Integration Tests (Session & Topic Routing)
-        run: task test:integration
+      - name: Run E2E Network Tests (${{ matrix.name }})
+        run: cargo test --test test_e2e_network ${{ matrix.cargo_flags }} -- --nocapture
 
-      - name: Run Live TCP Socket E2E Network Tests
-        run: task test:e2e
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 3: Release Builds — produce distributable binaries for both variants
+  # ─────────────────────────────────────────────────────────────────────────────
+  release-build:
+    name: Release Binary — ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "wolfSSL Standard"
+            variant: standard
+            cargo_flags: "--features wolfssl"
+            artifact_suffix: "linux-amd64-wolfssl"
+            build_dir: build
 
+          - name: "wolfSSL FIPS-Ready"
+            variant: fips
+            cargo_flags: "--no-default-features --features wolfssl-fips"
+            artifact_suffix: "linux-amd64-wolfssl-fips-ready"
+            build_dir: build_fips
+
+    steps:
+      - name: Checkout Repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Build Dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.variant }}
+
+      - name: Build Release Binary (${{ matrix.name }})
+        run: |
+          cargo build --release --bin wolf-broker ${{ matrix.cargo_flags }}
+          cargo build --release --bin wolf-bench-tls ${{ matrix.cargo_flags }}
+
+      - name: Package Release Artifact (${{ matrix.name }})
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          PKG="wolfimq-v${VERSION}-${{ matrix.artifact_suffix }}"
+          mkdir -p "${PKG}/bin" "${PKG}/config" "${PKG}/scripts" "${PKG}/docs"
+
+          # Binaries
+          cp target/release/wolf-broker target/release/wolf-bench-tls "${PKG}/bin/"
+
+          # Configuration & scripts
+          cp config/broker.toml config/acl.conf "${PKG}/config/"
+          cp scripts/generate_certs.sh "${PKG}/scripts/"
+
+          # Documentation
+          cp README.md LICENSE CHANGELOG.md "${PKG}/"
+          cp docs/CONFIGURATION_AND_CONTROL.md "${PKG}/docs/" 2>/dev/null || true
+
+          # FIPS variant: include a FIPS notice file
+          if [ "${{ matrix.variant }}" = "fips" ]; then
+            cat > "${PKG}/FIPS-NOTICE.txt" << 'EOF'
+          WolfiMQ FIPS-Ready Build
+          ========================
+          This binary was compiled with wolfSSL FIPS-Ready mode (-DWOLFSSL_FIPS=ON).
+
+          Algorithm profile:
+            ALLOWED : AES-128/256 CBC+GCM, SHA-224/256/384/512, SHA-3, RSA 2048+,
+                      ECDSA/ECDH P-256/P-384/P-521, HMAC-SHA, Hash-DRBG (SP 800-90A)
+            REMOVED : ChaCha20-Poly1305, MD5, DES/3DES, RC4
+
+          IMPORTANT: "FIPS-Ready" means the binary uses only FIPS-approved algorithms
+          and parameters, but does NOT carry a formal CMVP validation certificate.
+
+          For formal FIPS 140-3 validation (CMVP Certificate #4718), replace the
+          wolfSSL source in external/wolfssl with a wolfSSL FIPS validated bundle
+          obtained from https://www.wolfssl.com/products/wolfcrypt-fips/ and rebuild.
+          EOF
+          fi
+
+          # Create archive
+          tar -czvf "${PKG}.tar.gz" "${PKG}"
+          sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+          rm -rf "${PKG}"
+
+          echo "PKG_NAME=${PKG}" >> $GITHUB_ENV
+          echo "TAR_NAME=${PKG}.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_suffix }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 4: Security Audit
+  # ─────────────────────────────────────────────────────────────────────────────
+  security-audit:
+    name: Security & Vulnerability Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run Cargo Audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 5: Performance Benchmarks
+  # ─────────────────────────────────────────────────────────────────────────────
   benchmarks:
-    name: Release Performance Benchmarks
+    name: Performance Benchmarks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository (with submodules)
@@ -117,19 +258,9 @@ jobs:
       - name: Execute High-Precision Benchmarks
         run: task bench
 
-  security-audit:
-    name: Security & Vulnerability Audit
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Run Cargo Audit
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Job 6: Comparative TLS Benchmarks (WolfiMQ vs Mosquitto)
+  # ─────────────────────────────────────────────────────────────────────────────
   comparative-tls-benchmarks:
     name: Comparative TLS Benchmarks (WolfiMQ vs Mosquitto)
     runs-on: ubuntu-latest
@@ -140,7 +271,9 @@ jobs:
           submodules: recursive
 
       - name: Install Build Dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake build-essential mosquitto mosquitto-clients openssl
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -154,13 +287,8 @@ jobs:
           version: 3.x
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Eclipse Mosquitto & OpenSSL
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y mosquitto mosquitto-clients openssl
-
       - name: Generate mTLS Test Certificates
         run: task certs:gen
 
-      - name: Execute Comparative TLS Benchmark (WolfiMQ vs Mosquitto)
+      - name: Execute Comparative TLS Benchmark
         run: task bench:tls:compare
