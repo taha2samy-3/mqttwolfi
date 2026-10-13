@@ -115,6 +115,7 @@ newer versions) are reported as warnings at startup.
 | `max_sessions` | `10000` | Maximum connected MQTT-SN clients. |
 | `allow_qos_minus1` | `true` | Accept connectionless QoS −1 publishes (predefined / short topic ids only). |
 | `retry_interval_sec` | `10` | Retransmission interval for unacknowledged QoS 1/2 messages and REGISTER (Tretry). |
+| `max_idle_sec` | `3600` | Clients that connected with keep-alive 0 are dropped after this much silence. |
 | `max_retries` | `3` | Retransmissions before the client is treated as lost (Nretry). |
 | `predefined_topics` | `{}` | Map of topic id (1–65534, as a string key) to topic name. |
 
@@ -163,6 +164,7 @@ newer versions) are reported as warnings at startup.
 | `max_queued_messages` | `5000` | Messages buffered per session (slow subscriber or offline persistent session). |
 | `max_queued_bytes` | `8388608` | Payload + topic bytes buffered per session. |
 | `queue_full_policy` | `"drop_oldest"` | `drop_oldest` keeps the newest messages, `drop_newest` keeps the oldest. Dropped messages are counted in `$SYS/broker/messages/dropped`. |
+| `max_inflight_messages` | `32` | Unacknowledged outbound QoS 1/2 messages per session. The effective window is the smaller of this and the client's Receive Maximum, and the bytes held for retransmission are also capped by `max_queued_bytes`. |
 | `default_message_expiry_sec` | `0` | Drop queued messages without a Message Expiry Interval after waiting this long. `0` = never. |
 | `max_session_expiry_sec` | `86400` | Cap for the v5.0 Session Expiry Interval, and lifetime of v3.1.1 `CleanSession=0` sessions after disconnect. `0` disables persistent sessions. |
 
@@ -197,7 +199,7 @@ Exit codes: `0` success, `1` runtime or configuration error, `2` invalid argumen
 | Signal | Effect |
 | :--- | :--- |
 | `SIGINT`, `SIGTERM` | Stop accepting connections, send DISCONNECT 0x8B (Server shutting down) to v5.0 clients, close connections, wait up to `shutdown_grace_sec`. |
-| `SIGHUP` | Reload `acl_file`. The new file replaces all accounts atomically; if it does not parse, the old rules stay active and an error is logged. Existing connections keep the permissions they authenticated with. |
+| `SIGHUP` | Reload `acl_file`. The new file replaces all accounts atomically; if it does not parse, the old rules stay active and an error is logged. New rules apply immediately to existing connections and subscriptions (deliveries are re-checked), and removed accounts lose all access; passwords are only checked at the next CONNECT. |
 
 Prefer reading the password from stdin so it does not end up in the shell history:
 
@@ -291,7 +293,7 @@ wolf-simulate --tls --port 8883 --ca certs/ca-cert.pem --cert certs/client-cert.
   (v5.0: DISCONNECT 0x8D), and the Will is published.
 - **Sessions:** v3.1.1 `CleanSession = 0` and v5.0 Session Expiry Interval > 0 keep the session
   after disconnect (capped by `max_session_expiry_sec`; v5.0 clients are told the effective
-  value). Reconnecting with `clean_start = 0` resumes it: CONNACK session present = 1, queued
+  value). Only such a persistent session can be resumed, and only by the same user. Reconnecting with `clean_start = 0` resumes it: CONNACK session present = 1, queued
   messages are delivered, unacknowledged QoS 1/2 messages are resent with DUP and their
   original packet ids.
 - **Takeover:** a new connection with a ClientID in use closes the old connection (v5.0:
@@ -299,7 +301,8 @@ wolf-simulate --tls --port 8883 --ca certs/ca-cert.pem --cert certs/client-cert.
 - **Will:** published on abnormal close, keep-alive timeout, takeover, or DISCONNECT 0x04. A
   v5.0 Will Delay Interval postpones it; resuming the session before then cancels it.
 - **QoS:** each subscriber receives `min(publish QoS, granted QoS)`. Outbound packet ids are
-  allocated per session and never reused while in flight. Inbound QoS 2 duplicates (same
+  allocated per session and never reused while in flight. At most `max_inflight_messages`
+  deliveries (or the client's Receive Maximum, if lower) are unacknowledged at a time. Inbound QoS 2 duplicates (same
   packet id before PUBREL) are acknowledged but not delivered twice.
 - **Flow control:** a v5.0 client's Receive Maximum limits unacknowledged QoS 1/2 deliveries;
   its Maximum Packet Size causes larger messages to be skipped for it.
@@ -328,7 +331,8 @@ sessions like MQTT clients, so subscriptions, retained messages and Will message
 - **QoS:** −1 (no connection, predefined / short ids only, still authorized against
   `acl_user`), 0, 1 and 2. One QoS 1/2 message is in flight per client and retransmitted every
   `retry_interval_sec` with DUP set, up to `max_retries`, after which the client is lost and its
-  Will is published.
+  Will is published. An unacknowledged message stays in the session and is delivered again
+  when a persistent client reconnects.
 - **Sleeping clients:** `DISCONNECT` with a duration puts the client to sleep; messages are queued
   in its session (subject to the queue limits). `PINGREQ` with the ClientID wakes it: queued
   messages are sent, then `PINGRESP`, and the client sleeps again. No message within 1.5 × the

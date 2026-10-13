@@ -5,6 +5,43 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [0.5.1] - 2026-10-13
+
+Fixes from an independent review of the 0.5.0 broker core.
+
+### Fixed
+- **Memory exhaustion through unacknowledged deliveries:** a subscriber that never sent PUBACK
+  could make the broker keep up to 65,535 messages per session (v3.1.1 clients announce no
+  Receive Maximum). The window is now capped by `mqtt.queues.max_inflight_messages` (default 32)
+  and, in bytes, by `max_queued_bytes`.
+- **Non-persistent sessions could be resumed** by a takeover with Clean Start = 0, reporting
+  Session Present = 1 (MQTT-3.1.2-6). Only sessions with an expiry interval are resumed now.
+- **Another user could inherit a session** (subscriptions and queued messages) with
+  `client_id_takeover = "any"`; sessions are only resumed by the same user.
+- **ACL reloads did not affect existing connections:** deliveries, publishes, subscriptions and
+  Wills are now authorized against the current ACL, so revoked rules and removed accounts take
+  effect immediately (deliveries are re-checked against read permission).
+- **MQTT-SN short topic ids could inject U+0000** into a topic name and disconnect every
+  subscribed MQTT client; NUL is rejected in all topic names and filters.
+- Replies queued for a connection that was taken over could be delivered to the new connection.
+- A session being resumed at the exact moment it expired could be discarded under the new
+  connection.
+- After packet identifiers wrapped, a resumed session resent unacknowledged messages out of
+  order (MQTT-4.6.0-1).
+- Delayed Wills were dropped when a new connection with Clean Start ended the session, and were
+  authorized against the new connection's user instead of their owner.
+- TLS: a read needing socket writability (TLS 1.3 KeyUpdate) could replace the writer half's
+  wake-up, stalling outbound traffic.
+- MQTT-SN: a CONNECT that had to wait for a session takeover stalled the whole gateway; an
+  unacknowledged QoS 1/2 message was lost when the link closed instead of staying in the
+  session; clients with keep-alive 0 were never reaped (new `listeners.mqtt_sn.max_idle_sec`).
+
+### Changed
+- The release workflow shows the optional FIPS-Ready job as skipped (instead of green) when the
+  FIPS bundle secret is not configured; no FIPS archive is built in that case.
+
+---
+
 ## [0.5.0] - 2026-10-13
 
 This release reworks the protocol engine after a full review against the OASIS MQTT v3.1.1,

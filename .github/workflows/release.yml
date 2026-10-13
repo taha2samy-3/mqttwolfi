@@ -25,6 +25,7 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
+      fips: ${{ steps.fips.outputs.available }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -40,6 +41,16 @@ jobs:
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      # Secrets cannot be used in job-level `if`, so their presence is exported here.
+      - id: fips
+        name: Check for the FIPS bundle secret
+        env:
+          HAS_FIPS: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 != '' }}
+        run: |
+          echo "available=${HAS_FIPS}" >> "$GITHUB_OUTPUT"
+          if [ "${HAS_FIPS}" != "true" ]; then
+            echo "::notice title=No FIPS build::WOLFSSL_FIPS_BUNDLE_B64 is not set; the FIPS-Ready variant is skipped."
+          fi
 
   test:
     name: Test before release
@@ -135,31 +146,20 @@ jobs:
             wolfimq-*.sha256
 
   build-fips:
-    name: Build linux-x86_64 FIPS-Ready (optional)
+    name: Build linux-x86_64 FIPS-Ready
     needs: [prepare, test]
+    # Shown as "skipped" unless the FIPS-Ready bundle secret is configured.
+    if: needs.prepare.outputs.fips == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Check for the FIPS bundle secret
-        id: check
-        env:
-          HAS_FIPS: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 != '' }}
-        run: |
-          echo "available=${HAS_FIPS}" >> "$GITHUB_OUTPUT"
-          if [ "${HAS_FIPS}" != "true" ]; then
-            echo "::notice title=FIPS build skipped::Set the WOLFSSL_FIPS_BUNDLE_B64 secret to build the FIPS-Ready variant."
-          fi
       - uses: actions/checkout@v4
-        if: steps.check.outputs.available == 'true'
         with:
           ref: ${{ needs.prepare.outputs.tag }}
           submodules: recursive
       - name: Install build dependencies
-        if: steps.check.outputs.available == 'true'
         run: sudo apt-get update -qq && sudo apt-get install -y autoconf automake libtool
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.check.outputs.available == 'true'
       - name: Restore bundle and build
-        if: steps.check.outputs.available == 'true'
         env:
           WOLFSSL_FIPS_BUNDLE_B64: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 }}
         run: |
@@ -173,7 +173,6 @@ jobs:
           tar -czf "${PKG}.tar.gz" "${PKG}"
           sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
-        if: steps.check.outputs.available == 'true'
         with:
           name: dist-fips
           path: wolfimq-*
@@ -201,6 +200,10 @@ jobs:
   publish:
     name: Publish GitHub release
     needs: [prepare, build, build-fips, benchmarks]
+    # build-fips is usually skipped; publish as long as nothing failed.
+    if: >-
+      !cancelled() && needs.build.result == 'success' && needs.benchmarks.result == 'success'
+      && (needs.build-fips.result == 'success' || needs.build-fips.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write

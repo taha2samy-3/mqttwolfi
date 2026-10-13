@@ -107,3 +107,39 @@ async fn oversized_packets_close_v311_connections() {
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test]
+async fn unacknowledged_deliveries_are_capped_by_the_broker() {
+    // v3.1.1 clients announce no Receive Maximum; the broker's own inflight cap applies.
+    let mut options = BrokerOptions::permissive();
+    options.max_inflight_messages = 3;
+    let b = start_broker(options, AclEngine::new(true)).await;
+    let mut sub = connect(b.addr, v3("lazy-acker")).await;
+    sub.subscribe("cap/#", QoS::AtLeastOnce).await.unwrap();
+    let mut publ = connect(b.addr, v3("cap-pub")).await;
+    for i in 0..10u8 {
+        publ.publish(
+            PublishPacket::new("cap/x", Bytes::from(vec![i])).with_qos(QoS::AtLeastOnce, None),
+        )
+        .await
+        .unwrap();
+    }
+    let mut held = Vec::new();
+    while let Ok(Some(MqttPacket::Publish(p))) = sub.recv_timeout(QUIET).await {
+        held.push(p);
+    }
+    assert_eq!(
+        held.len(),
+        3,
+        "only max_inflight_messages may be unacknowledged"
+    );
+    sub.ack_publish(&held[0]).await.unwrap();
+    let next = sub
+        .expect(|p| matches!(p, MqttPacket::Publish(_)))
+        .await
+        .unwrap();
+    let MqttPacket::Publish(next) = next else {
+        unreachable!()
+    };
+    assert_eq!(&next.payload[..], &[3]);
+}

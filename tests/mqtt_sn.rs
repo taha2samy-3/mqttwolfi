@@ -620,3 +620,86 @@ async fn session_limit_is_enforced() {
     );
     let _ = BytesMut::new();
 }
+
+#[tokio::test]
+async fn short_topic_ids_with_nul_are_rejected() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let mut all = connect(t.broker.addr, v3("nul-watch")).await;
+    all.subscribe("#", QoS::AtMostOnce).await.unwrap();
+    let c = SnClient::new(t.gw).await;
+    c.connect("drone-nul", 60).await;
+    c.send(&sn_publish(1, TopicIdType::Short, 0x0041, 5, b"x"))
+        .await;
+    assert_eq!(
+        c.recv().await,
+        SnPacket::PubAck {
+            topic_id: 0x0041,
+            msg_id: 5,
+            return_code: return_code::REJECTED_INVALID_TOPIC_ID
+        }
+    );
+    c.send(&sn_publish(-1, TopicIdType::Short, 0x0041, 0, b"y"))
+        .await;
+    assert_no_publish(&mut all).await;
+    // The MQTT subscriber is still connected and healthy.
+    all.ping().await.unwrap();
+}
+
+#[tokio::test]
+async fn clients_with_keep_alive_zero_are_reaped_when_idle() {
+    let t = sn_setup(AclEngine::new(true), |cfg| cfg.max_idle_sec = 1).await;
+    let c = SnClient::new(t.gw).await;
+    c.connect("idle-forever", 0).await;
+    assert_eq!(t.broker.ctx.session_count(), 1);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(t.broker.ctx.session_count(), 0);
+}
+
+#[tokio::test]
+async fn unacknowledged_messages_survive_an_sn_reconnect() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let c = SnClient::new(t.gw).await;
+    let connect = |clean_session| SnPacket::Connect {
+        will: false,
+        clean_session,
+        duration: 60,
+        client_id: "persistent-drone".into(),
+    };
+    c.send(&connect(false)).await;
+    assert_eq!(c.recv().await, SnPacket::ConnAck { return_code: 0 });
+    c.send(&SnPacket::Subscribe {
+        dup: false,
+        qos: 1,
+        topic_id_type: TopicIdType::Predefined,
+        msg_id: 1,
+        topic_id: 2,
+        topic_name: None,
+    })
+    .await;
+    c.recv().await;
+
+    let mut gcs = connect_v3_helper(&t).await;
+    gcs.publish(msg("uav/drone_01/commands", b"keep-me", QoS::AtLeastOnce))
+        .await
+        .unwrap();
+    let SnPacket::Publish { data, .. } = c.recv().await else {
+        panic!("expected PUBLISH")
+    };
+    assert_eq!(&data[..], b"keep-me");
+
+    // Reconnect without acknowledging: the message is delivered again.
+    c.send(&connect(false)).await;
+    let mut redelivered = false;
+    for _ in 0..3 {
+        if let SnPacket::Publish { data, .. } = c.recv().await {
+            assert_eq!(&data[..], b"keep-me");
+            redelivered = true;
+            break;
+        }
+    }
+    assert!(redelivered);
+}
+
+async fn connect_v3_helper(t: &SnTest) -> wolf_mqtt::client::RawClient {
+    connect(t.broker.addr, v3("gcs-persist")).await
+}

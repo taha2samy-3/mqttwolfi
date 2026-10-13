@@ -402,6 +402,18 @@ impl AclEngine {
         self.snapshot().len()
     }
 
+    /// The current account for `username`, reflecting ACL reloads. The anonymous identity is
+    /// resolved as for new connections; an account that no longer exists yields `None`.
+    pub fn current_account(&self, username: &str) -> Option<Arc<UserAccount>> {
+        if let Some(account) = self.snapshot().get(username) {
+            return Some(Arc::clone(account));
+        }
+        if username == ANONYMOUS_USER {
+            return self.anonymous_identity();
+        }
+        None
+    }
+
     /// The identity used for anonymous clients, if anonymous access is enabled.
     pub fn anonymous_identity(&self) -> Option<Arc<UserAccount>> {
         if !self.allow_anonymous {

@@ -567,3 +567,24 @@ async fn invalid_utf8_with_payload_format_indicator_is_rejected() {
         reason::PAYLOAD_FORMAT_INVALID
     );
 }
+
+#[tokio::test]
+async fn delayed_will_is_published_when_a_clean_start_ends_the_session() {
+    let b = open_broker().await;
+    let mut watcher = connect(b.addr, v5("dw-watch")).await;
+    watcher.subscribe("dw/#", QoS::AtMostOnce).await.unwrap();
+    let mut will = msg("dw/gone", b"bye", QoS::AtMostOnce);
+    will.properties = Properties(vec![Property::WillDelayInterval(30)]);
+    let conn = with_props(
+        v5("dw-client").with_will(will),
+        vec![Property::SessionExpiryInterval(60)],
+    );
+    let _old = connect(b.addr, conn).await;
+    // A new connection with Clean Start ends the old session, so its Will is due now.
+    let _new = connect(b.addr, v5("dw-client")).await;
+    let p = tokio::time::timeout(Duration::from_secs(2), watcher.recv_publish())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&p.payload[..], b"bye");
+}

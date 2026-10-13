@@ -784,10 +784,7 @@ impl Gateway {
     ) -> bool {
         let user = link.session.user();
         if !is_valid_topic_name(&topic)
-            || !self
-                .ctx
-                .acl
-                .check_publish(&user, &link.session.client_id, &topic)
+            || !self.ctx.may_publish(&user, &link.session.client_id, &topic)
         {
             warn!(
                 "MQTT-SN client '{}' Will topic '{}' rejected",
@@ -983,10 +980,7 @@ impl Gateway {
         let user = link.session.user();
         let qos = qos_from_sn(qos as u8);
         if qos > self.ctx.options.maximum_qos
-            || !self
-                .ctx
-                .acl
-                .check_publish(&user, &link.session.client_id, &topic)
+            || !self.ctx.may_publish(&user, &link.session.client_id, &topic)
         {
             warn!(
                 "MQTT-SN publish by '{}' to '{}' denied",
@@ -1056,8 +1050,7 @@ impl Gateway {
         if (wildcard && !self.ctx.options.allow_wildcard_subscriptions)
             || !self
                 .ctx
-                .acl
-                .check_subscribe(&user, &link.session.client_id, &filter)
+                .may_subscribe(&user, &link.session.client_id, &filter)
         {
             warn!(
                 "MQTT-SN subscription of '{}' to '{}' denied",

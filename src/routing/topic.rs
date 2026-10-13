@@ -177,7 +177,10 @@ mod tests {
 
     #[test]
     fn nul_is_rejected_in_names_and_filters() {
-        assert_eq!(validate_topic_filter("a/\0"), Err(TopicError::InvalidCharacter));
+        assert_eq!(
+            validate_topic_filter("a/\0"),
+            Err(TopicError::InvalidCharacter)
+        );
         assert!(!is_valid_topic_name("\0A"));
         assert!(is_valid_topic_name("AB"));
     }

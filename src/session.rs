@@ -216,7 +216,10 @@ impl SessionState {
 
     /// Handles PUBCOMP; returns true when it completed an outbound QoS 2 flow.
     pub fn complete_qos2(&mut self, pid: u16) -> bool {
-        let hit = matches!(self.inflight.get(&pid).map(|e| &e.item), Some(InflightOut::PubRel));
+        let hit = matches!(
+            self.inflight.get(&pid).map(|e| &e.item),
+            Some(InflightOut::PubRel)
+        );
         if hit {
             self.remove(pid);
         }
@@ -236,7 +239,10 @@ impl SessionState {
             .map(|(pid, e)| (e.seq, *pid, e.item.clone()))
             .collect();
         entries.sort_by_key(|(seq, _, _)| *seq);
-        entries.into_iter().map(|(_, pid, item)| (pid, item)).collect()
+        entries
+            .into_iter()
+            .map(|(_, pid, item)| (pid, item))
+            .collect()
     }
 
     /// Number of unacknowledged outbound QoS 1/2 messages.
@@ -285,7 +291,11 @@ mod tests {
     fn packet_ids_skip_zero_and_inflight_entries() {
         let s = session();
         let mut st = s.state();
-        let a = st.track_outbound(qos(QoS::AtLeastOnce, b"")).unwrap().packet_id.unwrap();
+        let a = st
+            .track_outbound(qos(QoS::AtLeastOnce, b""))
+            .unwrap()
+            .packet_id
+            .unwrap();
         assert_eq!(a, 1);
         st.next_packet_id = u16::MAX;
         assert_eq!(st.allocate_packet_id(), Some(u16::MAX));
@@ -307,14 +317,29 @@ mod tests {
     fn qos_flows_update_counts_and_bytes() {
         let s = session();
         let mut st = s.state();
-        let p1 = st.track_outbound(qos(QoS::AtLeastOnce, b"1234")).unwrap().packet_id.unwrap();
-        let p2 = st.track_outbound(qos(QoS::ExactlyOnce, b"12")).unwrap().packet_id.unwrap();
+        let p1 = st
+            .track_outbound(qos(QoS::AtLeastOnce, b"1234"))
+            .unwrap()
+            .packet_id
+            .unwrap();
+        let p2 = st
+            .track_outbound(qos(QoS::ExactlyOnce, b"12"))
+            .unwrap()
+            .packet_id
+            .unwrap();
         assert_eq!((st.inflight_count(), st.inflight_bytes()), (2, 5 + 3));
-        assert!(!st.complete_qos1(p2), "PUBACK must not complete a QoS 2 message");
+        assert!(
+            !st.complete_qos1(p2),
+            "PUBACK must not complete a QoS 2 message"
+        );
         assert!(st.complete_qos1(p1));
         assert_eq!(st.pubrec(p2, false), PubRecOutcome::Release);
         assert_eq!((st.inflight_count(), st.inflight_bytes()), (1, 0));
-        assert_eq!(st.pubrec(p2, false), PubRecOutcome::Release, "duplicate PUBREC");
+        assert_eq!(
+            st.pubrec(p2, false),
+            PubRecOutcome::Release,
+            "duplicate PUBREC"
+        );
         assert!(st.complete_qos2(p2));
         assert_eq!(st.pubrec(p2, false), PubRecOutcome::Unknown);
         assert_eq!((st.inflight_count(), st.inflight_bytes()), (0, 0));
@@ -326,7 +351,12 @@ mod tests {
         let mut st = s.state();
         st.next_packet_id = u16::MAX - 1;
         let ids: Vec<u16> = (0..4)
-            .map(|_| st.track_outbound(qos(QoS::AtLeastOnce, b"x")).unwrap().packet_id.unwrap())
+            .map(|_| {
+                st.track_outbound(qos(QoS::AtLeastOnce, b"x"))
+                    .unwrap()
+                    .packet_id
+                    .unwrap()
+            })
             .collect();
         assert_eq!(ids, vec![u16::MAX - 1, u16::MAX, 1, 2]);
         let resend: Vec<u16> = st.resend_list().into_iter().map(|(pid, _)| pid).collect();

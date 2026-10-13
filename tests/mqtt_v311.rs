@@ -73,7 +73,10 @@ async fn qos2_publisher_flow_and_duplicate_suppression() {
 
 #[tokio::test]
 async fn outbound_packet_ids_are_unique_per_subscriber_across_publishers() {
-    let b = open_broker().await;
+    // Allow more unacknowledged deliveries than the default cap of 32.
+    let mut options = BrokerOptions::permissive();
+    options.max_inflight_messages = 100;
+    let b = start_broker(options, AclEngine::new(true)).await;
     let mut sub = connect(b.addr, v3("pid-sub")).await;
     sub.subscribe("pid/#", QoS::AtLeastOnce).await.unwrap();
 
@@ -376,4 +379,23 @@ async fn reconnect_with_same_client_id_closes_previous_connection() {
     old.wait_closed(Duration::from_secs(2)).await.unwrap();
     assert_eq!(&next_publish(&mut watcher).await.payload[..], b"replaced");
     new.ping().await.unwrap();
+}
+
+#[tokio::test]
+async fn takeover_never_resumes_a_non_persistent_session() {
+    let b = open_broker().await;
+    // A clean session (expiry 0) with a subscription, still connected.
+    let mut a = connect(b.addr, v3("shared-cid")).await;
+    a.subscribe("np/#", QoS::AtMostOnce).await.unwrap();
+    // A takeover asking to resume must not inherit it (MQTT-3.1.2-6).
+    let mut resume = v3("shared-cid");
+    resume.clean_start = false;
+    let (mut c, ack) = RawClient::connect(b.addr, resume).await.unwrap();
+    assert!(!ack.session_present);
+    a.wait_closed(Duration::from_secs(2)).await.unwrap();
+    let mut publ = connect(b.addr, v3("np-pub")).await;
+    publ.publish(msg("np/1", b"x", QoS::AtMostOnce))
+        .await
+        .unwrap();
+    assert_no_publish(&mut c).await;
 }

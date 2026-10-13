@@ -99,7 +99,7 @@ WOLFIMQ_SECURITY__TLS__ALPN_PROTOCOLS='["mqtt"]' \
 | `wolf-broker --check-config` | Validate configuration, ACL file and TLS material, then exit |
 | `wolf-broker --print-config` | Print the effective configuration (file + environment) |
 | `wolf-broker --hash-password` | Read a password on stdin, print an `acl.conf` `password_hash:` entry |
-| `kill -HUP <pid>` | Reload the ACL file atomically (a broken file is rejected) |
+| `kill -HUP <pid>` | Reload the ACL file atomically; applies to existing connections too (a broken file is rejected) |
 | `kill -TERM <pid>` | Graceful shutdown (v5.0 clients receive DISCONNECT 0x8B) |
 
 Unknown or misspelled keys produce a warning at startup. See

@@ -446,7 +446,7 @@ async fn accept_connect<W: AsyncWrite + Unpin>(
     }
 
     if let Some(will) = connect.will.as_mut() {
-        if !ctx.acl.check_publish(&user, &client_id, &will.topic) {
+        if !ctx.may_publish(&user, &client_id, &will.topic) {
             warn!(
                 "Client '{}' Will topic '{}' is not authorized",
                 client_id, will.topic
@@ -704,8 +704,7 @@ impl Conn<'_> {
 
         if !self
             .ctx
-            .acl
-            .check_publish(&self.user, &self.session.client_id, &p.topic)
+            .may_publish(&self.user, &self.session.client_id, &p.topic)
         {
             warn!(
                 "Publish by '{}' to '{}' denied",
@@ -789,8 +788,7 @@ impl Conn<'_> {
             }
             if !self
                 .ctx
-                .acl
-                .check_subscribe(&self.user, &self.session.client_id, effective_filter)
+                .may_subscribe(&self.user, &self.session.client_id, effective_filter)
             {
                 warn!(
                     "Subscription of '{}' to '{}' denied",

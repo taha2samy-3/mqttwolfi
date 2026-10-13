@@ -301,3 +301,73 @@ async fn acl_reload_replaces_rules_atomically() {
     assert_eq!(c.subscribe("b/z", QoS::AtMostOnce).await.unwrap(), 0);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[tokio::test]
+async fn acl_changes_apply_to_existing_subscriptions_and_sessions() {
+    let dir = std::env::temp_dir().join(format!("wolfimq-acl2-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("acl.conf");
+    std::fs::write(
+        &path,
+        "user r password:p\ntopic read feed/#\nuser w password:p\ntopic write feed/#\n",
+    )
+    .unwrap();
+    let acl = AclEngine::new(false);
+    acl.load_from_acl_file(&path).await.unwrap();
+    let b = start_broker(BrokerOptions::permissive(), acl).await;
+    let mut reader = login(b.addr, "reader", "r", "p").await;
+    assert_eq!(
+        reader.subscribe("feed/#", QoS::AtMostOnce).await.unwrap(),
+        0
+    );
+    let mut writer = login(b.addr, "writer", "w", "p").await;
+    writer
+        .publish(msg("feed/1", b"before", QoS::AtMostOnce))
+        .await
+        .unwrap();
+    assert_eq!(&next_publish(&mut reader).await.payload[..], b"before");
+
+    // Revoke read access: the existing subscription stops delivering.
+    std::fs::write(
+        &path,
+        "user r password:p\nuser w password:p\ntopic write feed/#\n",
+    )
+    .unwrap();
+    b.ctx.acl.load_from_acl_file(&path).await.unwrap();
+    writer
+        .publish(msg("feed/1", b"after", QoS::AtMostOnce))
+        .await
+        .unwrap();
+    assert_no_publish(&mut reader).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn sessions_are_never_resumed_by_another_user() {
+    let mut options = BrokerOptions::permissive();
+    options.client_id_takeover_any = true;
+    let b = acl_broker(options, false).await;
+    let mut persistent = v5("handover").with_credentials("dev_sarah", "sarah_dev_pass");
+    persistent.properties =
+        wolf_mqtt::Properties(vec![wolf_mqtt::Property::SessionExpiryInterval(60)]);
+    let mut sarah = connect(b.addr, persistent).await;
+    sarah
+        .subscribe("rooms/engineering/chat", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    sarah.disconnect().await.unwrap();
+
+    let mut takeover = v5("handover").with_credentials("ops_alex", "alex_ops_pass");
+    takeover.clean_start = false;
+    let (mut alex, ack) = RawClient::connect(b.addr, takeover).await.unwrap();
+    assert_eq!(ack.reason_code, 0);
+    assert!(
+        !ack.session_present,
+        "another user must get a fresh session"
+    );
+    let mut lead = login(b.addr, "lead-2", "ops_lead", "moderator_password").await;
+    lead.publish(msg("rooms/engineering/chat", b"private", QoS::AtMostOnce))
+        .await
+        .unwrap();
+    assert_no_publish(&mut alex).await;
+}

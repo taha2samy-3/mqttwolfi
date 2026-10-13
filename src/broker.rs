@@ -475,7 +475,7 @@ impl BrokerContext {
     }
 
     fn publish_will(&self, client_id: &str, owner: &UserAccount, mut will: PublishPacket) {
-        if !self.acl.check_publish(owner, client_id, &will.topic) {
+        if !self.may_publish(owner, client_id, &will.topic) {
             warn!(
                 "Will of '{}' on '{}' not published: not authorized",
                 client_id, will.topic
@@ -488,6 +488,30 @@ impl BrokerContext {
         will.packet_id = None;
         will.dup = false;
         self.route_message(None, will);
+    }
+
+    // ── Authorization ────────────────────────────────────────────────────────
+    //
+    // Decisions use the account as currently defined in the ACL, not the copy taken at
+    // CONNECT, so an ACL reload (SIGHUP) applies to existing connections and subscriptions,
+    // and a removed account loses all access.
+
+    pub fn may_publish(&self, user: &UserAccount, client_id: &str, topic: &str) -> bool {
+        self.acl
+            .current_account(&user.username)
+            .is_some_and(|u| self.acl.check_publish(&u, client_id, topic))
+    }
+
+    pub fn may_subscribe(&self, user: &UserAccount, client_id: &str, filter: &str) -> bool {
+        self.acl
+            .current_account(&user.username)
+            .is_some_and(|u| self.acl.check_subscribe(&u, client_id, filter))
+    }
+
+    pub fn may_read(&self, user: &UserAccount, client_id: &str, topic: &str) -> bool {
+        self.acl
+            .current_account(&user.username)
+            .is_some_and(|u| self.acl.check_read(&u, client_id, topic))
     }
 
     // ── Subscriptions ────────────────────────────────────────────────────────
@@ -524,7 +548,7 @@ impl BrokerContext {
         let user = session.user();
         let mut n = 0;
         for (mut p, expires_at) in matches {
-            if !self.acl.check_read(&user, &session.client_id, &p.topic) {
+            if !self.may_read(&user, &session.client_id, &p.topic) {
                 continue;
             }
             p.qos = p.qos.min(sub.options.qos);
@@ -601,10 +625,7 @@ impl BrokerContext {
         for (session, target) in targets {
             // Re-check read access at delivery time: covers ACL reloads and sessions whose
             // subscriptions predate a rule change.
-            if !self
-                .acl
-                .check_read(&session.user(), &session.client_id, &base.topic)
-            {
+            if !self.may_read(&session.user(), &session.client_id, &base.topic) {
                 continue;
             }
             count += 1;

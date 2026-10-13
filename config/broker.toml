@@ -60,6 +60,8 @@ allow_qos_minus1 = true
 # Retransmission of unacknowledged QoS 1/2 messages (Tretry seconds, Nretry attempts).
 retry_interval_sec = 10
 max_retries = 3
+# Drop clients that connected with keep-alive 0 after this much silence.
+max_idle_sec = 3600
 
 [listeners.mqtt_sn.predefined_topics]
 "1" = "uav/drone_01/telemetry/gps"
@@ -125,6 +127,8 @@ max_queued_messages = 5000
 max_queued_bytes = 8388608
 # "drop_oldest" or "drop_newest"
 queue_full_policy = "drop_oldest"
+# Unacknowledged QoS 1/2 deliveries per session (also limited by the client's Receive Maximum).
+max_inflight_messages = 32
 # Drop messages without a Message Expiry Interval after waiting this long in a queue (0 = never).
 default_message_expiry_sec = 0
 # Upper bound for Session Expiry Interval; lifetime of MQTT v3.1.1 CleanSession=0 sessions.
