@@ -809,7 +809,7 @@ mod tests {
             qos: -1,
             retain: false,
             topic_id_type: TopicIdType::Short,
-            topic_id: u16::from_be_bytes([b'A', b'B']),
+            topic_id: u16::from_be_bytes(*b"AB"),
             msg_id: 0,
             data: Bytes::from_static(b"FAST-DATA"),
         };
