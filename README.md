@@ -1,327 +1,186 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="WolfiMQ Banner Logo" width="580"/>
+  <img src="assets/logo.svg" alt="WolfiMQ" width="720"/>
 </p>
 
 <p align="center">
-  <strong>Lightweight, Memory-Safe MQTT v3.1.1, v5.0 &amp; MQTT-SN v1.2 Broker in Rust — Native wolfSSL TLS 1.3 · Standard &amp; FIPS-Ready Builds</strong>
-</p>
-
-<p align="center">
-  <a href="#project-status--architectural-matrix">Status Matrix</a> •
-  <a href="#about-wolfimq">About</a> •
-  <a href="#tls--cryptography-architecture">TLS Architecture</a> •
-  <a href="#benchmarks--methodology">Benchmarks</a> •
-  <a href="#security--access-control">Security & RBAC</a> •
+  <a href="#features">Features</a> •
+  <a href="#quick-start">Quick start</a> •
   <a href="#configuration">Configuration</a> •
-  <a href="#testing--ci">Testing & CI</a> •
-  <a href="#license--governance">License</a>
+  <a href="#security">Security</a> •
+  <a href="#mqtt-sn-gateway">MQTT-SN</a> •
+  <a href="#benchmarks">Benchmarks</a> •
+  <a href="#development">Development</a> •
+  <a href="#license">License</a>
 </p>
 
 ---
 
-## Project Status & Architectural Matrix
+**WolfiMQ** is an MQTT broker written in Rust. It speaks MQTT v3.1.1, MQTT v5.0 and
+MQTT-SN v1.2 (UDP), uses [wolfSSL](https://www.wolfssl.com/) for TLS 1.3 / mutual TLS (with an
+optional FIPS-Ready build), and ships as a single binary for Linux, Windows and macOS.
 
-> ⚠️ **Development Stage Notice:** WolfiMQ is an emerging, active-development open-source MQTT broker engine written in Rust. It provides clean protocol codecs, in-memory topic routing, bounded session queues with backpressure, role-based access control, TLS 1.3 / mTLS mutual authentication, and native OASIS MQTT-SN v1.2 over UDP. It is **in early-stage development** and is **not yet a distributed cluster** or disk-persistent broker like EMQX or Mosquitto with storage plugins. The matrix below outlines currently verified capabilities versus roadmap items.
+> **Status:** early-stage. The broker is a single node and keeps all state in memory
+> (sessions and retained messages are lost on restart). It is not a replacement for clustered
+> or disk-persistent brokers yet.
 
-### Feature Implementation Matrix
+## Features
 
-| Category | Capability / Feature | Status | Notes & Verification |
-| :--- | :--- | :---: | :--- |
-| **Transport** | TCP Listener (Plaintext) | ✅ Implemented | Asynchronous Tokio TCP server on configurable host/port with unified `BrokerContext` |
-| **Transport** | TLS 1.3 / 1.2 Listener (mTLS) | ✅ Implemented | Full mutual authentication, ALPN (`mqtt`), shared routing state with TCP listener |
-| **Transport** | MQTT-SN Listener (UDP) | ✅ Implemented | OASIS MQTT-SN v1.2 over UDP (Port 1884) with predefined topic mappings (DTLS transport encapsulation on roadmap) |
-| **Multi-Listener**| Unified Broker State & Cross-Routing | ✅ Implemented | TCP, TLS, and UDP SN listeners share router, sessions, ACL, and retained store ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)) |
-| **MQTT-SN 1.2**| Predefined & Short Topic IDs | ✅ Implemented | Zero-bandwidth topic IDs for aerial telemetry (UAVs / Drones) and constrained wireless sensors |
-| **MQTT-SN 1.2**| QoS -1 (Ultra-Fast Fire & Forget) | ✅ Implemented | Low-power stateless publishing without prior `CONNECT` handshake |
-| **MQTT-SN 1.2**| Cross-Protocol Fanout (UDP $\leftrightarrow$ TCP) | ✅ Implemented | Bi-directional message delivery between UDP sensor nodes and TCP/TLS ground control stations |
-| **MQTT 3.1.1** | CONNECT, CONNACK, PINGREQ, DISCONNECT | ✅ Implemented | Bounds-checked DoS-hardened codecs, duplicate CONNECT rejected, duplicate ClientID replaces session |
-| **MQTT 3.1.1** | PUBLISH & PUBACK (QoS 0 & QoS 1) | ✅ Implemented | Wildcards in publish topic rejected, live delivery clears retain flag per MQTT-3.3.1-9 |
-| **MQTT 3.1.1** | SUBSCRIBE & SUBACK | ✅ Implemented | Underflow-safe decoding, reduced lock contention during ACL verification |
-| **MQTT 3.1.1** | UNSUBSCRIBE & UNSUBACK | ✅ Implemented | Live unsubscription handling with recursive Topic Trie node pruning |
-| **MQTT 3.1.1** | Retained Messages | ✅ Implemented | Retained QoS 1 outbound packet ID generation, late subscriber delivery, empty-payload erasure |
-| **MQTT 3.1.1** | Last Will & Testament (LWT) | ✅ Implemented | Triggered on socket collapse or Keep-Alive timeout, cancelled on clean DISCONNECT |
-| **MQTT 5.0** | v5 Wire Codecs, Connect & Reason Codes | ✅ Implemented | Full v5 CONNECT, CONNACK, PUBACK, DISCONNECT framing and spec-compliant reason codes |
-| **MQTT 5.0** | Properties Parsing & Will Properties | ✅ Implemented | Variable Byte Integer properties length parsing & skipping in CONNECT, Will, CONNACK, and PUBACK |
-| **MQTT 5.0** | Cross-Protocol Interoperability | ✅ Implemented | Seamless bidirectional message exchange between v3.1.1 and v5.0 clients ([`tests/test_mqtt5_conformance_and_interop.rs`](tests/test_mqtt5_conformance_and_interop.rs)) |
-| **Keep-Alive** | Keep-Alive Timeout Enforcement | ✅ Implemented | Automatic 1.5× `keep_alive_sec` activity timeout, dead session cleanup, and LWT dispatch |
-| **QoS Levels** | QoS 0 (At most once) & QoS 1 (At least once)| ✅ Implemented | Fully tested and verified |
-| **QoS Levels** | QoS 2 (Handshake: PUBREC, PUBREL, PUBCOMP)| ✅ Implemented | Full 4-step state machine (`PUBREC`, `PUBREL`, `PUBCOMP`) with duplicate deduplication across TCP, TLS, and UDP SN ([`tests/test_unified_listeners_and_hardening.rs`](tests/test_unified_listeners_and_hardening.rs), [`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)) |
-| **Routing** | Topic Trie (`+` and `#` wildcards) | ✅ Implemented | Radix trie lookup with root wildcard `$SYS/` isolation per MQTT-4.7.2-1 |
-| **Queues** | Bounded Backpressure & Drop Policies | ✅ Implemented | Bounded channels (`mpsc::channel(1024)`) with non-blocking `try_send` and slow-consumer protection |
-| **Security** | Argon2id Password Hashing | ✅ Implemented | Memory-hard verification offloaded to worker threads via `tokio::task::spawn_blocking` |
-| **Security** | Role-Based Access Control (RBAC) & Rooms | ✅ Implemented | Dynamic macros (`%u`, `%c`, `%r`), room isolation, wildcard sanitization, declarative [`config/acl.conf`](config/acl.conf) |
-| **Security** | Pass-the-Hash Elimination & Strict Auth | ✅ Implemented | Raw hash fallback eliminated, empty passwords rejected, Device accounts strictly scoped |
-| **Monitoring** | `$SYS/broker/...` System Telemetry | ✅ Implemented | Periodic emitter for uptime, version, active clients, and retained message counts |
-| **Persistence**| In-Memory Session & Retained Storage | ✅ Implemented | Concurrent `RwLock` and `Arc` data structures |
-| **Persistence**| Disk Storage (SQLite / RocksDB) | 📋 Planned | Pluggable persistence engine on architectural roadmap |
-| **Clustering** | High-Availability Distributed Clustering | 📋 Planned | Raft / Gossip clustering planned for multi-node deployments |
+| Area | Supported |
+| :--- | :--- |
+| Protocols | MQTT v3.1.1, MQTT v5.0, MQTT-SN v1.2 over UDP — all sharing one routing core |
+| Transports | TCP, TLS 1.2 / 1.3 via wolfSSL (mutual TLS, ALPN, cipher selection), UDP for MQTT-SN |
+| QoS | 0, 1 and 2 in both directions, per-session packet ids, DUP resend on session resume |
+| Sessions | Clean and persistent sessions (v3.1.1 `CleanSession=0`, v5.0 Session Expiry), session takeover |
+| MQTT v5.0 | Properties forwarding, topic aliases, subscription identifiers, No Local, Retain As Published, Retain Handling, shared subscriptions (`$share/…`), Receive Maximum, Maximum Packet Size, Message Expiry, Will Delay, reason codes, server DISCONNECT |
+| Retained / Will | Retained store with quotas and expiry; Last Will on abnormal close, keep-alive timeout or takeover |
+| Security | Argon2id passwords, ACL with roles and `%u` / `%c` / `%r` macros, ClientID ↔ certificate binding, connection / packet / queue limits |
+| Operations | TOML config + `WOLFIMQ_*` environment overrides, `$SYS/broker/...` metrics, SIGHUP ACL reload, graceful SIGTERM |
+| MQTT-SN | Predefined and short topic ids, REGISTER, QoS −1, Will, sleeping clients, retransmission, forwarder encapsulation |
 
----
+Not implemented: clustering, disk persistence, MQTT over WebSockets, MQTT v5.0 enhanced
+authentication (AUTH), DTLS for MQTT-SN.
 
-## About WolfiMQ
+## Quick start
 
-**WolfiMQ** (`wolf-mqtt-broker`) is a lightweight, modular MQTT broker engine engineered with **Rust** and designed for secure messaging in modern IoT, aerial robotics, and edge environments.
+### Download a release
 
-- **Clean Async Core:** Built on Tokio and `bytes::Bytes` for minimal payload copying during pub/sub fan-out.
-- **Native Hybrid MQTT & MQTT-SN Engine:** Simultaneous listener support for standard TCP/TLS (MQTT 3.1.1 & 5.0) and UDP (OASIS MQTT-SN v1.2) sharing a unified, thread-safe routing core.
-- **Drone & Constrained Link Optimization:** Predefined Topic IDs and QoS -1 support to transmit telemetry across low-bandwidth wireless links (UAV radios, satellite, LoRaWAN / 6LoWPAN) without overhead.
-- **Defensive Resource Controls:** Explicitly bounded client session queues with configurable drop policies to prevent out-of-memory crashes from slow consumers.
-- **Multi-Level Topic Routing:** Radix Topic Trie supporting single-level (`+`) and multi-level (`#`) wildcards.
-- **Virtual Rooms & Declarative ACLs:** Topic templating using dynamic substitution (`%u` username, `%c` client ID, `%r` room) for secure multi-tenant partitioning.
+Each [release](../../releases) contains archives for:
 
----
-
-## TLS & Cryptography Architecture
-
-WolfiMQ provides transport security designed for enterprise and defense-grade IoT deployments, available in two build variants:
-
-### Build Variants
-
-| Variant | Cargo Feature | wolfSSL Source | Cipher Suite | Release Artifact |
-|---------|--------------|----------------|--------------|------------------|
-| **Standard** | `wolfssl` (default) | Open-source GitHub submodule | Full: AES-GCM + ChaCha20-Poly1305 + all ECDH curves | `wolfimq-*-wolfssl.tar.gz` |
-| **FIPS-Ready** | `wolfssl-fips` | wolfSSL FIPS bundle (user-provided) | FIPS 140-2/3 approved only | `wolfimq-*-wolfssl-fips-ready.tar.gz` |
+| Archive suffix | Platform |
+| :--- | :--- |
+| `linux-x86_64`, `linux-aarch64`, `linux-armv7`, `linux-riscv64` | Linux, glibc ≥ 2.17 (riscv64: ≥ 2.27) |
+| `linux-x86_64-musl`, `linux-aarch64-musl` | Linux, fully static (any distribution, Alpine) |
+| `windows-x86_64` | Windows 10 / Server 2016 or newer |
+| `macos-aarch64`, `macos-x86_64` | macOS (Apple silicon / Intel) |
 
 ```bash
-# Standard build (default)
+sha256sum -c wolfimq-<version>-linux-x86_64.tar.gz.sha256      # verify the download
+tar xzf wolfimq-<version>-linux-x86_64.tar.gz && cd wolfimq-<version>-linux-x86_64
+bash scripts/generate_certs.sh certs        # throw-away test PKI; use real certificates in production
+./bin/wolf-broker --config config/broker.toml
+```
+
+### Build from source
+
+Requirements: Rust ≥ 1.82, CMake, a C compiler, and `openssl` (only for the test PKI).
+
+```bash
+git clone --recursive <repository-url> && cd wolfimq   # or: git submodule update --init
 cargo build --release
-
-# FIPS-Ready build (requires external/wolfssl-fips-bundle/ — see below)
-cargo build --release --no-default-features --features wolfssl-fips
+./target/release/wolf-broker --help
 ```
 
-### Standard wolfSSL Build
-- Powered by native C **wolfSSL 5.9+** statically linked via CMake (`build.rs`).
-- Non-blocking async I/O via custom `WolfTlsStream` implementing Tokio's `AsyncRead + AsyncWrite`.
-- **TLS 1.3** (RFC 8446) + **TLS 1.2** with optional Mutual TLS (mTLS).
-- Full cipher suite: AES-128/256-GCM, ChaCha20-Poly1305, ECDH/ECDSA, ALPN, SNI, DTLS.
-- Automated E2E test: [`tests/test_tls_e2e.rs`](tests/test_tls_e2e.rs).
+### Try it
 
-### FIPS-Ready wolfSSL Build
+The sample configuration enables TLS on 8883 and MQTT-SN on 1884. For a quick local test,
+enable plain TCP on loopback through the environment:
 
-The FIPS-Ready variant uses `-DWOLFSSL_FIPS=ON` to enforce FIPS 140-2/3 approved algorithms:
-
-| | FIPS-Ready | Standard |
-|---|---|---|
-| AES-128/256 CBC + GCM | ✅ | ✅ |
-| SHA-224/256/384/512 | ✅ | ✅ |
-| SHA-3 | ✅ | ✅ |
-| RSA 2048/3072/4096 | ✅ | ✅ |
-| ECDSA/ECDH P-256/P-384/P-521 | ✅ | ✅ |
-| HMAC-SHA-2, Hash-DRBG | ✅ | ✅ |
-| ChaCha20-Poly1305 | ❌ removed | ✅ |
-| MD5, DES, RC4 | ❌ removed | ✅ |
-
-**Setup:** Download the wolfSSL FIPS-Ready bundle from [wolfssl.com](https://www.wolfssl.com/products/wolfcrypt-fips/) and extract into `external/wolfssl-fips-bundle/`.
-
-> **FIPS Certification Note:** "FIPS-Ready" = FIPS-approved algorithms only. It does **not** carry a formal CMVP certificate. For a formally validated build (CMVP Certificate #4718), use wolfSSL's commercially licensed FIPS validated bundle.
-
-> ⚖️ **wolfSSL Licensing:** wolfSSL is dual-licensed under GPLv2 or commercial. Consult [SECURITY.md](SECURITY.md).
-
----
-
-## Benchmarks & Methodology
-
-WolfiMQ includes an automated empirical benchmark suite in [`benches/bench_throughput.rs`](benches/bench_throughput.rs).
-
-### Transparent Methodology & Nomenclature
-- **Compiler Dead-Code Prevention:** All benchmark loops pass inputs and outputs through `std::hint::black_box` to prevent LLVM from optimizing away operations in release mode.
-- **Trie Match Rate vs Network Delivery:** In-memory routing benchmarks measure **subscriber-matches/sec** within the topic trie, distinct from live socket transmissions.
-- **Lock Contention Under Active Writers:** Multi-threaded concurrency benchmarks run with **7 concurrent reader threads and 1 active writer thread** continuously updating subscriptions to measure genuine `RwLock` contention.
-- **Pipelined Loopback Streaming:** TCP loopback tests measure pipelined socket throughput over the local OS networking stack, not multi-hop WAN network RTT.
-- **Retained Store Queries:** Both direct hash fast-path lookup ($O(1)$) and linear wildcard scan are tested and disclosed below.
-
-### Empirical Micro-Benchmark Results
-
-*Hardware Environment: Linux x86_64, Rust 1.80+, Release Profile (`opt-level = 3`, `lto = "fat"`, `codegen-units = 1`):*
-
-#### 1. Core Codec & In-Memory Routing Metrics
-| Benchmark Target | Workload Scale | Throughput | Mean Latency / Op | Description & Methodology |
-| :--- | :--- | :--- | :--- | :--- |
-| **VBI Integer Encoding** | 2,000,000 iterations | **4.62M ops/sec** | `216.43 ns / op` | Bit-packing integer compaction |
-| **VBI Integer Decoding** | 2,000,000 iterations | **12.27M ops/sec** | `81.49 ns / op` | Multi-byte decoding (`black_box` protected) |
-| **Topic Trie Wildcard Match** | 1,000,000 queries | **597.7K queries/sec** | `1,672.91 ns / query` | Multi-level (`#`) and single (`+`) hierarchy matches |
-| **Deep Topic Hierarchy (10 Levels)** | 500,000 queries | **120.2K queries/sec** | `8,319.70 ns / query` | 10-level nested hierarchy with branch exploration |
-| **Dynamic Subscription Churn** | 300,000 ops | **436.3K ops/sec** | `2,291.78 ns / op` | Real-time topic registration |
-| **Dynamic Unsubscription Churn** | 300,000 ops | **477.0K ops/sec** | `2,096.45 ns / op` | Topic cancellation & node cleanup |
-| **Fan-Out Matching Pipeline** | 100 subs, 300K msgs | **20.25K queries/sec** | — | **2.02M subscriber-matches/sec** |
-| **Multi-Thread Contention (7R + 1W)** | 8 threads, 350K ops | **112.2K queries/sec** | — | **5.61M matches/sec** under reader/writer lock stress |
-| **Retained Store Ingestion** | 5,000 stored topics | **1.59M updates/sec** | `625.85 ns / op` | In-memory retained topic indexing |
-| **Retained Store Exact Match ($O(1)$)**| 100,000 queries | **1.82M queries/sec** | `546.82 ns / op` | Direct hash lookup on exact topic path |
-| **Retained Store Wildcard Scan** | 10,000,000 matches | **95.68 queries/sec** | `10.45 ms / query` | Full store traversal matching wildcard filters |
-| **TCP Loopback Network Streaming** | 5,000 socket msgs | **42,758 msgs/sec** | `23.39 µs / msg` | Asynchronous Tokio TCP socket streaming |
-
-#### 2. Payload Scaling & Codec Bandwidth Throughput
-| Payload Size | Iterations | Encode Speed | Decode Speed | Effective Wire Bandwidth |
-| :--- | :--- | :--- | :--- | :--- |
-| **64 Bytes** | 500,000 pkts | 1.36M pkts/sec | 2.51M pkts/sec | **83.60 MB/s** |
-| **512 Bytes** | 300,000 pkts | 1.00M pkts/sec | 1.75M pkts/sec | **489.54 MB/s** |
-| **1 KB** | 250,000 pkts | 813.4K pkts/sec | 1.61M pkts/sec | **794.35 MB/s** |
-| **16 KB** | 50,000 pkts | 121.4K pkts/sec | 631.7K pkts/sec | **1,897.51 MB/s (1.89 GB/s)** |
-| **64 KB** | 15,000 pkts | 31.1K pkts/sec | 100.2K pkts/sec | **1,948.46 MB/s (1.94 GB/s)** |
-| **256 KB** | 4,000 pkts | 8.56K pkts/sec | 45.9K pkts/sec | **2,142.47 MB/s (2.14 GB/s)** |
-
-#### 3. End-to-End Latency Percentiles (100,000 Iteration Loop)
-| Percentile | Latency (µs) | Methodology & Interpretation |
-| :--- | :--- | :--- |
-| **Mean Latency** | **30.73 µs** | Average decode $\rightarrow$ route $\rightarrow$ encode execution |
-| **p50 (Median)** | **26.69 µs** | 50% of transactions complete in under 27 µs |
-| **p90** | **41.33 µs** | 90% of transactions complete in under 42 µs |
-| **p95** | **53.93 µs** | 95% of transactions complete in under 54 µs |
-| **p99** | **80.83 µs** | 99% of transactions complete in under 81 µs |
-| **p99.9** | **171.72 µs** | Tail latency under local memory pressure |
-| **Max Latency** | **1,955.82 µs** | Maximum OS scheduling tail |
-
-#### 4. QoS 2 State Machine & Wireless MQTT-SN Metrics
-| Benchmark Target | Workload Scale | Throughput | Mean Latency / Op | Description & Methodology |
-| :--- | :--- | :--- | :--- | :--- |
-| **QoS 2 4-Step Handshake** | 1,000,000 handshakes | **2.19M handshakes/sec** | `456.76 ns / handshake` | Full 4-step sequence (`PUBLISH` $\rightarrow$ `PUBREC` $\rightarrow$ `PUBREL` $\rightarrow$ `PUBCOMP`) with inflight deduplication |
-| **MQTT-SN v1.2 Wire Codec**| 1,000,000 roundtrips | **6.74M pkts/sec** | `148.43 ns / op` | End-to-end compact datagram serialization and deserialization with Predefined Topic ID |
-
-To run the benchmark suite locally:
 ```bash
-task bench
+WOLFIMQ_LISTENERS__TCP__ENABLED=true ./target/release/wolf-broker --config config/broker.toml
+./target/release/wolf-simulate          # in another terminal: runs a scripted pub/sub session
 ```
 
-To run encrypted TLS 1.3 benchmarks:
-```bash
-task bench:tls
-```
-
----
-
-## Security & Access Control
-
-WolfiMQ implements multi-layered security controls:
-
-- **Argon2id Password Hashing:** Uses standard PHC format (`$argon2id$...`) with per-password OS salt generated via `rand_core::OsRng`. Legacy SHA-256 hashes are supported for low-power embedded clients.
-- **Config Validation & Numerical Sanity:** The broker checks numerical relationships on startup:
-  - `max_packet_size <= max_queued_bytes` is strictly enforced to prevent buffer overflow anomalies.
-  - Listeners and authentication algorithms are validated before opening network ports.
-- **Granular RBAC & Room Isolation:**
-  - Dynamic pattern substitution macros: `%u` (username), `%c` (ClientID), and `%r` (room membership).
-  - Virtual room scoping (`rooms/%r/chat`, `rooms/%r/presence`, `rooms/%r/announcements`, `rooms/%r/admin/control`).
-  - Precedence order: explicit `Deny` rules override general permissions immediately.
-
----
-
-## Quick Start
-
-### 1. Prerequisites
-- **Rust:** 1.80+ (managed via `mise` or `rustup`)
-- **Task:** `task` runner (`go-task`)
-
-### 2. Available Commands
-```bash
-# Run CI pipeline (format check, clippy lint, all tests)
-task ci
-
-# Run all 49 test suites (unit + integration + TLS + ACL)
-task test:all
-
-# Run live TCP socket E2E integration tests
-task test:e2e
-
-# Run performance benchmarks
-task bench
-
-# Generate local test PKI certificates for mTLS
-task certs:gen
-
-# Build optimized release binary
-task build:release
-```
-
-### 3. Container Deployment (Docker)
-A production multi-stage [Dockerfile](Dockerfile) is provided:
-```bash
-# Build Docker image
-docker build -t wolf-mqtt-broker:latest .
-
-# Run container with mounted configuration
-docker run -d -p 1883:1883 -p 8883:8883 \
-  -v $(pwd)/config:/etc/wolf-mqtt-broker:ro \
-  wolf-mqtt-broker:latest
-```
-
----
+`wolf-simulate --tls` does the same over TLS using `certs/`.
 
 ## Configuration
 
-Edit [`config/broker.toml`](config/broker.toml) to configure server properties:
+Configuration comes from (highest priority first) environment variables, the TOML file, and
+compiled defaults. Any key can be overridden from the environment:
 
-```toml
-[broker]
-node_id = "wolfimq-node-01"
-max_connections = 100000
-
-[listeners.tcp]
-enabled = true
-bind_address = "127.0.0.1"   # Plaintext recommended for internal loopback only
-port = 1883
-
-[listeners.tls]
-enabled = true
-bind_address = "0.0.0.0"     # TLS recommended for external interfaces
-port = 8883
-
-[listeners.mqtt_sn]
-enabled = true
-bind_address = "0.0.0.0"     # UDP / MQTT-SN listener (Port 1884)
-port = 1884
-gateway_id = 1
-advertise_interval_sec = 900 # Periodic ADVERTISE broadcast (0 to disable)
-
-[listeners.mqtt_sn.predefined_topics]
-"1" = "uav/drone_01/telemetry/gps"
-"2" = "uav/drone_01/commands"
-
-[security.tls]
-ca_cert_file = "certs/ca-cert.pem"
-server_cert_file = "certs/server-cert.pem"
-server_key_file = "certs/server-key.pem"
-require_client_cert = true
-min_tls_version = "TLSv1.3"
-alpn_protocols = ["mqtt"]
-
-[security.auth]
-allow_anonymous = false
-password_hash_algorithm = "argon2id"
-acl_file = "config/acl.conf"
-
-[mqtt.protocol]
-max_packet_size = 4194304    # 4 MB
-
-[mqtt.queues]
-max_queued_messages = 5000
-max_queued_bytes = 8388608   # 8 MB (must be >= max_packet_size)
-queue_full_policy = "drop_oldest"
+```bash
+WOLFIMQ_LISTENERS__TCP__PORT=1884 \
+WOLFIMQ_SECURITY__AUTH__ALLOW_ANONYMOUS=true \
+WOLFIMQ_SECURITY__TLS__ALPN_PROTOCOLS='["mqtt"]' \
+  wolf-broker --config /etc/wolfimq/broker.toml
 ```
 
-> 📖 Consult the **[Configuration & Operational Control Guide](docs/CONFIGURATION_AND_CONTROL.md)** for exhaustive details on every setting, Linux kernel tuning, and Systemd service management.
+| Command | Purpose |
+| :--- | :--- |
+| `wolf-broker --check-config` | Validate configuration, ACL file and TLS material, then exit |
+| `wolf-broker --print-config` | Print the effective configuration (file + environment) |
+| `wolf-broker --hash-password` | Read a password on stdin, print an `acl.conf` `password_hash:` entry |
+| `kill -HUP <pid>` | Reload the ACL file atomically (a broken file is rejected) |
+| `kill -TERM <pid>` | Graceful shutdown (v5.0 clients receive DISCONNECT 0x8B) |
 
----
+Unknown or misspelled keys produce a warning at startup. See
+**[docs/CONFIGURATION_AND_CONTROL.md](docs/CONFIGURATION_AND_CONTROL.md)** for every setting,
+the ACL format, TLS / PKI setup, systemd and kernel tuning.
 
-## Testing & CI Suite
+## Security
 
-WolfiMQ validates stability across **84 automated test cases** (43 Unit Tests + 41 Integration & E2E Tests across 12 test suites):
-- **43 Unit Tests:** Packet codecs, variable-byte integers, bounds-checked CONNECT framing, Argon2id hashing, Topic Trie matching & pruning, `$SYS` topic root wildcard isolation, retained store quota limit, configuration validation, and MQTT-SN v1.2 frame serialization / deserialization roundtrips.
-- **12 MQTT-SN UDP Tests:** Connect/Ping/Disconnect lifecycle, Register & QoS 1 publish, QoS -1 predefined telemetry, cross-protocol UDP-to-TCP delivery, cross-protocol TCP-to-UDP command delivery, LWT handshake flow (§5.4.4), Unsubscribe flow (§5.4.16), QoS 2 four-way handshake (§5.4.10), QoS 2 duplicate packet deduplication (§5.4.10), sleeping client lifecycle (§5.4.18), sleeping client buffered message queue & flush (§5.4.20), and keepalive timeout reaper with LWT broadcast (§5.4.5) ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)).
-- **5 MQTT 5.0 Conformance & Interop Tests:** Live TCP pub/sub exchange, raw frame properties parsing, will properties LWT delivery, MQTT 5 reason codes (`0x86` vs `0x05`), and v3.1.1/v5.0 cross-version interoperability.
-- **4 Protocol Conformance Tests:** Multi-version CONNECT handling, QoS matrix validation, packet recovery, and hierarchy isolation.
-- **8 Unified Listeners & Hardening Tests:** Cross-listener message routing (TCP 1883 $\leftrightarrow$ TLS 8883), live UNSUBSCRIBE / UNSUBACK with trie pruning, retained QoS 1 delivery with packet IDs, duplicate CONNECT disconnects, publisher QoS 2 deduplication, subscriber QoS 2 full 4-step handshake delivery (`PUBREC` $\rightarrow$ `PUBREL` $\rightarrow$ `PUBCOMP`), QoS 1 LWT delivery, and MQTT 5.0 CONNACK raw wire properties verification.
-- **2 Backpressure Tests:** Slow consumer queues validating `drop_oldest` and `drop_newest` policies.
-- **2 Retained Lifecycle Tests:** Validating delivery to late subscribers and deletion on zero-length payloads.
-- **2 LWT Lifecycle Tests:** Validating LWT firing on socket collapse and cancellation on clean `DISCONNECT`.
-- **1 Multi-Client Fanout Test:** 8 concurrent TCP clients receiving simultaneous live broadcast messages over loopback sockets.
-- **3 Live TCP Socket E2E Tests:** Real TCP client socket message exchanges and Ping/Pong on ephemeral ports.
-- **5 RBAC & Room Isolation E2E Tests:** Authenticating users, verifying dynamic macros, and ensuring strict cross-room isolation.
-- **1 TLS 1.3 / mTLS E2E Test:** Validating full mutual TLS certificate verification and encrypted message transfer.
+- **Use TLS outside localhost.** Plain TCP defaults to `127.0.0.1`. The TLS listener uses
+  wolfSSL with TLS 1.3 by default (TLS 1.2 optional), mutual TLS, ALPN and configurable
+  cipher suites. `verify_client_identity` binds the MQTT ClientID to the certificate CN / SAN.
+- **Passwords** are Argon2id hashes in `config/acl.conf` (`--hash-password`). Unknown users take
+  as long to reject as known ones, and concurrent verifications are bounded.
+- **Authorization** uses first-match ACL rules per user, followed by role defaults
+  (`admin`, `moderator`, `member`, `viewer`, `device`). A subscription is granted only if an
+  allow rule covers the entire filter; Will topics are checked like publishes.
+- **Limits**: packet size, connections, per-session queue (count and bytes, `drop_oldest` or
+  `drop_newest`), retained store, CONNECT deadline and TLS handshake timeout.
 
----
+Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
-## License & Governance
+### wolfSSL builds
 
-- **Source Code:** Dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).
-- **Security Policy:** Vulnerability disclosure guidelines and cryptographic notices are detailed in [SECURITY.md](SECURITY.md).
-- **Docker Container:** Built with Debian Slim runtime in [Dockerfile](Dockerfile).
+| Variant | Command | wolfSSL source |
+| :--- | :--- | :--- |
+| Standard (default) | `cargo build --release` | `external/wolfssl` submodule, pinned to `v5.9.4-stable` |
+| FIPS-Ready | `cargo build --release --no-default-features --features wolfssl-fips` | wolfSSL FIPS-Ready bundle in `external/wolfssl-fips-bundle/` (or `WOLFSSL_FIPS_BUNDLE_DIR`) |
+
+"FIPS-Ready" means FIPS-approved algorithms only; it is **not** a CMVP-validated module.
+
+## MQTT-SN gateway
+
+The UDP gateway shares sessions, subscriptions and retained messages with the MQTT listeners,
+so a drone publishing over MQTT-SN reaches a ground station subscribed over TLS and vice versa.
+
+- **Identity:** MQTT-SN v1.2 has no credentials. All SN clients act as the ACL user named in
+  `listeners.mqtt_sn.acl_user` (or as the anonymous identity when it is empty).
+- **Topics:** predefined topic ids (configured), two-character short topics, and REGISTER;
+  the gateway registers new topic names with the client before publishing on them.
+- **Delivery:** QoS −1 (connectionless, predefined / short topics), 0, 1, 2 with retransmission;
+  sleeping clients get buffered messages on wake-up; Will on timeout.
+- **Caution:** traffic is unencrypted and clients are identified by UDP address.
+
+## Benchmarks
+
+Benchmark figures are produced by CI on GitHub-hosted runners, not maintained by hand:
+
+- every [release](../../releases) contains `BENCHMARKS.md` and shows the results in its notes;
+- every push to the main branch publishes the same report in the workflow run summary.
+
+The report covers end-to-end MQTT over TLS 1.3 throughput and latency (side by side with
+Mosquitto on the same runner) plus codec and routing micro-benchmarks. Run it locally with:
+
+```bash
+task bench:report          # or: bash scripts/ci_benchmarks.sh BENCHMARKS.md
+```
+
+## Development
+
+```bash
+task ci                     # fmt check, clippy -D warnings, all tests
+task test                   # unit tests + live TCP / TLS / MQTT-SN / CLI suites
+task build:cross TARGET=aarch64-unknown-linux-gnu   # cross build via cargo-zigbuild
+```
+
+Integration tests start real listeners on ephemeral ports and generate a throw-away PKI with
+`openssl`. CI runs formatting, clippy, tests on Linux and macOS, the minimum Rust version,
+cross builds, a dependency audit and the benchmarks.
+
+### Releasing
+
+1. Update `version` in `Cargo.toml` and add a section to `CHANGELOG.md`.
+2. Tag and push: `git tag -a v<version> -m "WolfiMQ v<version>" && git push origin v<version>`.
+3. The release workflow checks that the tag matches `Cargo.toml`, runs the tests, builds all
+   platforms, runs the benchmarks and publishes the GitHub release with checksums.
+
+## License
+
+WolfiMQ's source code is dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
+
+Binaries link wolfSSL statically. wolfSSL 5.9.x is licensed under the GPLv3 (or commercially by
+wolfSSL Inc.), so distributed binaries — including the release archives — are subject to the
+GPLv3 unless you have a commercial wolfSSL license. See [SECURITY.md](SECURITY.md) and
+`third-party/wolfssl/` in the release archives.
