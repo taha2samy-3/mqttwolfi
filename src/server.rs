@@ -619,6 +619,27 @@ impl BrokerServer {
                                     let _ = tx.send(ack_buf.freeze()).await;
                                 }
                             }
+                            MqttPacket::PubRec { packet_id } => {
+                                // OASIS MQTT v3.1.1 & v5.0 §4.3.3: Step 2 of outbound QoS 2 delivery to subscriber
+                                let pubrel = MqttPacket::PubRel { packet_id };
+                                let mut ack_buf = BytesMut::new();
+                                if pubrel.encode(&mut ack_buf).is_ok() {
+                                    let _ = tx.send(ack_buf.freeze()).await;
+                                }
+                            }
+                            MqttPacket::PubComp { packet_id } => {
+                                // OASIS MQTT v3.1.1 & v5.0 §4.3.3: Step 4 concludes outbound QoS 2 delivery
+                                debug!(
+                                    "PUBCOMP received from subscriber client #{} for packet_id {}",
+                                    client_id, packet_id
+                                );
+                            }
+                            MqttPacket::PubAck { packet_id } => {
+                                debug!(
+                                    "PUBACK received from subscriber client #{} for packet_id {}",
+                                    client_id, packet_id
+                                );
+                            }
                             MqttPacket::PingReq => {
                                 let mut ping_buf = BytesMut::new();
                                 if MqttPacket::PingResp.encode(&mut ping_buf).is_ok() {
