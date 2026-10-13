@@ -187,10 +187,7 @@ impl MqttSnServer {
                 {
                     let mut lock = self.sessions.write().await;
                     if clean_session || !lock.contains_key(&peer) {
-                        lock.insert(
-                            peer,
-                            SnClientSession::new(client_id, internal_id, duration),
-                        );
+                        lock.insert(peer, SnClientSession::new(client_id, internal_id, duration));
                     } else if let Some(session) = lock.get_mut(&peer) {
                         session.last_seen = Instant::now();
                         session.duration_sec = duration;
@@ -204,9 +201,7 @@ impl MqttSnServer {
             }
 
             SnPacket::Register {
-                msg_id,
-                topic_name,
-                ..
+                msg_id, topic_name, ..
             } => {
                 let mut assigned_id = 0u16;
                 {
@@ -288,7 +283,10 @@ impl MqttSnServer {
                     let mut forward_pkt = pub_pkt;
                     forward_pkt.retain = false;
                     let mut forward_buf = BytesMut::new();
-                    if MqttPacket::Publish(forward_pkt).encode(&mut forward_buf).is_ok() {
+                    if MqttPacket::Publish(forward_pkt)
+                        .encode(&mut forward_buf)
+                        .is_ok()
+                    {
                         let frozen = forward_buf.freeze();
                         let clients_guard = self.context.clients.read().await;
                         for target_id in matched_ids {

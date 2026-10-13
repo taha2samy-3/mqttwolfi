@@ -337,11 +337,7 @@ impl SnPacket {
                 let flags = body[0];
                 let dup = (flags & 0x80) != 0;
                 let qos_raw = (flags >> 5) & 0x03;
-                let qos = if qos_raw == 0b11 {
-                    -1i8
-                } else {
-                    qos_raw as i8
-                };
+                let qos = if qos_raw == 0b11 { -1i8 } else { qos_raw as i8 };
                 let retain = (flags & 0x10) != 0;
                 let topic_id_type = TopicIdType::from(flags);
                 let topic_id = u16::from_be_bytes([body[1], body[2]]);
