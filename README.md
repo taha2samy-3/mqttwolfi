@@ -75,10 +75,11 @@
 
 WolfiMQ provides transport security designed for enterprise and defense-grade IoT deployments:
 
-1. **Rust-Native TLS Engine:**
-   - Powered by `tokio-rustls`, `rustls-pki-types`, and `rustls-pemfile`.
-   - Supports **TLS 1.3** and **TLS 1.2** with mandatory or optional Mutual TLS (mTLS).
-   - Enforces **Application-Layer Protocol Negotiation (ALPN)** for `"mqtt"`.
+1. **Genuine wolfSSL C Cryptographic Engine:**
+   - Powered by native C **wolfSSL 5.9+** linked statically via `build.rs` with FFI bindings.
+   - Non-blocking asynchronous I/O integration via custom `WolfTlsStream` supporting Tokio's `AsyncRead + AsyncWrite`.
+   - Supports **TLS 1.3** (RFC 8446) and **TLS 1.2** with mandatory or optional Mutual TLS (mTLS).
+   - Enforces **Application-Layer Protocol Negotiation (ALPN)** for `"mqtt"` and Server Name Indication (SNI).
    - Automated End-to-End integration test in [`tests/test_tls_e2e.rs`](tests/test_tls_e2e.rs) validates client and server certificate verification, handshake negotiation, and encrypted pub/sub exchange.
 
 2. **wolfSSL Feature Hooks, DTLS & FIPS Packaging:**
