@@ -45,6 +45,9 @@ jobs:
       - name: Install build dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update -qq && sudo apt-get install -y cmake openssl
+      - name: Use OpenSSL 3 for the test PKI (macOS ships LibreSSL)
+        if: runner.os == 'macOS'
+        run: echo "$(brew --prefix openssl@3)/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Unit tests, CLI tests and the live TCP / TLS / MQTT-SN integration suites.
