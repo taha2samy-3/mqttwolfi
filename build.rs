@@ -6,9 +6,20 @@ fn main() {
     let wolfssl_src = manifest_dir.join("external/wolfssl");
     let build_dir = wolfssl_src.join("build");
 
+    // Detect FIPS feature flag set by Cargo
+    let fips_enabled = std::env::var("CARGO_FEATURE_WOLFSSL_FIPS").is_ok();
+
+    // Use a distinct build directory per variant to avoid cache conflicts
+    let build_dir = if fips_enabled {
+        wolfssl_src.join("build_fips")
+    } else {
+        wolfssl_src.join("build")
+    };
+
     let lib_path = build_dir.join("libwolfssl.a");
     if !lib_path.exists() {
-        let status = Command::new("cmake")
+        let mut cmake_cmd = Command::new("cmake");
+        cmake_cmd
             .arg("-S")
             .arg(&wolfssl_src)
             .arg("-B")
@@ -20,7 +31,20 @@ fn main() {
             .arg("-DWOLFSSL_TLS13=ON")
             .arg("-DWOLFSSL_ALPN=ON")
             .arg("-DWOLFSSL_SNI=ON")
-            .arg("-DWOLFSSL_DTLS=ON")
+            .arg("-DWOLFSSL_DTLS=ON");
+
+        if fips_enabled {
+            // Enable FIPS 140-2/140-3 compliant mode.
+            // NOTE: FIPS requires a validated wolfSSL FIPS source bundle.
+            // The standard open-source wolfSSL tree does NOT include FIPS code.
+            // Set FIPS_VERSION to match your validated bundle (v1, v2, v5, etc.)
+            cmake_cmd
+                .arg("-DWOLFSSL_FIPS=ON")
+                .arg("-DFIPS_VERSION=v5"); // Adjust to your certified bundle version
+            println!("cargo:warning=Building wolfSSL in FIPS mode (FIPS_VERSION=v5). Ensure you are using a validated FIPS source bundle.");
+        }
+
+        let status = cmake_cmd
             .status()
             .expect("Failed to execute cmake for wolfSSL");
         assert!(status.success(), "cmake configure failed for wolfSSL");
@@ -39,4 +63,10 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", build_dir.display());
     println!("cargo:rustc-link-lib=static=wolfssl");
     println!("cargo:rerun-if-changed=external/wolfssl/CMakeLists.txt");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_WOLFSSL_FIPS");
+
+    if fips_enabled {
+        // Expose the cfg flag so library code can conditionally compile FIPS paths
+        println!("cargo:rustc-cfg=wolfssl_fips");
+    }
 }
