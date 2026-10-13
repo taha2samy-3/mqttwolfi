@@ -681,19 +681,74 @@ impl MqttSnServer {
                 msg_id,
                 ..
             } => {
+                // Guard: must have a valid authenticated session (CONNECT received)
+                let session_info = {
+                    let lock = self.sessions.read().await;
+                    lock.get(&peer).map(|s| (
+                        s.is_authenticated,
+                        s.user.clone(),
+                        s.client_id_str.clone(),
+                        s.internal_id,
+                    ))
+                };
+                let (is_auth, user_opt, client_id_str, internal_id) = match session_info {
+                    Some(info) => info,
+                    None => {
+                        warn!("MQTT-SN SUBSCRIBE from {} without session (no CONNECT); ignoring", peer);
+                        let suback = SnPacket::SubAck { qos, topic_id: 0, msg_id, return_code: 0x03 };
+                        let mut buf = BytesMut::new();
+                        suback.encode(&mut buf);
+                        let _ = outbound.send((peer, buf)).await;
+                        return;
+                    }
+                };
+                if !is_auth {
+                    warn!("MQTT-SN SUBSCRIBE from {} without CONNECT; ignoring", peer);
+                    let suback = SnPacket::SubAck { qos, topic_id: 0, msg_id, return_code: 0x03 };
+                    let mut buf = BytesMut::new();
+                    suback.encode(&mut buf);
+                    let _ = outbound.send((peer, buf)).await;
+                    return;
+                }
+
                 let resolved_topic = match topic_id_type {
                     TopicIdType::Normal => topic_name,
                     TopicIdType::Predefined => self.predefined_id_to_name.get(&topic_id).cloned(),
                     TopicIdType::Short => {
                         let bytes = topic_id.to_be_bytes();
-                        Some(String::from_utf8_lossy(&bytes).to_string())
+                        if bytes.iter().any(|&b| b == b'+' || b == b'#') {
+                            warn!("MQTT-SN SUBSCRIBE rejected from {}: short topic ID contains wildcard byte", peer);
+                            let suback = SnPacket::SubAck { qos, topic_id: 0, msg_id, return_code: 0x02 };
+                            let mut buf = BytesMut::new();
+                            suback.encode(&mut buf);
+                            let _ = outbound.send((peer, buf)).await;
+                            return;
+                        }
+                        String::from_utf8(bytes.to_vec()).ok()
                     }
                     _ => None,
                 };
 
                 if let Some(topic) = resolved_topic {
+                    // ACL: Check subscribe authorization
+                    let acl_allowed = if let Some(ref user) = user_opt {
+                        self.context.acl.check_subscribe(user.as_ref(), &client_id_str, &topic)
+                    } else {
+                        false
+                    };
+                    if !acl_allowed {
+                        warn!(
+                            "MQTT-SN SUBSCRIBE denied for client '{}' ({}): topic '{}'",
+                            client_id_str, peer, topic
+                        );
+                        let suback = SnPacket::SubAck { qos, topic_id: 0, msg_id, return_code: 0x03 };
+                        let mut buf = BytesMut::new();
+                        suback.encode(&mut buf);
+                        let _ = outbound.send((peer, buf)).await;
+                        return;
+                    }
+
                     let mut assigned_id = topic_id;
-                    let mut internal_id = self.context.next_client_id();
 
                     {
                         let mut lock = self.sessions.write().await;
@@ -702,11 +757,10 @@ impl MqttSnServer {
                                 assigned_id = session.register_topic(&topic);
                             }
                             session.subscribed_topics.push(topic.clone());
-                            internal_id = session.internal_id;
                         }
                     }
 
-                    // Register client channel in central context
+                    // Register client channel in central context (reuse existing if present)
                     let (tx, mut rx) = mpsc::channel::<Bytes>(1024);
                     {
                         let mut clients_guard = self.context.clients.write().await;
@@ -757,7 +811,8 @@ impl MqttSnServer {
                                             (TopicIdType::Normal, nid)
                                         }
                                     } else {
-                                        (TopicIdType::Normal, 0)
+                                        // Session gone; forwarder task should exit
+                                        break;
                                     }
                                 };
 
@@ -782,12 +837,20 @@ impl MqttSnServer {
                                 if is_asleep {
                                     let mut lock = forward_sessions.write().await;
                                     if let Some(s) = lock.get_mut(&target_peer) {
-                                        s.buffered_messages.push(buf);
+                                        // Cap sleeping buffer to prevent memory exhaustion
+                                        if s.buffered_messages.len() < MAX_SLEEPING_BUFFER {
+                                            s.buffered_messages.push(buf);
+                                        } else {
+                                            debug!(
+                                                "Sleeping buffer full ({} msgs) for MQTT-SN peer {}; dropping oldest",
+                                                MAX_SLEEPING_BUFFER, target_peer
+                                            );
+                                            s.buffered_messages.remove(0);
+                                            s.buffered_messages.push(buf);
+                                        }
                                     }
-                                } else {
-                                    if forward_outbound.send((target_peer, buf)).await.is_err() {
-                                        break;
-                                    }
+                                } else if forward_outbound.send((target_peer, buf)).await.is_err() {
+                                    break;
                                 }
                             }
                         }
