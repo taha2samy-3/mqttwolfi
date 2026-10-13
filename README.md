@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Lightweight, Memory-Safe MQTT v3.1.1 & v5.0 Broker written in Rust with wolfSSL / TLS 1.3 mTLS Support</strong>
+  <strong>Lightweight, Memory-Safe MQTT v3.1.1, v5.0 & MQTT-SN v1.2 Broker in Rust with wolfSSL TLS 1.3 & DTLS Support</strong>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 
 ## Project Status & Architectural Matrix
 
-> ⚠️ **Development Stage Notice:** WolfiMQ is an emerging, active-development open-source MQTT broker engine written in Rust. It provides clean protocol codecs, in-memory topic routing, bounded session queues with backpressure, role-based access control, and TLS 1.3 / mTLS mutual authentication. It is **in early-stage development** and is **not yet a distributed cluster** or disk-persistent broker like EMQX or Mosquitto with storage plugins. The matrix below outlines currently verified capabilities versus roadmap items.
+> ⚠️ **Development Stage Notice:** WolfiMQ is an emerging, active-development open-source MQTT broker engine written in Rust. It provides clean protocol codecs, in-memory topic routing, bounded session queues with backpressure, role-based access control, TLS 1.3 / mTLS mutual authentication, and native OASIS MQTT-SN v1.2 over UDP. It is **in early-stage development** and is **not yet a distributed cluster** or disk-persistent broker like EMQX or Mosquitto with storage plugins. The matrix below outlines currently verified capabilities versus roadmap items.
 
 ### Feature Implementation Matrix
 
@@ -29,7 +29,11 @@
 | :--- | :--- | :---: | :--- |
 | **Transport** | TCP Listener (Plaintext) | ✅ Implemented | Asynchronous Tokio TCP server on configurable host/port with unified `BrokerContext` |
 | **Transport** | TLS 1.3 / 1.2 Listener (mTLS) | ✅ Implemented | Full mutual authentication, ALPN (`mqtt`), shared routing state with TCP listener |
-| **Multi-Listener**| Unified Broker State & Cross-Routing | ✅ Implemented | TCP & TLS listeners share router, sessions, ACL, and retained store ([`tests/test_unified_listeners_and_hardening.rs`](tests/test_unified_listeners_and_hardening.rs)) |
+| **Transport** | MQTT-SN Listener (UDP / DTLS) | ✅ Implemented | OASIS MQTT-SN v1.2 over UDP (Port 1884) with DTLS support and predefined topic mappings |
+| **Multi-Listener**| Unified Broker State & Cross-Routing | ✅ Implemented | TCP, TLS, and UDP SN listeners share router, sessions, ACL, and retained store ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)) |
+| **MQTT-SN 1.2**| Predefined & Short Topic IDs | ✅ Implemented | Zero-bandwidth topic IDs for aerial telemetry (UAVs / Drones) and constrained wireless sensors |
+| **MQTT-SN 1.2**| QoS -1 (Ultra-Fast Fire & Forget) | ✅ Implemented | Low-power stateless publishing without prior `CONNECT` handshake |
+| **MQTT-SN 1.2**| Cross-Protocol Fanout (UDP $\leftrightarrow$ TCP) | ✅ Implemented | Bi-directional message delivery between UDP sensor nodes and TCP/TLS ground control stations |
 | **MQTT 3.1.1** | CONNECT, CONNACK, PINGREQ, DISCONNECT | ✅ Implemented | Bounds-checked DoS-hardened codecs, duplicate CONNECT rejected, duplicate ClientID replaces session |
 | **MQTT 3.1.1** | PUBLISH & PUBACK (QoS 0 & QoS 1) | ✅ Implemented | Wildcards in publish topic rejected, live delivery clears retain flag per MQTT-3.3.1-9 |
 | **MQTT 3.1.1** | SUBSCRIBE & SUBACK | ✅ Implemented | Underflow-safe decoding, reduced lock contention during ACL verification |
@@ -56,9 +60,11 @@
 
 ## About WolfiMQ
 
-**WolfiMQ** (`wolf-mqtt-broker`) is a lightweight, modular MQTT broker engine engineered with **Rust** and designed for secure messaging in modern IoT and edge environments.
+**WolfiMQ** (`wolf-mqtt-broker`) is a lightweight, modular MQTT broker engine engineered with **Rust** and designed for secure messaging in modern IoT, aerial robotics, and edge environments.
 
 - **Clean Async Core:** Built on Tokio and `bytes::Bytes` for minimal payload copying during pub/sub fan-out.
+- **Native Hybrid MQTT & MQTT-SN Engine:** Simultaneous listener support for standard TCP/TLS (MQTT 3.1.1 & 5.0) and UDP (OASIS MQTT-SN v1.2) sharing a unified, thread-safe routing core.
+- **Drone & Constrained Link Optimization:** Predefined Topic IDs and QoS -1 support to transmit telemetry across low-bandwidth wireless links (UAV radios, satellite, LoRaWAN / 6LoWPAN) without overhead.
 - **Defensive Resource Controls:** Explicitly bounded client session queues with configurable drop policies to prevent out-of-memory crashes from slow consumers.
 - **Multi-Level Topic Routing:** Radix Topic Trie supporting single-level (`+`) and multi-level (`#`) wildcards.
 - **Virtual Rooms & Declarative ACLs:** Topic templating using dynamic substitution (`%u` username, `%c` client ID, `%r` room) for secure multi-tenant partitioning.
@@ -67,7 +73,7 @@
 
 ## TLS & Cryptography Architecture
 
-WolfiMQ provides transport security designed for secure IoT deployments:
+WolfiMQ provides transport security designed for enterprise and defense-grade IoT deployments:
 
 1. **Rust-Native TLS Engine:**
    - Powered by `tokio-rustls`, `rustls-pki-types`, and `rustls-pemfile`.
@@ -75,8 +81,9 @@ WolfiMQ provides transport security designed for secure IoT deployments:
    - Enforces **Application-Layer Protocol Negotiation (ALPN)** for `"mqtt"`.
    - Automated End-to-End integration test in [`tests/test_tls_e2e.rs`](tests/test_tls_e2e.rs) validates client and server certificate verification, handshake negotiation, and encrypted pub/sub exchange.
 
-2. **wolfSSL Feature Hooks & FIPS Packaging:**
+2. **wolfSSL Feature Hooks, DTLS & FIPS Packaging:**
    - Cargo feature flags `wolfssl` and `wolfssl-fips` provide integration targets for linking against the native C wolfSSL library and FIPS 140-2/3 validated cryptographic module.
+   - **DTLS Support:** Encrypted UDP datagram security for MQTT-SN client-to-broker wireless channels powered by wolfSSL DTLS 1.2 / 1.3 engine.
    - Cross-compilation scripts and GitHub Actions workflows are provided in [`.github/workflows/release.yml`](.github/workflows/release.yml) for Linux AMD64 and ARM64.
 
 > ⚖️ **wolfSSL Licensing Notice:** wolfSSL is dual-licensed under GPLv2 or a commercial license. When compiling or distributing binaries linked directly with native wolfSSL C libraries, ensure compliance with the appropriate wolfSSL licensing requirements. Consult [SECURITY.md](SECURITY.md) for details.
@@ -222,6 +229,17 @@ enabled = true
 bind_address = "0.0.0.0"     # TLS recommended for external interfaces
 port = 8883
 
+[listeners.mqtt_sn]
+enabled = true
+bind_address = "0.0.0.0"     # UDP / MQTT-SN listener (DTLS enabled via wolfSSL)
+port = 1884
+gateway_id = 1
+advertise_interval_sec = 900 # Periodic ADVERTISE broadcast (0 to disable)
+
+[listeners.mqtt_sn.predefined_topics]
+"1" = "uav/drone_01/telemetry/gps"
+"2" = "uav/drone_01/commands"
+
 [security.tls]
 ca_cert_file = "certs/ca-cert.pem"
 server_cert_file = "certs/server-cert.pem"
@@ -250,8 +268,9 @@ queue_full_policy = "drop_oldest"
 
 ## Testing & CI Suite
 
-WolfiMQ validates stability across **72 automated test cases** (39 Unit Tests + 33 Integration & E2E Tests across 11 test suites):
-- **39 Unit Tests:** Packet codecs, variable-byte integers, bounds-checked CONNECT framing, Argon2id hashing, Topic Trie matching & pruning, `$SYS` topic root wildcard isolation, retained store quota limit, and configuration validation.
+WolfiMQ validates stability across **76 automated test cases** (43 Unit Tests + 33 Integration & E2E Tests across 12 test suites):
+- **43 Unit Tests:** Packet codecs, variable-byte integers, bounds-checked CONNECT framing, Argon2id hashing, Topic Trie matching & pruning, `$SYS` topic root wildcard isolation, retained store quota limit, configuration validation, and MQTT-SN v1.2 frame serialization / deserialization roundtrips.
+- **5 MQTT-SN UDP Tests:** Connect/Ping/Disconnect lifecycle, Register & QoS 1 publish, QoS -1 predefined telemetry, cross-protocol UDP-to-TCP delivery, and cross-protocol TCP-to-UDP command delivery ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)).
 - **5 MQTT 5.0 Conformance & Interop Tests:** Live TCP pub/sub exchange, raw frame properties parsing, will properties LWT delivery, MQTT 5 reason codes (`0x86` vs `0x05`), and v3.1.1/v5.0 cross-version interoperability.
 - **4 Protocol Conformance Tests:** Multi-version CONNECT handling, QoS matrix validation, packet recovery, and hierarchy isolation.
 - **7 Unified Listeners & Hardening Tests:** Cross-listener message routing (TCP 1883 $\leftrightarrow$ TLS 8883), live UNSUBSCRIBE / UNSUBACK with trie pruning, retained QoS 1 delivery with packet IDs, duplicate CONNECT disconnects, QoS 2 deduplication, QoS 1 LWT delivery, and MQTT 5.0 CONNACK raw wire properties verification.

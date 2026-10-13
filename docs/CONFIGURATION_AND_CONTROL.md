@@ -32,28 +32,29 @@ An exhaustive reference manual for configuring, tuning, securing, and operating 
 WolfiMQ utilizes an asynchronous, non-blocking I/O event loop built on Tokio. Its concurrency model decouples network transport from packet processing and message dispatch:
 
 ```
-                      +-----------------------------------+
-                      |   Incoming TCP / TLS 1.3 Clients   |
-                      +-----------------+-----------------+
-                                        |
-                   +--------------------+--------------------+
-                   |                                         |
-         [listeners.tcp]                             [listeners.tls]
-       Plain TCP (Port 1883)                     wolfSSL TLS 1.3 (Port 8883)
-                   |                                         |
-                   +--------------------+--------------------+
-                                        |
-                           +------------v------------+
-                           |  Tokio Connection Pool  |
-                           +------------+------------+
-                                        |
-       +--------------------------------+--------------------------------+
-       |                                |                                |
-+------v------+                  +------v------+                  +------v------+
-| Packet      |                  | Topic Trie  |                  | Retained &  |
-| Codecs      |                  | Routing     |                  | Session     |
-| (Zero-Copy) |                  | Radix Tree  |                  | Queues      |
-+-------------+                  +-------------+                  +-------------+
+                      +-------------------------------------------------------+
+                      |       Multi-Transport IoT & Aerial Robotics Clients   |
+                      +---------------------------+---------------------------+
+                                                  |
+           +--------------------------------------+--------------------------------------+
+           |                                      |                                      |
+    [listeners.tcp]                        [listeners.tls]                       [listeners.mqtt_sn]
+  Plain TCP (Port 1883)               wolfSSL TLS 1.3 (Port 8883)             UDP / DTLS (Port 1884)
+  MQTT v3.1.1 / v5.0                     MQTT v3.1.1 / v5.0                      OASIS MQTT-SN v1.2
+           |                                      |                                      |
+           +--------------------------------------+--------------------------------------+
+                                                  |
+                                    +-------------v-------------+
+                                    |   Shared BrokerContext    |
+                                    +-------------+-------------+
+                                                  |
+        +-----------------------------------------+-----------------------------------------+
+        |                                         |                                         |
+ +------v------+                           +------v------+                           +------v------+
+ | Packet      |                           | Topic Trie  |                           | Retained &  |
+ | Codecs      |                           | Routing     |                           | Session     |
+ | (Zero-Copy) |                           | Radix Tree  |                           | Queues      |
+ +-------------+                           +-------------+                           +-------------+
 ```
 
 Key characteristics:
@@ -127,7 +128,7 @@ line_numbers = false
 
 ### Network Listeners (`[listeners]`)
 
-Configures dual unencrypted TCP and encrypted TLS listeners:
+Configures multi-protocol listeners across unencrypted TCP, encrypted TLS 1.3 / mTLS, and UDP MQTT-SN (with DTLS):
 
 ```toml
 [listeners.tcp]
@@ -139,10 +140,36 @@ port = 1883
 enabled = true
 bind_address = "0.0.0.0"
 port = 8883
+
+[listeners.mqtt_sn]
+enabled = true
+bind_address = "0.0.0.0"
+port = 1884
+gateway_id = 1
+advertise_interval_sec = 900 # Send ADVERTISE frames every 15 mins (0 to disable)
+
+[listeners.mqtt_sn.predefined_topics]
+"1" = "uav/drone_01/telemetry/gps"
+"2" = "uav/drone_01/commands"
 ```
 
+| Directive | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `listeners.tcp.enabled` | Boolean | `true` | Enables standard unencrypted TCP listener for MQTT 3.1.1 & 5.0 (port 1883). |
+| `listeners.tls.enabled` | Boolean | `true` | Enables encrypted TLS 1.3 / 1.2 mTLS listener for MQTT 3.1.1 & 5.0 (port 8883). |
+| `listeners.mqtt_sn.enabled` | Boolean | `true` | Enables native OASIS MQTT-SN v1.2 listener over UDP (port 1884). |
+| `listeners.mqtt_sn.gateway_id` | Integer | `1` | Unique Gateway Identifier (1..255) advertised in `GWINFO` and `ADVERTISE` frames. |
+| `listeners.mqtt_sn.advertise_interval_sec`| Integer | `900` | Periodic `ADVERTISE` broadcast interval (seconds). Set to `0` to disable broadcast. |
+| `listeners.mqtt_sn.predefined_topics` | Table | `{}` | Key-value map of 16-bit Topic IDs (`"1"`, `"2"`) to full topic paths for bandwidth-constrained links. |
+
+#### Low-Bandwidth Optimizations for Drones & Sensor Networks
+1. **Predefined Topic IDs:** Eliminates the overhead of transmitting ASCII topic paths over RF links. Drones publish with a 2-byte numeric ID (`0x0001`), and WolfiMQ automatically resolves and fans out the message to standard MQTT subscribers (e.g. `uav/drone_01/telemetry/gps`).
+2. **QoS -1 (Ultra-Fast Fire-and-Forget):** Constrained edge nodes and UAVs can transmit datagrams directly without prior `CONNECT` handshakes or session initialization.
+3. **DTLS Transport Security:** wolfSSL DTLS 1.2 / 1.3 provides datagram-level cipher encryption, anti-replay protection, and mutual certificate authentication across UDP channels.
+4. **Cross-Protocol Hybrid Delivery:** UDP datagrams published by MQTT-SN clients are immediately dispatched into the central `TopicTrie` and delivered to TCP/TLS subscribers in real-time, and vice versa.
+
 > [!TIP]
-> In production environments with public internet exposure, set `listeners.tcp.enabled = false` and exclusively expose `listeners.tls` on port 8883 to enforce encrypted transport.
+> In production environments with public internet exposure, set `listeners.tcp.enabled = false` and exclusively expose `listeners.tls` on port 8883 and `listeners.mqtt_sn` on port 1884 (with DTLS).
 
 ---
 
