@@ -45,7 +45,7 @@
 | **MQTT 5.0** | Cross-Protocol Interoperability | ✅ Implemented | Seamless bidirectional message exchange between v3.1.1 and v5.0 clients ([`tests/test_mqtt5_conformance_and_interop.rs`](tests/test_mqtt5_conformance_and_interop.rs)) |
 | **Keep-Alive** | Keep-Alive Timeout Enforcement | ✅ Implemented | Automatic 1.5× `keep_alive_sec` activity timeout, dead session cleanup, and LWT dispatch |
 | **QoS Levels** | QoS 0 (At most once) & QoS 1 (At least once)| ✅ Implemented | Fully tested and verified |
-| **QoS Levels** | QoS 2 (Handshake: PUBREC, PUBREL, PUBCOMP)| 📋 Roadmap | Wire packet codecs implemented; 4-step state machine on roadmap |
+| **QoS Levels** | QoS 2 (Handshake: PUBREC, PUBREL, PUBCOMP)| ✅ Implemented | Full 4-step state machine (`PUBREC`, `PUBREL`, `PUBCOMP`) with duplicate deduplication across TCP, TLS, and UDP SN ([`tests/test_unified_listeners_and_hardening.rs`](tests/test_unified_listeners_and_hardening.rs), [`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)) |
 | **Routing** | Topic Trie (`+` and `#` wildcards) | ✅ Implemented | Radix trie lookup with root wildcard `$SYS/` isolation per MQTT-4.7.2-1 |
 | **Queues** | Bounded Backpressure & Drop Policies | ✅ Implemented | Bounded channels (`mpsc::channel(1024)`) with non-blocking `try_send` and slow-consumer protection |
 | **Security** | Argon2id Password Hashing | ✅ Implemented | Memory-hard verification offloaded to worker threads via `tokio::task::spawn_blocking` |
@@ -141,6 +141,12 @@ WolfiMQ includes an automated empirical benchmark suite in [`benches/bench_throu
 | **p99** | **80.83 µs** | 99% of transactions complete in under 81 µs |
 | **p99.9** | **171.72 µs** | Tail latency under local memory pressure |
 | **Max Latency** | **1,955.82 µs** | Maximum OS scheduling tail |
+
+#### 4. QoS 2 State Machine & Wireless MQTT-SN Metrics
+| Benchmark Target | Workload Scale | Throughput | Mean Latency / Op | Description & Methodology |
+| :--- | :--- | :--- | :--- | :--- |
+| **QoS 2 4-Step Handshake** | 1,000,000 handshakes | **2.19M handshakes/sec** | `456.76 ns / handshake` | Full 4-step sequence (`PUBLISH` $\rightarrow$ `PUBREC` $\rightarrow$ `PUBREL` $\rightarrow$ `PUBCOMP`) with inflight deduplication |
+| **MQTT-SN v1.2 Wire Codec**| 1,000,000 roundtrips | **6.74M pkts/sec** | `148.43 ns / op` | End-to-end compact datagram serialization and deserialization with Predefined Topic ID |
 
 To run the benchmark suite locally:
 ```bash
@@ -268,12 +274,12 @@ queue_full_policy = "drop_oldest"
 
 ## Testing & CI Suite
 
-WolfiMQ validates stability across **82 automated test cases** (43 Unit Tests + 39 Integration & E2E Tests across 12 test suites):
+WolfiMQ validates stability across **84 automated test cases** (43 Unit Tests + 41 Integration & E2E Tests across 12 test suites):
 - **43 Unit Tests:** Packet codecs, variable-byte integers, bounds-checked CONNECT framing, Argon2id hashing, Topic Trie matching & pruning, `$SYS` topic root wildcard isolation, retained store quota limit, configuration validation, and MQTT-SN v1.2 frame serialization / deserialization roundtrips.
-- **11 MQTT-SN UDP Tests:** Connect/Ping/Disconnect lifecycle, Register & QoS 1 publish, QoS -1 predefined telemetry, cross-protocol UDP-to-TCP delivery, cross-protocol TCP-to-UDP command delivery, LWT handshake flow (§5.4.4), Unsubscribe flow (§5.4.16), QoS 2 four-way handshake (§5.4.10), sleeping client lifecycle (§5.4.18), sleeping client buffered message queue & flush (§5.4.20), and keepalive timeout reaper with LWT broadcast (§5.4.5) ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)).
+- **12 MQTT-SN UDP Tests:** Connect/Ping/Disconnect lifecycle, Register & QoS 1 publish, QoS -1 predefined telemetry, cross-protocol UDP-to-TCP delivery, cross-protocol TCP-to-UDP command delivery, LWT handshake flow (§5.4.4), Unsubscribe flow (§5.4.16), QoS 2 four-way handshake (§5.4.10), QoS 2 duplicate packet deduplication (§5.4.10), sleeping client lifecycle (§5.4.18), sleeping client buffered message queue & flush (§5.4.20), and keepalive timeout reaper with LWT broadcast (§5.4.5) ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)).
 - **5 MQTT 5.0 Conformance & Interop Tests:** Live TCP pub/sub exchange, raw frame properties parsing, will properties LWT delivery, MQTT 5 reason codes (`0x86` vs `0x05`), and v3.1.1/v5.0 cross-version interoperability.
 - **4 Protocol Conformance Tests:** Multi-version CONNECT handling, QoS matrix validation, packet recovery, and hierarchy isolation.
-- **7 Unified Listeners & Hardening Tests:** Cross-listener message routing (TCP 1883 $\leftrightarrow$ TLS 8883), live UNSUBSCRIBE / UNSUBACK with trie pruning, retained QoS 1 delivery with packet IDs, duplicate CONNECT disconnects, QoS 2 deduplication, QoS 1 LWT delivery, and MQTT 5.0 CONNACK raw wire properties verification.
+- **8 Unified Listeners & Hardening Tests:** Cross-listener message routing (TCP 1883 $\leftrightarrow$ TLS 8883), live UNSUBSCRIBE / UNSUBACK with trie pruning, retained QoS 1 delivery with packet IDs, duplicate CONNECT disconnects, publisher QoS 2 deduplication, subscriber QoS 2 full 4-step handshake delivery (`PUBREC` $\rightarrow$ `PUBREL` $\rightarrow$ `PUBCOMP`), QoS 1 LWT delivery, and MQTT 5.0 CONNACK raw wire properties verification.
 - **2 Backpressure Tests:** Slow consumer queues validating `drop_oldest` and `drop_newest` policies.
 - **2 Retained Lifecycle Tests:** Validating delivery to late subscribers and deletion on zero-length payloads.
 - **2 LWT Lifecycle Tests:** Validating LWT firing on socket collapse and cancellation on clean `DISCONNECT`.
