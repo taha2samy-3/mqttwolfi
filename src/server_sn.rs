@@ -963,17 +963,24 @@ impl MqttSnServer {
 
             SnPacket::Disconnect { duration } => {
                 if duration.is_none() {
-                    // Permanent disconnect: clean up session and central client channel
-                    let mut internal_id = None;
-                    {
+                    // Permanent disconnect: clean up session, client channel, AND router subscriptions
+                    let cleanup = {
                         let mut lock = self.sessions.write().await;
-                        if let Some(session) = lock.remove(&peer) {
-                            internal_id = Some(session.internal_id);
+                        lock.remove(&peer).map(|s| (s.internal_id, s.subscribed_topics))
+                    };
+                    if let Some((id, subscribed_topics)) = cleanup {
+                        // Remove from active clients map
+                        {
+                            let mut clients_guard = self.context.clients.write().await;
+                            clients_guard.remove(&id);
                         }
-                    }
-                    if let Some(id) = internal_id {
-                        let mut clients_guard = self.context.clients.write().await;
-                        clients_guard.remove(&id);
+                        // CRITICAL: Also remove all router subscriptions to prevent trie leaks
+                        {
+                            let mut router_guard = self.context.router.write().await;
+                            for topic in &subscribed_topics {
+                                router_guard.unsubscribe(topic, &id);
+                            }
+                        }
                     }
                 } else {
                     // OASIS MQTT-SN v1.2 §5.4.20: Client enters Asleep state; retain session & subscriptions
@@ -987,6 +994,7 @@ impl MqttSnServer {
                 SnPacket::Disconnect { duration: None }.encode(&mut buf);
                 let _ = outbound.send((peer, buf)).await;
             }
+
 
             SnPacket::EncapMsg {
                 ctrl: _,
