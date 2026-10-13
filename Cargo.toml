@@ -1,6 +1,6 @@
 [package]
 name = "wolf-mqtt-broker"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["WolfMQTT Team"]
 description = "High-performance, secure MQTT v3.1.1 & v5.0 broker written in Rust with native wolfSSL (standard & FIPS-Ready) TLS 1.3"

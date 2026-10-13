@@ -5,6 +5,31 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [0.3.2] - 2026-10-13
+
+### 🚀 Dual Release: wolfSSL Standard & FIPS-Ready
+- **Two release artifacts per version:**
+  - `wolfimq-*-linux-amd64-wolfssl.tar.gz` — standard build, full TLS 1.3 cipher suite
+  - `wolfimq-*-linux-amd64-wolfssl-fips-ready.tar.gz` — FIPS-Ready build, FIPS 140-2/3 approved algorithms only
+
+### ⚙️ FIPS-Ready Build Support
+- **New `wolfssl-fips` Cargo feature** activates `-DWOLFSSL_FIPS=ON` in CMake, restricting to FIPS-approved algorithms (AES, SHA-2/3, RSA, ECC, HMAC-SHA, Hash-DRBG). Non-FIPS primitives (ChaCha20-Poly1305, MD5, DES, RC4) are removed.
+- **Separate source directories:** Standard build uses `external/wolfssl` (git submodule); FIPS-Ready build uses `external/wolfssl-fips-bundle/` (user-provided from wolfssl.com).
+- **Clear diagnostic error:** If the FIPS bundle is missing, `build.rs` prints a structured error box explaining exactly where to download it.
+- **CMVP Note:** FIPS-Ready = FIPS-approved algorithms, no formal certificate. For CMVP #4718, use wolfSSL's validated bundle.
+- **Files:** [`build.rs`](build.rs), [`Cargo.toml`](Cargo.toml), [`.gitignore`](.gitignore)
+
+### 🏗️ Release Workflow
+- **New [`.github/workflows/release.yml`](.github/workflows/release.yml):** Triggered on version tag push (`v*.*.*`) or manual `workflow_dispatch`. Builds both variants, packages with `BUILD-INFO.txt` + `FIPS-NOTICE.txt`, computes SHA-256, and publishes a GitHub Release with extracted CHANGELOG notes.
+- **FIPS bundle in CI:** The `WOLFSSL_FIPS_BUNDLE_B64` GitHub Actions secret (base64-encoded tar) is decoded at build time — the FIPS binary is built only when the secret is set; a clear notice is shown otherwise.
+- **Updated CI matrix:** [`ci.yml`](.github/workflows/ci.yml) test-suite job now runs both `standard` and `fips` matrix variants with separate `Swatinem/rust-cache` keys.
+
+### 📚 Documentation
+- **README:** TLS & Cryptography Architecture section replaced with algorithm comparison table (FIPS-Ready vs Standard), build commands, and setup instructions.
+- **Cargo.toml:** Feature definitions annotated with allowed/removed algorithm lists and download link.
+
+---
+
 ## [0.3.1] - 2026-10-13
 
 ### 🔒 Security Fix
