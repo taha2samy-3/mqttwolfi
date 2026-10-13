@@ -252,4 +252,64 @@ mod tests {
         assert!(store.update(p1_updated));
         assert_eq!(store.count(), 2);
     }
+
+    #[test]
+    fn test_retained_store_byte_quota() {
+        // max 100 messages, but only 30 bytes allowed
+        let mut store = RetainedStore::with_limits(100, 30);
+
+        // topic len (4) + payload len (10) = 14 bytes
+        let p1 = PublishPacket {
+            topic: "t/01".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"0123456789"),
+        };
+        assert!(store.update(p1));
+        assert_eq!(store.current_bytes(), 14);
+
+        // topic len (4) + payload len (10) = 14 bytes -> total 28 bytes <= 30
+        let p2 = PublishPacket {
+            topic: "t/02".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"0123456789"),
+        };
+        assert!(store.update(p2));
+        assert_eq!(store.current_bytes(), 28);
+
+        // topic len (4) + payload len (5) = 9 bytes -> 28 + 9 = 37 > 30 -> rejected!
+        let p3 = PublishPacket {
+            topic: "t/03".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"12345"),
+        };
+        assert!(!store.update(p3.clone()));
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.current_bytes(), 28);
+
+        // Clearing t/01 frees 14 bytes -> total becomes 14
+        let clear_p1 = PublishPacket {
+            topic: "t/01".into(),
+            qos: QoS::AtMostOnce,
+            retain: true,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::new(),
+        };
+        assert!(store.update(clear_p1));
+        assert_eq!(store.current_bytes(), 14);
+
+        // Now p3 fits (14 + 9 = 23 <= 30)
+        assert!(store.update(p3));
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.current_bytes(), 23);
+    }
 }
