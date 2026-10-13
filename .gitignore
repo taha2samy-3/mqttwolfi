@@ -9,7 +9,10 @@ certs/*.pem
 .mise.local.toml
 
 # Dependencies and external sources
-external/
+# Track external/wolfssl as a git submodule; ignore only its build output
+external/wolfssl/build/
+external/wolfssl/build_fips/
+external/wolfMQTT/
 
 # IDE files
 .vscode/

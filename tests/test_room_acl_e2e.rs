@@ -752,3 +752,267 @@ async fn test_e2e_load_acl_conf_file_live() {
         );
     }
 }
+
+/// Regression test for F2: ACL rule ordering bug.
+///
+/// `guest_auditor` in acl.conf is a `viewer` for the `operations` room with these rules (in file order):
+///   1. topic read rooms/%r/chat
+///   2. topic read rooms/%r/announcements
+///   3. topic deny rooms/%r/#
+///
+/// Before the fix (`insert(0)` reversed order), rule 3 was evaluated first and denied all access,
+/// making rule 1 and 2 unreachable. This test verifies that rule ordering is now correct.
+#[tokio::test]
+async fn test_e2e_acl_conf_guest_auditor() {
+    let acl = Arc::new(AclEngine::new(false));
+    acl.load_from_acl_file("config/acl.conf")
+        .await
+        .expect("config/acl.conf must load");
+
+    let server = BrokerServer::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .with_acl(acl);
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // guest_auditor connects with correct password
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut buf = BytesMut::new();
+    send_packet(
+        &mut stream,
+        MqttPacket::Connect(
+            ConnectPacket::new("auditor_session")
+                .with_credentials("guest_auditor", Bytes::from_static(b"auditor_pass")),
+        ),
+    )
+    .await;
+    let ack = timeout(Duration::from_secs(2), read_packet(&mut stream, &mut buf))
+        .await
+        .expect("ConnAck timeout");
+    assert_eq!(
+        ack,
+        MqttPacket::ConnAck {
+            session_present: false,
+            reason_code: 0x00,
+        },
+        "guest_auditor must connect successfully"
+    );
+
+    // ALLOWED: subscribe to rooms/operations/chat (rule 1: read rooms/%r/chat)
+    send_packet(
+        &mut stream,
+        MqttPacket::Subscribe {
+            packet_id: 1,
+            topics: vec![("rooms/operations/chat".into(), QoS::AtMostOnce)],
+        },
+    )
+    .await;
+    let suback = timeout(Duration::from_secs(2), read_packet(&mut stream, &mut buf))
+        .await
+        .expect("SubAck timeout");
+    assert_eq!(
+        suback,
+        MqttPacket::SubAck {
+            packet_id: 1,
+            return_codes: vec![0x00],
+        },
+        "guest_auditor MUST be allowed to subscribe to rooms/operations/chat (F2 regression)"
+    );
+
+    // ALLOWED: subscribe to rooms/operations/announcements (rule 2)
+    send_packet(
+        &mut stream,
+        MqttPacket::Subscribe {
+            packet_id: 2,
+            topics: vec![("rooms/operations/announcements".into(), QoS::AtMostOnce)],
+        },
+    )
+    .await;
+    let suback2 = timeout(Duration::from_secs(2), read_packet(&mut stream, &mut buf))
+        .await
+        .expect("SubAck timeout");
+    assert_eq!(
+        suback2,
+        MqttPacket::SubAck {
+            packet_id: 2,
+            return_codes: vec![0x00],
+        },
+        "guest_auditor MUST be allowed to subscribe to rooms/operations/announcements (F2 regression)"
+    );
+
+    // DENIED: subscribe to rooms/operations/presence (rule 3: deny rooms/%r/#)
+    send_packet(
+        &mut stream,
+        MqttPacket::Subscribe {
+            packet_id: 3,
+            topics: vec![("rooms/operations/presence".into(), QoS::AtMostOnce)],
+        },
+    )
+    .await;
+    let denied = timeout(Duration::from_secs(2), read_packet(&mut stream, &mut buf))
+        .await
+        .expect("SubAck timeout");
+    assert_eq!(
+        denied,
+        MqttPacket::SubAck {
+            packet_id: 3,
+            return_codes: vec![0x80],
+        },
+        "guest_auditor must be denied on rooms/operations/presence"
+    );
+
+    // DENIED: publish to rooms/operations/chat (viewer role = read-only)
+    send_packet(
+        &mut stream,
+        MqttPacket::Publish(PublishPacket {
+            topic: "rooms/operations/chat".into(),
+            qos: QoS::AtMostOnce,
+            retain: false,
+            dup: false,
+            packet_id: None,
+            payload: Bytes::from_static(b"illegal write"),
+        }),
+    )
+    .await;
+    // No deliver-back expected (viewer cannot publish)
+    let no_msg = timeout(Duration::from_millis(200), read_packet(&mut stream, &mut buf)).await;
+    assert!(
+        no_msg.is_err(),
+        "guest_auditor must NOT be able to publish (viewer = read-only)"
+    );
+}
+
+/// Regression test for F2: ACL rule ordering bug on device accounts.
+///
+/// `sensor_node` in acl.conf is a `device` with these rules (in file order):
+///   1. topic write devices/%c/telemetry
+///   2. topic read  devices/%c/commands
+///   3. topic deny  #
+///
+/// Before the fix, rule 3 was evaluated first and denied every topic.
+/// This test confirms that telemetry publish and commands subscribe work correctly.
+#[tokio::test]
+async fn test_e2e_acl_conf_sensor_node() {
+    let acl = Arc::new(AclEngine::new(false));
+    acl.load_from_acl_file("config/acl.conf")
+        .await
+        .expect("config/acl.conf must load");
+
+    let server = BrokerServer::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .with_acl(acl);
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // sensor_node must use ClientID == username (device role enforcement)
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut buf = BytesMut::new();
+    send_packet(
+        &mut stream,
+        MqttPacket::Connect(
+            ConnectPacket::new("sensor_node")
+                .with_credentials("sensor_node", Bytes::from_static(b"sensor_token_77")),
+        ),
+    )
+    .await;
+    let ack = timeout(Duration::from_secs(2), read_packet(&mut stream, &mut buf))
+        .await
+        .expect("ConnAck timeout");
+    assert_eq!(
+        ack,
+        MqttPacket::ConnAck {
+            session_present: false,
+            reason_code: 0x00,
+        },
+        "sensor_node must connect successfully"
+    );
+
+    // ALLOWED: subscribe to devices/sensor_node/commands (rule 2: read devices/%c/commands)
+    send_packet(
+        &mut stream,
+        MqttPacket::Subscribe {
+            packet_id: 1,
+            topics: vec![("devices/sensor_node/commands".into(), QoS::AtLeastOnce)],
+        },
+    )
+    .await;
+    let suback = timeout(Duration::from_secs(2), read_packet(&mut stream, &mut buf))
+        .await
+        .expect("SubAck timeout");
+    assert_eq!(
+        suback,
+        MqttPacket::SubAck {
+            packet_id: 1,
+            return_codes: vec![0x01],
+        },
+        "sensor_node MUST be allowed to subscribe to its own commands topic (F2 regression)"
+    );
+
+    // ALLOWED: publish QoS1 telemetry to devices/sensor_node/telemetry → must receive PUBACK
+    send_packet(
+        &mut stream,
+        MqttPacket::Publish(PublishPacket {
+            topic: "devices/sensor_node/telemetry".into(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(42),
+            payload: Bytes::from_static(b"temp=22.5C hum=60%"),
+        }),
+    )
+    .await;
+    let puback = timeout(Duration::from_secs(2), read_packet(&mut stream, &mut buf))
+        .await
+        .expect("PUBACK timeout for telemetry");
+    assert_eq!(
+        puback,
+        MqttPacket::PubAck { packet_id: 42 },
+        "sensor_node MUST receive PUBACK for telemetry publish (F2 regression)"
+    );
+
+    // DENIED: subscribe to rooms/# (caught by rule 3: deny #)
+    send_packet(
+        &mut stream,
+        MqttPacket::Subscribe {
+            packet_id: 2,
+            topics: vec![("rooms/#".into(), QoS::AtMostOnce)],
+        },
+    )
+    .await;
+    let denied = timeout(Duration::from_secs(2), read_packet(&mut stream, &mut buf))
+        .await
+        .expect("SubAck timeout");
+    assert_eq!(
+        denied,
+        MqttPacket::SubAck {
+            packet_id: 2,
+            return_codes: vec![0x80],
+        },
+        "sensor_node must be denied access to human rooms"
+    );
+
+    // DENIED: publish to another device's telemetry
+    send_packet(
+        &mut stream,
+        MqttPacket::Publish(PublishPacket {
+            topic: "devices/other_sensor/telemetry".into(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(43),
+            payload: Bytes::from_static(b"spoofed data"),
+        }),
+    )
+    .await;
+    let no_puback = timeout(Duration::from_millis(200), read_packet(&mut stream, &mut buf)).await;
+    assert!(
+        no_puback.is_err(),
+        "sensor_node must NOT receive PUBACK when publishing to another device's topic"
+    );
+}

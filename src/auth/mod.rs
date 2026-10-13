@@ -543,8 +543,13 @@ impl AclEngine {
                     let rule = AclRule::new(pattern, perm);
 
                     if let Some(ref mut user) = current_user {
-                        // Prepend custom file rules so explicit file rules take priority over default role rules
-                        user.custom_rules.insert(0, rule);
+                        // IMPORTANT: Append rules in file-declaration order.
+                        // Semantics: "first matching rule wins."
+                        // Previously this used insert(0, rule) which REVERSED the file order,
+                        // causing the last line (e.g. `topic deny #`) to be evaluated first,
+                        // silently denying all access even when specific allow rules were present.
+                        // Fix (F2): use push() to preserve file ordering.
+                        user.custom_rules.push(rule);
                     }
                 }
                 _ => {}
