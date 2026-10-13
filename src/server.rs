@@ -531,11 +531,7 @@ impl BrokerServer {
                                             );
                                             return_codes.push(0x80); // Filter invalid / syntax error
                                         } else {
-                                            let granted_qos = if *qos == QoS::ExactlyOnce {
-                                                QoS::AtLeastOnce
-                                            } else {
-                                                *qos
-                                            };
+                                            let granted_qos = *qos;
                                             if !subscribed_topics.contains(topic_filter) {
                                                 subscribed_topics.push(topic_filter.clone());
                                             }
