@@ -300,6 +300,10 @@ impl AclEngine {
         self
     }
 
+    pub fn allow_anonymous(&self) -> bool {
+        self.allow_anonymous
+    }
+
     pub async fn add_user(&self, account: UserAccount) {
         let mut guard = self.users.write().await;
         guard.insert(account.username.clone(), Arc::new(account));

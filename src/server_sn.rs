@@ -523,7 +523,7 @@ impl MqttSnServer {
                 data,
                 dup,
             } => {
-                // Guard: must be authenticated (i.e., CONNECT received)
+                // Guard: must be authenticated (i.e., CONNECT received), unless anonymous access is enabled or QoS -1
                 let session_info = {
                     let lock = self.sessions.read().await;
                     lock.get(&peer)
@@ -531,12 +531,23 @@ impl MqttSnServer {
                 };
                 let (is_auth, user_opt, client_id_str) = match session_info {
                     Some(info) => info,
+                    None if self.context.acl.allow_anonymous() || qos == 3 => (
+                        true,
+                        Some(Arc::new(UserAccount {
+                            username: "anonymous".into(),
+                            password_hash: String::new(),
+                            role: crate::auth::UserRole::Custom("anonymous".into()),
+                            allowed_rooms: Vec::new(),
+                            custom_rules: Vec::new(),
+                        })),
+                        format!("anon-{}", peer),
+                    ),
                     None => {
                         warn!("MQTT-SN PUBLISH from {} without session; ignoring", peer);
                         return;
                     }
                 };
-                if !is_auth {
+                if !is_auth && !self.context.acl.allow_anonymous() && qos != 3 {
                     warn!("MQTT-SN PUBLISH from {} without CONNECT; ignoring", peer);
                     return;
                 }
