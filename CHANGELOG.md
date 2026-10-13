@@ -5,6 +5,34 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [0.3.1] - 2026-10-13
+
+### 🔒 Security Fix
+- **[F2] ACL Rule Ordering Bug — Reversed Evaluation Order (HIGH):**
+  - **Root Cause:** `load_from_acl_file` used `user.custom_rules.insert(0, rule)` to prepend each parsed line. This reversed the file order so the **last** line in the user's block was evaluated **first**. Since `guest_auditor` and `sensor_node` both end with a broad `topic deny ...` rule as a catch-all fallback, this rule fired before any specific allow rules, silently blocking all access for those accounts.
+  - **Fix:** Changed to `user.custom_rules.push(rule)` — rules are now appended in file-declaration order, matching the documented "first match wins" semantics.
+  - **Files:** [`src/auth/mod.rs`](src/auth/mod.rs) (line ~547)
+
+### ✅ Testing
+- **Regression Tests for F2 Added:** Two new live E2E TCP tests added to [`tests/test_room_acl_e2e.rs`](tests/test_room_acl_e2e.rs):
+  - `test_e2e_acl_conf_guest_auditor` — verifies that a viewer can subscribe to `rooms/operations/chat` and `rooms/operations/announcements` but cannot publish or subscribe to other topics in the room.
+  - `test_e2e_acl_conf_sensor_node` — verifies that a device can publish telemetry to its own topic, subscribe to its own commands, and is blocked from room and cross-device topics.
+  - These tests would have caught the F2 bug at commit time.
+
+### 🏗️ CI/CD Fix
+- **Root Cause of CI Failures (Exit 101/201):** The `external/` directory was listed in `.gitignore`, meaning the `external/wolfssl` source tree (needed by `build.rs` to compile `libwolfssl.a`) was never committed and was absent in the GitHub Actions runner clone.
+- **Fix — wolfSSL Git Submodule:** Registered `external/wolfssl` as an official git submodule (pointing to `https://github.com/wolfSSL/wolfssl.git`). Updated `.gitignore` to allow the submodule path while still ignoring CMake build artifacts (`external/wolfssl/build/`, `external/wolfssl/build_fips/`).
+- **Fix — CI Workflow:** Added `submodules: recursive` to all `actions/checkout@v4` steps and added an "Install Build Dependencies" step (`cmake build-essential`) to all build jobs.
+- **Files:** [`.gitignore`](.gitignore), [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+
+### ⚙️ Feature: FIPS vs. Non-FIPS wolfSSL Variants
+- **New Cargo Feature `wolfssl-fips`:** When built with `--features wolfssl-fips`, `build.rs` now passes `-DWOLFSSL_FIPS=ON -DFIPS_VERSION=v5` to CMake and uses a separate `external/wolfssl/build_fips/` output directory to avoid cache conflicts between variants.
+- **Conditional Compilation Flag:** Emits `cfg(wolfssl_fips)` so library code can conditionally compile FIPS-specific paths.
+- **CI Matrix:** The CI test job now has a build matrix with `standard` and `fips` (commented out until a validated FIPS source bundle is available — the standard open-source wolfSSL tree does not include FIPS code).
+- **Files:** [`build.rs`](build.rs), [`Cargo.toml`](Cargo.toml), [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+
+---
+
 ## [0.3.0] - 2026-10-13
 
 ### 🚀 Major Highlights

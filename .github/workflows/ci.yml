@@ -15,8 +15,13 @@ jobs:
     name: Code Formatting & Clippy Lints
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout Repository (with submodules)
         uses: actions/checkout@v4
+        with:
+          submodules: recursive   # Fetches external/wolfssl
+
+      - name: Install Build Dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -39,11 +44,27 @@ jobs:
         run: task lint
 
   test-suite:
-    name: Unit, Integration & E2E Tests
+    name: Unit, Integration & E2E Tests (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Standard non-FIPS build
+          - variant: standard
+            cargo_features: --features wolfssl
+          # FIPS build — only runs when a validated FIPS source bundle is present
+          # Disabled by default; uncomment when a FIPS-validated wolfSSL bundle is available
+          # - variant: fips
+          #   cargo_features: --features wolfssl-fips
     steps:
-      - name: Checkout Repository
+      - name: Checkout Repository (with submodules)
         uses: actions/checkout@v4
+        with:
+          submodules: recursive   # Fetches external/wolfssl
+
+      - name: Install Build Dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -61,7 +82,7 @@ jobs:
         run: task certs:gen
 
       - name: Run Unit Tests (Packet Parser & Variables)
-        run: task test:unit
+        run: cargo test --test '*' ${{ matrix.cargo_features }} -- --test-threads=4
 
       - name: Run Integration Tests (Session & Topic Routing)
         run: task test:integration
@@ -73,8 +94,13 @@ jobs:
     name: Release Performance Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout Repository (with submodules)
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Build Dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -108,8 +134,13 @@ jobs:
     name: Comparative TLS Benchmarks (WolfiMQ vs Mosquitto)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
+      - name: Checkout Repository (with submodules)
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Build Dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake build-essential
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -133,4 +164,3 @@ jobs:
 
       - name: Execute Comparative TLS Benchmark (WolfiMQ vs Mosquitto)
         run: task bench:tls:compare
-

@@ -4,7 +4,6 @@ use std::process::Command;
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let wolfssl_src = manifest_dir.join("external/wolfssl");
-    let build_dir = wolfssl_src.join("build");
 
     // Detect FIPS feature flag set by Cargo
     let fips_enabled = std::env::var("CARGO_FEATURE_WOLFSSL_FIPS").is_ok();
