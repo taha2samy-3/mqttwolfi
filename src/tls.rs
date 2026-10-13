@@ -8,7 +8,7 @@
 //! All `unsafe` code of the crate lives in this module and is limited to FFI calls on pointers
 //! owned by [`SslHandle`] / [`WolfContext`].
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_short, c_void, CStr, CString};
 use std::future::poll_fn;
 use std::io;
 use std::path::Path;
@@ -53,6 +53,9 @@ const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: c_int = 2;
 const WOLFSSL_TLSV1_2: c_int = 3;
 const WOLFSSL_ALPN_FAILED_ON_MISMATCH: u8 = 4;
 const WOLFSSL_SNI_HOST_NAME: u8 = 0;
+/// Smallest peer keys accepted (bits): below these, certificates are refused in the handshake.
+const MIN_RSA_KEY_BITS: c_short = 2048;
+const MIN_ECC_KEY_BITS: c_short = 256;
 
 extern "C" {
     fn wolfSSL_Init() -> c_int;
@@ -80,6 +83,14 @@ extern "C" {
     );
     fn wolfSSL_CTX_SetMinVersion(ctx: *mut WOLFSSL_CTX, version: c_int) -> c_int;
     fn wolfSSL_CTX_set_cipher_list(ctx: *mut WOLFSSL_CTX, list: *const c_char) -> c_int;
+    fn wolfSSL_CTX_SetMinRsaKey_Sz(ctx: *mut WOLFSSL_CTX, key_sz: c_short) -> c_int;
+    fn wolfSSL_CTX_SetMinEccKey_Sz(ctx: *mut WOLFSSL_CTX, key_sz: c_short) -> c_int;
+    fn wolfSSL_CTX_EnableCRL(ctx: *mut WOLFSSL_CTX, options: c_int) -> c_int;
+    fn wolfSSL_CTX_LoadCRLFile(
+        ctx: *mut WOLFSSL_CTX,
+        path: *const c_char,
+        file_type: c_int,
+    ) -> c_int;
     fn wolfSSL_new(ctx: *mut WOLFSSL_CTX) -> *mut WOLFSSL;
     fn wolfSSL_free(ssl: *mut WOLFSSL);
     fn wolfSSL_set_fd(ssl: *mut WOLFSSL, fd: c_int) -> c_int;
@@ -163,9 +174,18 @@ impl WolfContext {
         }
         // SAFETY: method is a valid static method table; wolfSSL_CTX_new takes ownership of it.
         let raw = unsafe { wolfSSL_CTX_new(method) };
-        NonNull::new(raw)
+        let ctx = NonNull::new(raw)
             .map(|raw| Self { raw })
-            .ok_or(TlsError::Library("wolfSSL_CTX_new failed"))
+            .ok_or(TlsError::Library("wolfSSL_CTX_new failed"))?;
+        // SAFETY: ctx is valid.
+        let ok = unsafe {
+            wolfSSL_CTX_SetMinRsaKey_Sz(ctx.ptr(), MIN_RSA_KEY_BITS) == WOLFSSL_SUCCESS
+                && wolfSSL_CTX_SetMinEccKey_Sz(ctx.ptr(), MIN_ECC_KEY_BITS) == WOLFSSL_SUCCESS
+        };
+        if !ok {
+            return Err(TlsError::Library("setting minimum key sizes failed"));
+        }
+        Ok(ctx)
     }
 
     fn ptr(&self) -> *mut WOLFSSL_CTX {
@@ -213,6 +233,19 @@ impl WolfContext {
         // SAFETY: as above; the directory argument may be NULL.
         self.load_file("CA certificate", path, |ctx, p| unsafe {
             wolfSSL_CTX_load_verify_locations(ctx, p, std::ptr::null())
+        })
+    }
+
+    /// Checks client certificates against a certificate revocation list (PEM). Only the
+    /// client's own certificate is checked; the CRL must be issued by the CA that signed it.
+    fn load_crl(&self, path: &str) -> Result<(), TlsError> {
+        // SAFETY: ctx is valid; 0 = check the peer certificate only.
+        if unsafe { wolfSSL_CTX_EnableCRL(self.ptr(), 0) } != WOLFSSL_SUCCESS {
+            return Err(TlsError::Library("wolfSSL_CTX_EnableCRL failed"));
+        }
+        // SAFETY: as for the other files.
+        self.load_file("certificate revocation list", path, |ctx, p| unsafe {
+            wolfSSL_CTX_LoadCRLFile(ctx, p, SSL_FILETYPE_PEM)
         })
     }
 
@@ -588,6 +621,8 @@ pub struct TlsServerConfig {
     pub key_file: String,
     /// CA used to verify client certificates; `Some` enables mutual TLS.
     pub client_ca_file: Option<String>,
+    /// Certificate revocation list for client certificates (mutual TLS only).
+    pub crl_file: Option<String>,
     pub min_version: TlsVersion,
     pub ciphers: Option<String>,
     pub alpn_protocols: Vec<String>,
@@ -600,6 +635,7 @@ impl TlsServerConfig {
             cert_file: cert_file.into(),
             key_file: key_file.into(),
             client_ca_file: None,
+            crl_file: None,
             min_version: TlsVersion::Tls13,
             ciphers: None,
             alpn_protocols: vec!["mqtt".into()],
@@ -612,6 +648,7 @@ impl TlsServerConfig {
             cert_file: c.server_cert_file.clone(),
             key_file: c.server_key_file.clone(),
             client_ca_file: c.require_client_cert.then(|| c.ca_cert_file.clone()),
+            crl_file: (c.require_client_cert && !c.crl_file.is_empty()).then(|| c.crl_file.clone()),
             min_version: if c.min_tls_version == "TLSv1.2" {
                 TlsVersion::Tls12
             } else {
@@ -641,13 +678,16 @@ impl WolfTlsAcceptor {
             let len = list.len() as u32;
             list.push(0);
             // SAFETY: ssl is valid; wolfSSL copies the list during the call.
-            unsafe {
+            let rc = unsafe {
                 wolfSSL_UseALPN(
                     tls.ssl.ptr(),
                     list.as_mut_ptr().cast(),
                     len,
                     WOLFSSL_ALPN_FAILED_ON_MISMATCH,
-                );
+                )
+            };
+            if rc != WOLFSSL_SUCCESS {
+                return Err(io::Error::other("wolfSSL_UseALPN failed"));
             }
         }
         match tokio::time::timeout(self.handshake_timeout, tls.handshake(true)).await {
@@ -690,6 +730,9 @@ pub fn create_tls_acceptor(cfg: &TlsServerConfig) -> Result<WolfTlsAcceptor, Tls
         Some(ca) => {
             ctx.load_ca(ca)?;
             ctx.set_verify(SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT);
+            if let Some(crl) = &cfg.crl_file {
+                ctx.load_crl(crl)?;
+            }
         }
         None => ctx.set_verify(SSL_VERIFY_NONE),
     }
@@ -722,7 +765,11 @@ impl WolfTlsConnector {
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "domain too long"))?;
             // SAFETY: ssl is valid; the domain buffer holds `len` bytes and wolfSSL copies it.
             unsafe {
-                wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, c_domain.as_ptr().cast(), len);
+                if wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, c_domain.as_ptr().cast(), len)
+                    != WOLFSSL_SUCCESS
+                {
+                    return Err(io::Error::other("wolfSSL_UseSNI failed"));
+                }
                 if wolfSSL_check_domain_name(ssl, c_domain.as_ptr()) != WOLFSSL_SUCCESS {
                     return Err(io::Error::other("wolfSSL_check_domain_name failed"));
                 }
@@ -733,7 +780,7 @@ impl WolfTlsConnector {
             let len = list.len() as u32;
             list.push(0);
             // SAFETY: as in the acceptor.
-            unsafe {
+            let rc = unsafe {
                 wolfSSL_UseALPN(
                     ssl,
                     list.as_mut_ptr().cast(),
@@ -741,6 +788,9 @@ impl WolfTlsConnector {
                     WOLFSSL_ALPN_FAILED_ON_MISMATCH,
                 )
             };
+            if rc != WOLFSSL_SUCCESS {
+                return Err(io::Error::other("wolfSSL_UseALPN failed"));
+            }
         }
         tls.handshake(false).await?;
         Ok(tls)

@@ -157,6 +157,8 @@ impl Property {
             Property::ReceiveMaximum(v) | Property::TopicAlias(v) => *v != 0,
             Property::MaximumPacketSize(v) => *v != 0,
             Property::SubscriptionIdentifier(v) => (1..=268_435_455).contains(v),
+            // A Response Topic is a Topic Name: non-empty, no wildcards (MQTT-3.3.2-14).
+            Property::ResponseTopic(t) => !t.is_empty() && !t.contains(['+', '#']),
             _ => true,
         };
         if ok {
@@ -243,8 +245,9 @@ impl Properties {
         while inner.has_remaining() {
             let prop = Property::decode(&mut inner)?;
             let id = prop.id();
+            // §2.2.2.2: an identifier not valid for the packet makes it a Malformed Packet.
             if !ctx.allows(id) {
-                return Err(PacketError::ProtocolError(
+                return Err(PacketError::Malformed(
                     "property not allowed in this packet",
                 ));
             }
@@ -268,6 +271,28 @@ impl Properties {
         put_vbi(dst, body.len() as u32)?;
         dst.put(body);
         Ok(())
+    }
+
+    /// Approximate memory held by the properties, counted against queue and retained-store
+    /// byte quotas (cheap: no encoding).
+    pub fn memory_size(&self) -> usize {
+        self.0
+            .iter()
+            .map(|p| {
+                8 + match p {
+                    Property::ContentType(s)
+                    | Property::ResponseTopic(s)
+                    | Property::AssignedClientIdentifier(s)
+                    | Property::AuthenticationMethod(s)
+                    | Property::ResponseInformation(s)
+                    | Property::ServerReference(s)
+                    | Property::ReasonString(s) => s.len(),
+                    Property::CorrelationData(b) | Property::AuthenticationData(b) => b.len(),
+                    Property::UserProperty(k, v) => k.len() + v.len(),
+                    _ => 0,
+                }
+            })
+            .sum()
     }
 
     /// Size of the encoded property list including its length prefix.
@@ -392,10 +417,25 @@ mod tests {
         let mut buf = BytesMut::new();
         props.encode(&mut buf).unwrap();
         let mut r = Reader::new(buf.freeze());
-        assert!(matches!(
-            Properties::decode(&mut r, PropertyContext::Packet(PacketType::Publish)),
-            Err(PacketError::ProtocolError(_))
-        ));
+        // §2.2.2.2: an identifier not valid for the packet type makes it malformed (0x81).
+        let err =
+            Properties::decode(&mut r, PropertyContext::Packet(PacketType::Publish)).unwrap_err();
+        assert!(matches!(err, PacketError::Malformed(_)));
+        assert_eq!(err.reason_code(), 0x81);
+    }
+
+    #[test]
+    fn rejects_response_topic_with_wildcards() {
+        for topic in ["reply/#", "reply/+/x", ""] {
+            let props = Properties(vec![Property::ResponseTopic(topic.into())]);
+            let mut buf = BytesMut::new();
+            props.encode(&mut buf).unwrap();
+            let mut r = Reader::new(buf.freeze());
+            assert!(
+                Properties::decode(&mut r, PropertyContext::Packet(PacketType::Publish)).is_err(),
+                "{topic:?}"
+            );
+        }
     }
 
     #[test]

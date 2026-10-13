@@ -136,7 +136,7 @@ async fn topic_aliases_from_clients() {
     publ.publish(bad).await.unwrap();
     let got = publ.wait_closed(Duration::from_secs(2)).await.unwrap();
     assert!(
-        got.contains(&MqttPacket::disconnect(reason::TOPIC_ALIAS_INVALID)),
+        disconnected_with(&got, reason::TOPIC_ALIAS_INVALID),
         "{got:?}"
     );
 }
@@ -474,10 +474,7 @@ async fn server_sends_disconnect_reason_codes() {
     let mut c = connect(b.addr, v5("dc-1")).await;
     c.send(&MqttPacket::Connect(v5("dc-1"))).await.unwrap();
     let got = c.wait_closed(Duration::from_secs(2)).await.unwrap();
-    assert!(
-        got.contains(&MqttPacket::disconnect(reason::PROTOCOL_ERROR)),
-        "{got:?}"
-    );
+    assert!(disconnected_with(&got, reason::PROTOCOL_ERROR), "{got:?}");
 
     let mut c = connect(b.addr, v5("dc-2")).await;
     c.send(&MqttPacket::Publish(PublishPacket::new(
@@ -487,23 +484,20 @@ async fn server_sends_disconnect_reason_codes() {
     .await
     .unwrap();
     let got = c.wait_closed(Duration::from_secs(2)).await.unwrap();
-    assert!(
-        got.contains(&MqttPacket::disconnect(reason::PACKET_TOO_LARGE)),
-        "{got:?}"
-    );
+    assert!(disconnected_with(&got, reason::PACKET_TOO_LARGE), "{got:?}");
 
     let mut old = connect(b.addr, v5("dc-3")).await;
     let _new = connect(b.addr, v5("dc-3")).await;
     let got = old.wait_closed(Duration::from_secs(2)).await.unwrap();
     assert!(
-        got.contains(&MqttPacket::disconnect(reason::SESSION_TAKEN_OVER)),
+        disconnected_with(&got, reason::SESSION_TAKEN_OVER),
         "{got:?}"
     );
 
     let mut idle = connect(b.addr, v5("dc-4").with_keep_alive(1)).await;
     let got = idle.wait_closed(Duration::from_secs(4)).await.unwrap();
     assert!(
-        got.contains(&MqttPacket::disconnect(reason::KEEP_ALIVE_TIMEOUT)),
+        disconnected_with(&got, reason::KEEP_ALIVE_TIMEOUT),
         "{got:?}"
     );
 
@@ -516,10 +510,7 @@ async fn server_sends_disconnect_reason_codes() {
     .await
     .unwrap();
     let got = c.wait_closed(Duration::from_secs(2)).await.unwrap();
-    assert!(
-        got.contains(&MqttPacket::disconnect(reason::PROTOCOL_ERROR)),
-        "{got:?}"
-    );
+    assert!(disconnected_with(&got, reason::PROTOCOL_ERROR), "{got:?}");
 }
 
 #[tokio::test]
@@ -543,7 +534,7 @@ async fn maximum_qos_and_retain_availability_are_advertised_and_enforced() {
     .unwrap();
     let got = c.wait_closed(Duration::from_secs(2)).await.unwrap();
     assert!(
-        got.contains(&MqttPacket::disconnect(reason::RETAIN_NOT_SUPPORTED)),
+        disconnected_with(&got, reason::RETAIN_NOT_SUPPORTED),
         "{got:?}"
     );
 
@@ -552,7 +543,7 @@ async fn maximum_qos_and_retain_availability_are_advertised_and_enforced() {
     m.packet_id = Some(1);
     c.send(&MqttPacket::Publish(m)).await.unwrap();
     let got = c.wait_closed(Duration::from_secs(2)).await.unwrap();
-    assert!(got.contains(&MqttPacket::disconnect(0x9B)), "{got:?}");
+    assert!(disconnected_with(&got, 0x9B), "{got:?}");
 }
 
 #[tokio::test]
@@ -587,4 +578,172 @@ async fn delayed_will_is_published_when_a_clean_start_ends_the_session() {
         .unwrap()
         .unwrap();
     assert_eq!(&p.payload[..], b"bye");
+}
+
+/// Collects the PUBLISH packets that arrive until the connection goes quiet (not acknowledged).
+async fn unacked_publishes(c: &mut RawClient) -> Vec<PublishPacket> {
+    let mut got = Vec::new();
+    while let Ok(Some(pkt)) = c.recv_timeout(QUIET).await {
+        if let MqttPacket::Publish(p) = pkt {
+            got.push(p);
+        }
+    }
+    got
+}
+
+#[tokio::test]
+async fn resumed_session_resends_within_the_new_receive_maximum() {
+    let b = open_broker().await;
+    let session = |receive_max| {
+        with_props(
+            v5("rm-resume"),
+            vec![
+                Property::SessionExpiryInterval(60),
+                Property::ReceiveMaximum(receive_max),
+            ],
+        )
+    };
+    let mut c = connect(b.addr, session(10)).await;
+    c.subscribe("rmr/#", QoS::AtLeastOnce).await.unwrap();
+    let mut publ = connect(b.addr, v5("rmr-pub")).await;
+    for i in 0..5u8 {
+        publ.publish(
+            PublishPacket::new("rmr/x", Bytes::from(vec![i])).with_qos(QoS::AtLeastOnce, None),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(unacked_publishes(&mut c).await.len(), 5);
+    drop(c); // connection lost with five unacknowledged messages
+
+    // The client comes back allowing only two unacknowledged messages (MQTT-3.3.4-9).
+    let mut resume = session(2);
+    resume.clean_start = false;
+    let (mut c, ack) = RawClient::connect(b.addr, resume).await.unwrap();
+    assert!(ack.session_present);
+    let got = unacked_publishes(&mut c).await;
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got.iter().all(|p| p.dup));
+    assert_eq!(
+        (&got[0].payload[..], &got[1].payload[..]),
+        (&[0][..], &[1][..])
+    );
+
+    // Each acknowledgement lets the next held-back message through, with its original id.
+    c.ack_publish(&got[0]).await.unwrap();
+    let next = unacked_publishes(&mut c).await;
+    assert_eq!(next.len(), 1);
+    assert!(next[0].dup);
+    assert_eq!(&next[0].payload[..], &[2]);
+}
+
+#[tokio::test]
+async fn own_will_skips_no_local_subscriptions_of_the_resumed_session() {
+    let b = open_broker().await;
+    let mut watcher = connect(b.addr, v5("nlw-watch")).await;
+    watcher.subscribe("nlw/#", QoS::AtMostOnce).await.unwrap();
+
+    let conn = with_props(
+        v5("nlw-client").with_will(msg("nlw/status", b"offline", QoS::AtMostOnce)),
+        vec![Property::SessionExpiryInterval(60)],
+    );
+    let mut first = connect(b.addr, conn.clone()).await;
+    let mut no_local = SubscriptionOptions::new(QoS::AtMostOnce);
+    no_local.no_local = true;
+    first
+        .subscribe_with(vec![("nlw/#".into(), no_local)], Properties::new())
+        .await
+        .unwrap();
+
+    // Takeover: the old connection's Will is published (§3.1.4) on behalf of the session.
+    let mut resume = conn;
+    resume.clean_start = false;
+    resume.will = None;
+    let (mut second, ack) = RawClient::connect(b.addr, resume).await.unwrap();
+    assert!(ack.session_present);
+    assert_eq!(&next_publish(&mut watcher).await.payload[..], b"offline");
+    assert_no_publish(&mut second).await; // MQTT-3.8.3-3
+}
+
+#[tokio::test]
+async fn retained_quota_rejection_is_reported_and_drops_the_stale_value() {
+    let mut options = BrokerOptions::permissive();
+    options.retained_max_bytes = 64;
+    let b = start_broker(options, AclEngine::new(true)).await;
+    let mut c = connect(b.addr, v5("rq")).await;
+    let small = msg("rq/state", b"v1", QoS::AtLeastOnce).with_retain(true);
+    assert_eq!(c.publish(small).await.unwrap(), reason::SUCCESS);
+    let big = PublishPacket::new("rq/state", Bytes::from(vec![b'x'; 100]))
+        .with_qos(QoS::AtLeastOnce, None)
+        .with_retain(true);
+    assert_eq!(c.publish(big).await.unwrap(), reason::QUOTA_EXCEEDED);
+
+    // MQTT-3.3.1-5: the new value replaces the old one; since it could not be stored, a new
+    // subscriber gets no (stale) retained message.
+    let mut late = connect(b.addr, v5("rq-late")).await;
+    late.subscribe("rq/#", QoS::AtMostOnce).await.unwrap();
+    assert_no_publish(&mut late).await;
+}
+
+#[tokio::test]
+async fn retained_byte_quota_counts_user_properties() {
+    let mut options = BrokerOptions::permissive();
+    options.retained_max_bytes = 1024;
+    let b = start_broker(options, AclEngine::new(true)).await;
+    let mut c = connect(b.addr, v5("rq-props")).await;
+    let heavy = msg("rqp/x", b"1", QoS::AtLeastOnce)
+        .with_retain(true)
+        .with_properties(Properties(vec![Property::UserProperty(
+            "k".into(),
+            "v".repeat(4096),
+        )]));
+    assert_eq!(c.publish(heavy).await.unwrap(), reason::QUOTA_EXCEEDED);
+}
+
+#[tokio::test]
+async fn protocol_violations_get_the_specified_reason_codes() {
+    let b = open_broker().await;
+
+    // Response Topic with a wildcard (MQTT-3.3.2-14).
+    let mut c = connect(b.addr, v5("pv-1")).await;
+    c.send(&MqttPacket::Publish(
+        msg("pv/x", b"r", QoS::AtMostOnce)
+            .with_properties(Properties(vec![Property::ResponseTopic("reply/#".into())])),
+    ))
+    .await
+    .unwrap();
+    let got = c.wait_closed(Duration::from_secs(2)).await.unwrap();
+    assert!(disconnected_with(&got, reason::PROTOCOL_ERROR), "{got:?}");
+
+    // Empty Topic Name without a Topic Alias (§3.3.2.3.4).
+    let mut c = connect(b.addr, v5("pv-2")).await;
+    c.send(&MqttPacket::Publish(msg("", b"r", QoS::AtMostOnce)))
+        .await
+        .unwrap();
+    let got = c.wait_closed(Duration::from_secs(2)).await.unwrap();
+    assert!(disconnected_with(&got, reason::PROTOCOL_ERROR), "{got:?}");
+
+    // QoS 0 with an invalid UTF-8 payload declared as UTF-8 (§4.13).
+    let mut c = connect(b.addr, v5("pv-3")).await;
+    c.send(&MqttPacket::Publish(
+        PublishPacket::new("pv/x", Bytes::from_static(&[0xFF]))
+            .with_properties(Properties(vec![Property::PayloadFormatIndicator(1)])),
+    ))
+    .await
+    .unwrap();
+    let got = c.wait_closed(Duration::from_secs(2)).await.unwrap();
+    assert!(
+        disconnected_with(&got, reason::PAYLOAD_FORMAT_INVALID),
+        "{got:?}"
+    );
+
+    // UNSUBSCRIBE with an invalid filter (§3.11.3).
+    let mut c = connect(b.addr, v5("pv-4")).await;
+    assert_eq!(
+        c.unsubscribe(&["a/#/b", "never/subscribed"]).await.unwrap(),
+        vec![
+            reason::TOPIC_FILTER_INVALID,
+            reason::NO_SUBSCRIPTION_EXISTED
+        ]
+    );
 }

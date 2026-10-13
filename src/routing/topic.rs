@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum TopicError {
     #[error("topic filter is empty")]
     EmptyTopic,
@@ -14,6 +14,16 @@ pub enum TopicError {
     InvalidSharedSubscription,
     #[error("topic contains U+0000")]
     InvalidCharacter,
+    #[error("topic has more than {MAX_TOPIC_LEVELS} levels")]
+    TooManyLevels,
+}
+
+/// Deepest topic name or filter accepted (same limit as Mosquitto). Bounds the recursion of
+/// the subscription trie, which a filter like `a////…` could otherwise overflow.
+pub const MAX_TOPIC_LEVELS: usize = 200;
+
+fn level_count(topic: &str) -> usize {
+    topic.bytes().filter(|b| *b == b'/').count() + 1
 }
 
 /// Validates a topic filter (§4.7.1).
@@ -24,6 +34,9 @@ pub fn validate_topic_filter(filter: &str) -> Result<(), TopicError> {
     // U+0000 is never allowed in MQTT strings (§1.5.4).
     if filter.contains('\0') {
         return Err(TopicError::InvalidCharacter);
+    }
+    if level_count(filter) > MAX_TOPIC_LEVELS {
+        return Err(TopicError::TooManyLevels);
     }
     let levels: Vec<&str> = filter.split('/').collect();
     let last = levels.len() - 1;
@@ -39,9 +52,9 @@ pub fn validate_topic_filter(filter: &str) -> Result<(), TopicError> {
 }
 
 /// A topic name used in PUBLISH must be non-empty and free of wildcards (§4.7.3) and of
-/// U+0000 (§1.5.4).
+/// U+0000 (§1.5.4), with at most [`MAX_TOPIC_LEVELS`] levels.
 pub fn is_valid_topic_name(topic: &str) -> bool {
-    !topic.is_empty() && !topic.contains(['+', '#', '\0'])
+    !topic.is_empty() && !topic.contains(['+', '#', '\0']) && level_count(topic) <= MAX_TOPIC_LEVELS
 }
 
 pub fn has_wildcards(filter: &str) -> bool {
@@ -146,6 +159,23 @@ pub fn filters_intersect(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topic_depth_is_bounded() {
+        let deepest = vec!["a"; MAX_TOPIC_LEVELS].join("/");
+        assert!(validate_topic_filter(&deepest).is_ok());
+        assert!(is_valid_topic_name(&deepest));
+        let too_deep = format!("{deepest}/a");
+        assert_eq!(
+            validate_topic_filter(&too_deep),
+            Err(TopicError::TooManyLevels)
+        );
+        assert!(!is_valid_topic_name(&too_deep));
+        assert_eq!(
+            validate_topic_filter(&format!("a{}", "/".repeat(65_000))),
+            Err(TopicError::TooManyLevels)
+        );
+    }
 
     #[test]
     fn filter_validation() {

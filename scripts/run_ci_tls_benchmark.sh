@@ -44,9 +44,10 @@ listener ${MOSQUITTO_PORT} 127.0.0.1
 cafile $(pwd)/certs/ca-cert.pem
 certfile $(pwd)/certs/server-cert.pem
 keyfile $(pwd)/certs/server-key.pem
-require_certificate false
+require_certificate true
 allow_anonymous true
-log_type all
+log_type error
+log_type warning
 log_dest file ${MOSQUITTO_CONF_DIR}/mosquitto.log
 max_queued_messages 0
 EOF

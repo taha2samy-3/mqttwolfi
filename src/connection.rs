@@ -6,15 +6,16 @@
 
 use crate::broker::{
     connack_capabilities, granted_subscription, BrokerContext, OpenError, OpenedSession,
+    SubscribeError,
 };
 use crate::protocol::{
-    connack_v3, reason, ConnectPacket, MqttPacket, PacketError, Properties, Property,
-    ProtocolVersion, PublishPacket, QoS, RetainHandling,
+    connack_v3, reason, reason_text, ConnectPacket, MqttPacket, PacketError, Properties, Property,
+    ProtocolVersion, PublishPacket, QoS,
 };
 use crate::queue::Outbound;
 use crate::routing::topic::has_wildcards;
 use crate::routing::{is_valid_topic_name, parse_shared_subscription, validate_topic_filter};
-use crate::session::{InflightOut, PubRecOutcome, Session, Transport};
+use crate::session::{PubRecOutcome, Resend, Session, Transport};
 use bytes::{Bytes, BytesMut};
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
@@ -31,6 +32,9 @@ use tracing::{debug, info, warn};
 const WRITE_BATCH_BYTES: usize = 64 * 1024;
 /// How long teardown waits for the writer to flush.
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Largest CONNECT accepted (it is buffered before the client is authenticated); further
+/// packets may use the full `max_packet_size`.
+const MAX_CONNECT_PACKET_SIZE: usize = 256 * 1024;
 
 /// Facts about the remote peer established by the listener.
 #[derive(Debug, Clone, Default)]
@@ -104,7 +108,8 @@ where
     // ── 1. Read the CONNECT packet within the connect timeout (§3.1, MQTT-3.1.0-1) ──────────
     let deadline = Instant::now() + ctx.options.connect_timeout;
     let first = loop {
-        match MqttPacket::decode_from(&mut buf, ProtocolVersion::V311, max_packet) {
+        let first_max = max_packet.min(MAX_CONNECT_PACKET_SIZE);
+        match MqttPacket::decode_from(&mut buf, ProtocolVersion::V311, first_max) {
             Ok(Some(p)) => break p,
             Ok(None) => {}
             Err(PacketError::UnsupportedProtocolVersion(level)) => {
@@ -143,8 +148,8 @@ where
         return;
     };
 
-    // ── 2. Validate and authenticate ─────────────────────────────────────────────────────
-    let Some(accepted) = accept_connect(&ctx, &peer, connect, &mut wr).await else {
+    // ── 2. Validate and authenticate (still within the connect timeout) ───────────────────
+    let Some(accepted) = accept_connect(&ctx, &peer, connect, &mut wr, deadline).await else {
         return;
     };
 
@@ -189,6 +194,16 @@ where
                 version,
                 connack_v3::SERVER_UNAVAILABLE,
                 reason::SERVER_BUSY,
+            )
+            .await;
+            return;
+        }
+        Err(OpenError::SessionLimit) => {
+            refuse(
+                &mut wr,
+                version,
+                connack_v3::SERVER_UNAVAILABLE,
+                reason::QUOTA_EXCEEDED,
             )
             .await;
             return;
@@ -264,7 +279,11 @@ where
         version,
         user: Arc::clone(&user),
         will: connect.will.clone(),
-        connect_expiry: expiry,
+        requested_expiry: if version == ProtocolVersion::V500 {
+            connect.properties.session_expiry_interval().unwrap_or(0)
+        } else {
+            expiry
+        },
         topic_aliases: HashMap::new(),
     };
     let ka = (keep_alive > 0).then(|| Duration::from_millis(keep_alive as u64 * 1500));
@@ -285,7 +304,11 @@ where
                 Ok(None) => break,
                 Err(e) => {
                     warn!("Client '{}' sent an invalid packet: {}", client_id, e);
-                    break 'conn Exit::Server(e.reason_code());
+                    let code = match e.reason_code() {
+                        reason::UNSUPPORTED_PROTOCOL_VERSION => reason::PROTOCOL_ERROR,
+                        code => code,
+                    };
+                    break 'conn Exit::Server(code);
                 }
             }
         }
@@ -357,6 +380,7 @@ async fn accept_connect<W: AsyncWrite + Unpin>(
     peer: &PeerInfo,
     mut connect: ConnectPacket,
     wr: &mut W,
+    deadline: Instant,
 ) -> Option<Accepted> {
     let version = connect.version;
     let v5 = version == ProtocolVersion::V500;
@@ -370,6 +394,16 @@ async fn accept_connect<W: AsyncWrite + Unpin>(
             reason::UNSUPPORTED_PROTOCOL_VERSION,
         )
         .await;
+        return None;
+    }
+    if v5
+        && connect.properties.authentication_method().is_none()
+        && connect
+            .properties
+            .iter()
+            .any(|p| matches!(p, Property::AuthenticationData(_)))
+    {
+        refuse(wr, version, 0, reason::PROTOCOL_ERROR).await;
         return None;
     }
     if v5 && connect.properties.authentication_method().is_some() {
@@ -391,15 +425,32 @@ async fn accept_connect<W: AsyncWrite + Unpin>(
     }
     let client_id = connect.client_id.clone();
 
-    let user = match ctx
-        .acl
-        .authenticate(
+    // Waiting for a verification slot counts against the connect timeout, so a flood of
+    // CONNECTs cannot queue up behind the bounded password verifications forever.
+    let auth = tokio::time::timeout_at(
+        deadline,
+        ctx.acl.authenticate(
             connect.username.as_deref(),
             connect.password.as_deref(),
             &client_id,
+        ),
+    )
+    .await;
+    let Ok(auth) = auth else {
+        warn!(
+            "Authentication of client '{}' from {:?} timed out",
+            client_id, peer.addr
+        );
+        refuse(
+            wr,
+            version,
+            connack_v3::SERVER_UNAVAILABLE,
+            reason::SERVER_BUSY,
         )
-        .await
-    {
+        .await;
+        return None;
+    };
+    let user = match auth {
         Ok(u) => u,
         Err(e) => {
             use crate::auth::AuthError;
@@ -425,23 +476,23 @@ async fn accept_connect<W: AsyncWrite + Unpin>(
         }
     };
 
-    // Bind the MQTT ClientID to the TLS client certificate when configured.
+    // Bind the MQTT ClientID to the TLS client certificate when configured. A connection
+    // without a verified certificate (plain TCP) has no identity and is refused.
     if opts.verify_client_identity {
-        if let Some(ids) = &peer.tls_identities {
-            if !ids.iter().any(|i| i == &client_id) {
-                warn!(
-                    "ClientID '{}' does not match the client certificate identities {:?}",
-                    client_id, ids
-                );
-                refuse(
-                    wr,
-                    version,
-                    connack_v3::NOT_AUTHORIZED,
-                    reason::NOT_AUTHORIZED,
-                )
-                .await;
-                return None;
-            }
+        let ids = peer.tls_identities.as_deref().unwrap_or_default();
+        if !ids.iter().any(|i| i == &client_id) {
+            warn!(
+                "ClientID '{}' does not match the client certificate identities {:?}",
+                client_id, ids
+            );
+            refuse(
+                wr,
+                version,
+                connack_v3::NOT_AUTHORIZED,
+                reason::NOT_AUTHORIZED,
+            )
+            .await;
+            return None;
         }
     }
 
@@ -462,7 +513,7 @@ async fn accept_connect<W: AsyncWrite + Unpin>(
         }
         if will.qos > opts.maximum_qos {
             if v5 {
-                refuse(wr, version, 0, 0x9B).await; // QoS not supported
+                refuse(wr, version, 0, reason::QOS_NOT_SUPPORTED).await;
                 return None;
             }
             will.qos = opts.maximum_qos;
@@ -477,6 +528,15 @@ async fn accept_connect<W: AsyncWrite + Unpin>(
     }
 
     // Keep alive: v5.0 clients can be told a lower value via Server Keep Alive (§3.2.2.3.14).
+    // v3.1.1 has no such mechanism, so a longer keep alive is refused (as Mosquitto does).
+    if !v5 && opts.max_keep_alive_sec > 0 && connect.keep_alive_sec > opts.max_keep_alive_sec {
+        warn!(
+            "Client '{}' asked for keep alive {}s, above max_keep_alive_sec {}",
+            connect.client_id, connect.keep_alive_sec, opts.max_keep_alive_sec
+        );
+        refuse(wr, version, connack_v3::IDENTIFIER_REJECTED, 0).await;
+        return None;
+    }
     let mut keep_alive = connect.keep_alive_sec;
     let mut server_keep_alive = None;
     if v5
@@ -510,7 +570,8 @@ struct Conn<'a> {
     version: ProtocolVersion,
     user: Arc<crate::auth::UserAccount>,
     will: Option<PublishPacket>,
-    connect_expiry: u32,
+    /// Session Expiry Interval the client asked for in CONNECT (before the broker's cap).
+    requested_expiry: u32,
     /// Client-to-server topic aliases (MQTT v5.0 §3.3.2.3.4).
     topic_aliases: HashMap<u16, String>,
 }
@@ -593,7 +654,14 @@ impl Conn<'_> {
                 let reason_codes = filters
                     .iter()
                     .map(|f| {
-                        if self.ctx.unsubscribe(self.session.id, f) {
+                        let valid = match parse_shared_subscription(f) {
+                            Ok(Some(_)) => true,
+                            Ok(None) => validate_topic_filter(f).is_ok(),
+                            Err(_) => false,
+                        };
+                        if !valid {
+                            reason::TOPIC_FILTER_INVALID
+                        } else if self.ctx.unsubscribe(self.session.id, f) {
                             reason::SUCCESS
                         } else {
                             reason::NO_SUBSCRIPTION_EXISTED
@@ -612,7 +680,7 @@ impl Conn<'_> {
             } => {
                 if let Some(new_expiry) = properties.session_expiry_interval() {
                     // §3.14.2.2.2: a session that was not persistent cannot become persistent.
-                    if self.connect_expiry == 0 && new_expiry != 0 {
+                    if self.requested_expiry == 0 && new_expiry != 0 {
                         return Some(Exit::Server(reason::PROTOCOL_ERROR));
                     }
                     self.session.state().expiry_interval =
@@ -644,8 +712,10 @@ impl Conn<'_> {
     fn on_publish(&mut self, mut p: PublishPacket) -> Option<Exit> {
         let ctx = self.ctx;
         let opts = &ctx.options;
-        if p.qos > opts.maximum_qos {
-            return Some(Exit::Server(0x9B)); // QoS not supported
+        // v5.0 clients were told the Maximum QoS in CONNACK (MQTT-3.2.2-11). v3.1.1 has no way
+        // to advertise it, so the message is accepted and routed at the maximum QoS.
+        if p.qos > opts.maximum_qos && self.v5() {
+            return Some(Exit::Server(reason::QOS_NOT_SUPPORTED));
         }
         if p.retain && !opts.allow_retained_messages {
             if self.v5() {
@@ -674,6 +744,10 @@ impl Conn<'_> {
                     .retain(|pr| !matches!(pr, Property::TopicAlias(_)));
             }
         }
+        if p.topic.is_empty() && self.v5() {
+            // §3.3.2.3.4: an empty Topic Name without a Topic Alias is a protocol error.
+            return Some(Exit::Server(reason::PROTOCOL_ERROR));
+        }
         if !is_valid_topic_name(&p.topic) {
             return Some(Exit::Server(reason::TOPIC_NAME_INVALID));
         }
@@ -699,7 +773,11 @@ impl Conn<'_> {
             .iter()
             .any(|pr| matches!(pr, Property::PayloadFormatIndicator(1)));
         if utf8_declared && std::str::from_utf8(&p.payload).is_err() {
-            return ack(reason::PAYLOAD_FORMAT_INVALID).and_then(|a| self.send(a));
+            // §3.3.2.3.2 / §4.13: PUBACK / PUBREC 0x99, or DISCONNECT 0x99 for QoS 0.
+            return match ack(reason::PAYLOAD_FORMAT_INVALID) {
+                Some(a) => self.send(a),
+                None => Some(Exit::Server(reason::PAYLOAD_FORMAT_INVALID)),
+            };
         }
 
         if !self
@@ -741,8 +819,14 @@ impl Conn<'_> {
         let mut routed = p.clone();
         routed.packet_id = None;
         routed.dup = false;
-        self.ctx.publish(Some(self.session.id), routed);
-        ack(reason::SUCCESS).and_then(|a| self.send(a))
+        routed.qos = routed.qos.min(opts.maximum_qos);
+        let outcome = self.ctx.publish(Some(self.session.id), routed);
+        let code = if outcome.retained_rejected && self.v5() {
+            reason::QUOTA_EXCEEDED
+        } else {
+            reason::SUCCESS
+        };
+        ack(code).and_then(|a| self.send(a))
     }
 
     fn on_subscribe(
@@ -756,7 +840,6 @@ impl Conn<'_> {
         let opts = &ctx.options;
         let sub_id = properties.subscription_identifiers().next();
         let mut codes = Vec::with_capacity(filters.len());
-        let mut retained_requests = Vec::new();
 
         for (filter, requested) in filters {
             let fail = |v5code: u8| if v5 { v5code } else { 0x80 };
@@ -798,19 +881,20 @@ impl Conn<'_> {
                 continue;
             }
             let sub = granted_subscription(self.ctx, requested, sub_id);
-            match self.ctx.subscribe(self.session.id, &filter, sub) {
-                Ok(is_new) => {
-                    codes.push(sub.options.qos as u8);
-                    let send_retained = match sub.options.retain_handling {
-                        RetainHandling::SendAlways => true,
-                        RetainHandling::SendIfNew => is_new,
-                        RetainHandling::DoNotSend => false,
-                    };
-                    if send_retained {
-                        retained_requests.push((filter, sub));
-                    }
+            // Retained messages may precede the SUBACK (v3.1.1 §3.8.4 allows matching
+            // PUBLISH packets before SUBACK).
+            match self.ctx.subscribe(self.session, &filter, sub) {
+                Ok(_) => codes.push(sub.options.qos as u8),
+                Err(SubscribeError::TooManySubscriptions) => {
+                    warn!(
+                        "Client '{}' reached the subscription limit; '{}' refused",
+                        self.session.client_id, filter
+                    );
+                    codes.push(fail(reason::QUOTA_EXCEEDED));
                 }
-                Err(_) => codes.push(fail(reason::TOPIC_FILTER_INVALID)),
+                Err(SubscribeError::InvalidFilter(_)) => {
+                    codes.push(fail(reason::TOPIC_FILTER_INVALID))
+                }
             }
         }
 
@@ -819,9 +903,6 @@ impl Conn<'_> {
             reason_codes: codes,
         }) {
             return Some(exit);
-        }
-        for (filter, sub) in retained_requests {
-            self.ctx.deliver_retained(self.session, &filter, &sub);
         }
         None
     }
@@ -848,17 +929,10 @@ async fn run_writer<W>(
     let mut out = BytesMut::with_capacity(16 * 1024);
     out.extend_from_slice(&connack);
     if params.resend_inflight {
-        // §4.4: resend unacknowledged PUBLISH (DUP = 1) and PUBREL with their original ids.
-        let pending = session.state().resend_list();
-        for (pid, item) in pending {
-            let pkt = match item {
-                InflightOut::Publish(mut p) => {
-                    p.dup = true;
-                    MqttPacket::Publish(p)
-                }
-                InflightOut::PubRel => MqttPacket::pubrel(pid),
-            };
-            let _ = pkt.encode(params.version, &mut out);
+        // §4.4: PUBREL packets are resent right away; unacknowledged PUBLISH packets (DUP = 1,
+        // original packet ids) follow in the loop below as the client's Receive Maximum allows.
+        for pid in session.state().begin_resend() {
+            let _ = MqttPacket::pubrel(pid).encode(params.version, &mut out);
         }
     }
     if wr.write_all(&out).await.is_err() || wr.flush().await.is_err() {
@@ -867,27 +941,60 @@ async fn run_writer<W>(
 
     // Flow control: bounded by message count (Receive Maximum / broker limit) and by the bytes
     // held for retransmission, so unacknowledged messages cannot exceed the queue budget.
+    // Resends of a resumed session come before new messages.
     let recv_max = params.client_receive_max.max(1);
     let max_bytes = ctx.options.queue_limits.max_bytes;
     let can_publish = || {
         let st = session.state();
-        st.inflight_count() < recv_max && st.inflight_bytes() < max_bytes
+        !st.has_unsent() && st.inflight_count() < recv_max && st.inflight_bytes() < max_bytes
+    };
+    let can_resend = || {
+        let st = session.state();
+        st.has_unsent() && st.inflight_count() < recv_max
     };
     loop {
+        out.clear();
+        while out.len() < WRITE_BATCH_BYTES {
+            let next = {
+                let mut st = session.state();
+                if st.inflight_count() < recv_max {
+                    st.next_resend()
+                } else {
+                    None
+                }
+            };
+            match next {
+                Some(r) => encode_resend(&ctx, &session, &params, r, &mut out),
+                None => break,
+            }
+        }
+        if !out.is_empty() {
+            if wr.write_all(&out).await.is_err() || wr.flush().await.is_err() {
+                break;
+            }
+            continue;
+        }
         let item = tokio::select! {
             biased;
             r = &mut stop => {
                 if let Ok(Some(code)) = r {
-                    let _ = write_direct(&mut wr, &MqttPacket::disconnect(code), params.version).await;
+                    // A Reason String is included: besides helping operators, some clients
+                    // (e.g. Paho Python 2.x) ignore the reason code unless properties follow it.
+                    let disconnect = MqttPacket::Disconnect {
+                        reason_code: code,
+                        properties: Properties(vec![Property::ReasonString(reason_text(code).into())]),
+                    };
+                    let _ = write_direct(&mut wr, &disconnect, params.version).await;
                 }
                 break;
             }
-            item = session.queue.pop(can_publish) => match item {
-                Some(item) => item,
+            item = session.queue.pop_or_ready(can_publish, can_resend) => match item {
+                Some(Some(item)) => item,
+                // Room for a resend opened up.
+                Some(None) => continue,
                 None => break,
             },
         };
-        out.clear();
         encode_outbound(&ctx, &session, &params, item, &mut out);
         while out.len() < WRITE_BATCH_BYTES {
             match session.queue.try_pop(can_publish()) {
@@ -934,19 +1041,49 @@ fn encode_outbound(
     }
     let mut p = delivery.publish;
     if let Some(at) = delivery.expires_at {
-        // §3.3.2.3.3: forward the remaining lifetime of the message.
-        let remaining = at.saturating_duration_since(now).as_secs_f64().ceil() as u32;
-        p.properties
-            .retain(|pr| !matches!(pr, Property::MessageExpiryInterval(_)));
-        p.properties
-            .push(Property::MessageExpiryInterval(remaining.max(1)));
+        set_remaining_expiry(&mut p, at, now);
     }
     if p.qos != QoS::AtMostOnce {
-        match session.state().track_outbound(p) {
+        match session.state().track_outbound(p, delivery.expires_at) {
             Some(tracked) => p = tracked,
             None => return,
         }
     }
+    write_publish(ctx, session, params, p, out);
+}
+
+/// Encodes an unacknowledged PUBLISH again for a resumed session.
+fn encode_resend(
+    ctx: &BrokerContext,
+    session: &Session,
+    params: &WriterParams,
+    resend: Resend,
+    out: &mut BytesMut,
+) {
+    let mut p = resend.publish;
+    if let Some(at) = resend.expires_at {
+        set_remaining_expiry(&mut p, at, std::time::Instant::now());
+    }
+    write_publish(ctx, session, params, p, out);
+}
+
+/// §3.3.2.3.3: a forwarded message carries its remaining lifetime.
+fn set_remaining_expiry(p: &mut PublishPacket, at: std::time::Instant, now: std::time::Instant) {
+    let remaining = at.saturating_duration_since(now).as_secs_f64().ceil() as u32;
+    p.properties
+        .retain(|pr| !matches!(pr, Property::MessageExpiryInterval(_)));
+    p.properties
+        .push(Property::MessageExpiryInterval(remaining.max(1)));
+}
+
+/// Encodes a PUBLISH into `out` unless it exceeds the client's Maximum Packet Size.
+fn write_publish(
+    ctx: &BrokerContext,
+    session: &Session,
+    params: &WriterParams,
+    p: PublishPacket,
+    out: &mut BytesMut,
+) {
     let (packet_id, payload_len) = (p.packet_id, p.payload.len());
     let start = out.len();
     if MqttPacket::Publish(p).encode(params.version, out).is_err()

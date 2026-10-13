@@ -20,7 +20,8 @@ Usage: wolf-broker [OPTIONS]
 
 Options:
   -c, --config <FILE>          Configuration file [env: WOLFIMQ_CONFIG] [default: config/broker.toml]
-      --check-config           Validate the configuration and ACL file, then exit
+      --check-config           Validate the configuration, ACL file and TLS files (certificates,
+                               key, CRL), then exit
       --print-config           Print the effective configuration (file + environment) as TOML
       --hash-password [PASS]   Print a password hash for acl.conf (reads stdin when PASS is omitted)
   -h, --help                   Print this help

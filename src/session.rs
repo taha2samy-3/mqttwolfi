@@ -34,6 +34,18 @@ struct InflightEntry {
     /// identifiers wrapped around (§4.6, MQTT-4.6.0-1).
     seq: u64,
     item: InflightOut,
+    /// When the message expires (to forward the remaining Message Expiry Interval on resend).
+    expires_at: Option<Instant>,
+    /// False for a PUBLISH of a resumed session that has not been resent on the new
+    /// connection yet; it does not count against the client's Receive Maximum until it is.
+    sent: bool,
+}
+
+/// An unacknowledged PUBLISH to resend on a resumed session.
+#[derive(Debug, Clone)]
+pub struct Resend {
+    pub publish: PublishPacket,
+    pub expires_at: Option<Instant>,
 }
 
 /// Result of a PUBREC for an outbound QoS 2 message.
@@ -76,6 +88,8 @@ pub struct SessionState {
     pub pending_will: Option<PendingWill>,
     inflight: HashMap<u16, InflightEntry>,
     inflight_bytes: usize,
+    /// Inflight PUBLISH entries waiting to be resent after a resume.
+    unsent: usize,
     next_seq: u64,
     next_packet_id: u16,
     /// Inbound QoS 2 packet ids for which PUBREC was sent and PUBREL is awaited.
@@ -114,6 +128,7 @@ impl Session {
                 pending_will: None,
                 inflight: HashMap::new(),
                 inflight_bytes: 0,
+                unsent: 0,
                 next_seq: 0,
                 next_packet_id: 1,
                 inbound_qos2: HashSet::new(),
@@ -136,7 +151,7 @@ impl Session {
 }
 
 fn publish_size(p: &PublishPacket) -> usize {
-    p.topic.len() + p.payload.len()
+    p.memory_size()
 }
 
 impl SessionState {
@@ -154,7 +169,11 @@ impl SessionState {
     }
 
     /// Records an outbound QoS > 0 PUBLISH; returns the packet with its identifier set.
-    pub fn track_outbound(&mut self, mut publish: PublishPacket) -> Option<PublishPacket> {
+    pub fn track_outbound(
+        &mut self,
+        mut publish: PublishPacket,
+        expires_at: Option<Instant>,
+    ) -> Option<PublishPacket> {
         debug_assert!(publish.qos != QoS::AtMostOnce);
         let pid = self.allocate_packet_id()?;
         publish.packet_id = Some(pid);
@@ -166,6 +185,8 @@ impl SessionState {
             InflightEntry {
                 seq,
                 item: InflightOut::Publish(publish.clone()),
+                expires_at,
+                sent: true,
             },
         );
         Some(publish)
@@ -176,7 +197,19 @@ impl SessionState {
         if let InflightOut::Publish(p) = &entry.item {
             self.inflight_bytes -= publish_size(p);
         }
+        if !entry.sent {
+            self.unsent -= 1;
+        }
         Some(entry.item)
+    }
+
+    fn mark_sent(&mut self, pid: u16) {
+        if let Some(e) = self.inflight.get_mut(&pid) {
+            if !e.sent {
+                e.sent = true;
+                self.unsent -= 1;
+            }
+        }
     }
 
     /// Handles PUBACK; returns true when it acknowledged an outbound QoS 1 message.
@@ -205,6 +238,8 @@ impl SessionState {
             self.remove(pid);
             return PubRecOutcome::Ended;
         }
+        // The client may acknowledge a message it got before reconnecting that was not resent.
+        self.mark_sent(pid);
         if let Some(entry) = self.inflight.get_mut(&pid) {
             if let InflightOut::Publish(p) = &entry.item {
                 self.inflight_bytes -= publish_size(p);
@@ -231,23 +266,61 @@ impl SessionState {
         self.remove(pid);
     }
 
-    /// Unacknowledged messages in their original send order, for resending on resume.
-    pub fn resend_list(&self) -> Vec<(u16, InflightOut)> {
-        let mut entries: Vec<(u64, u16, InflightOut)> = self
-            .inflight
-            .iter()
-            .map(|(pid, e)| (e.seq, *pid, e.item.clone()))
-            .collect();
-        entries.sort_by_key(|(seq, _, _)| *seq);
-        entries
-            .into_iter()
-            .map(|(_, pid, item)| (pid, item))
-            .collect()
+    /// Starts resending after a resume (§4.4): returns the packet ids awaiting PUBCOMP (their
+    /// PUBREL is resent right away) and marks every unacknowledged PUBLISH as not yet resent.
+    /// The PUBLISH packets are then taken with [`SessionState::next_resend`] as the client's
+    /// Receive Maximum allows.
+    pub fn begin_resend(&mut self) -> Vec<u16> {
+        let mut pubrels: Vec<(u64, u16)> = Vec::new();
+        self.unsent = 0;
+        for (pid, e) in self.inflight.iter_mut() {
+            match e.item {
+                InflightOut::PubRel => {
+                    e.sent = true;
+                    pubrels.push((e.seq, *pid));
+                }
+                InflightOut::Publish(_) => {
+                    e.sent = false;
+                    self.unsent += 1;
+                }
+            }
+        }
+        pubrels.sort_unstable();
+        pubrels.into_iter().map(|(_, pid)| pid).collect()
     }
 
-    /// Number of unacknowledged outbound QoS 1/2 messages.
+    /// Whether unacknowledged PUBLISH packets still wait to be resent after a resume.
+    pub fn has_unsent(&self) -> bool {
+        self.unsent > 0
+    }
+
+    /// Takes the oldest PUBLISH not resent yet on this connection (original packet id, DUP set).
+    pub fn next_resend(&mut self) -> Option<Resend> {
+        let (pid, _) = self
+            .inflight
+            .iter()
+            .filter(|(_, e)| !e.sent)
+            .map(|(pid, e)| (*pid, e.seq))
+            .min_by_key(|(_, seq)| *seq)?;
+        self.mark_sent(pid);
+        let e = &self.inflight[&pid];
+        match &e.item {
+            InflightOut::Publish(p) => {
+                let mut publish = p.clone();
+                publish.dup = true;
+                Some(Resend {
+                    publish,
+                    expires_at: e.expires_at,
+                })
+            }
+            InflightOut::PubRel => None,
+        }
+    }
+
+    /// Unacknowledged outbound QoS 1/2 messages sent on the current connection; this is what
+    /// the client's Receive Maximum limits.
     pub fn inflight_count(&self) -> usize {
-        self.inflight.len()
+        self.inflight.len() - self.unsent
     }
 
     /// Topic + payload bytes held by unacknowledged outbound PUBLISH packets.
@@ -292,7 +365,7 @@ mod tests {
         let s = session();
         let mut st = s.state();
         let a = st
-            .track_outbound(qos(QoS::AtLeastOnce, b""))
+            .track_outbound(qos(QoS::AtLeastOnce, b""), None)
             .unwrap()
             .packet_id
             .unwrap();
@@ -308,7 +381,7 @@ mod tests {
         let s = session();
         let mut st = s.state();
         for _ in 1..=u16::MAX {
-            st.track_outbound(qos(QoS::AtLeastOnce, b"")).unwrap();
+            st.track_outbound(qos(QoS::AtLeastOnce, b""), None).unwrap();
         }
         assert_eq!(st.allocate_packet_id(), None);
     }
@@ -318,12 +391,12 @@ mod tests {
         let s = session();
         let mut st = s.state();
         let p1 = st
-            .track_outbound(qos(QoS::AtLeastOnce, b"1234"))
+            .track_outbound(qos(QoS::AtLeastOnce, b"1234"), None)
             .unwrap()
             .packet_id
             .unwrap();
         let p2 = st
-            .track_outbound(qos(QoS::ExactlyOnce, b"12"))
+            .track_outbound(qos(QoS::ExactlyOnce, b"12"), None)
             .unwrap()
             .packet_id
             .unwrap();
@@ -352,14 +425,46 @@ mod tests {
         st.next_packet_id = u16::MAX - 1;
         let ids: Vec<u16> = (0..4)
             .map(|_| {
-                st.track_outbound(qos(QoS::AtLeastOnce, b"x"))
+                st.track_outbound(qos(QoS::AtLeastOnce, b"x"), None)
                     .unwrap()
                     .packet_id
                     .unwrap()
             })
             .collect();
         assert_eq!(ids, vec![u16::MAX - 1, u16::MAX, 1, 2]);
-        let resend: Vec<u16> = st.resend_list().into_iter().map(|(pid, _)| pid).collect();
+        assert!(st.begin_resend().is_empty());
+        let resend: Vec<u16> = std::iter::from_fn(|| st.next_resend())
+            .map(|r| {
+                assert!(r.publish.dup);
+                r.publish.packet_id.unwrap()
+            })
+            .collect();
         assert_eq!(resend, ids);
+    }
+
+    #[test]
+    fn held_back_resends_do_not_count_against_receive_maximum() {
+        let s = session();
+        let mut st = s.state();
+        let ids: Vec<u16> = (0..3)
+            .map(|_| {
+                st.track_outbound(qos(QoS::ExactlyOnce, b"x"), None)
+                    .unwrap()
+                    .packet_id
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(st.pubrec(ids[0], false), PubRecOutcome::Release);
+        // Resume: the PUBREL is resent at once, the two PUBLISH packets wait for the window.
+        assert_eq!(st.begin_resend(), vec![ids[0]]);
+        assert!(st.has_unsent());
+        assert_eq!(st.inflight_count(), 1);
+        assert_eq!(st.next_resend().unwrap().publish.packet_id, Some(ids[1]));
+        assert_eq!(st.inflight_count(), 2);
+        // The client acknowledges the last one before it was resent.
+        assert_eq!(st.pubrec(ids[2], false), PubRecOutcome::Release);
+        assert!(!st.has_unsent());
+        assert!(st.next_resend().is_none());
+        assert_eq!(st.inflight_count(), 3);
     }
 }

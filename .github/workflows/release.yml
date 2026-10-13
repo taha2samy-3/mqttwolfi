@@ -41,15 +41,18 @@ jobs:
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-      # Secrets cannot be used in job-level `if`, so their presence is exported here.
+      # The FIPS-Ready bundle (several MB, too large for a secret) is downloaded from a URL kept
+      # in the secret WOLFSSL_FIPS_BUNDLE_URL (it may embed an access token) and verified against
+      # the repository variable WOLFSSL_FIPS_BUNDLE_SHA256. Secrets cannot be used in job-level
+      # `if`, so their presence is exported here.
       - id: fips
-        name: Check for the FIPS bundle secret
+        name: Check for the FIPS bundle settings
         env:
-          HAS_FIPS: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 != '' }}
+          HAS_FIPS: ${{ secrets.WOLFSSL_FIPS_BUNDLE_URL != '' && vars.WOLFSSL_FIPS_BUNDLE_SHA256 != '' }}
         run: |
           echo "available=${HAS_FIPS}" >> "$GITHUB_OUTPUT"
           if [ "${HAS_FIPS}" != "true" ]; then
-            echo "::notice title=No FIPS build::WOLFSSL_FIPS_BUNDLE_B64 is not set; the FIPS-Ready variant is skipped."
+            echo "::notice title=No FIPS build::WOLFSSL_FIPS_BUNDLE_URL / WOLFSSL_FIPS_BUNDLE_SHA256 are not set; the FIPS-Ready variant is skipped."
           fi
 
   test:
@@ -148,8 +151,9 @@ jobs:
   build-fips:
     name: Build linux-x86_64 FIPS-Ready
     needs: [prepare, test]
-    # Shown as "skipped" unless the FIPS-Ready bundle secret is configured.
+    # Shown as "skipped" unless the FIPS-Ready bundle is configured (see `prepare`).
     if: needs.prepare.outputs.fips == 'true'
+    # Native build: the FIPS integrity hash step runs wolfCrypt's test program.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -157,25 +161,81 @@ jobs:
           ref: ${{ needs.prepare.outputs.tag }}
           submodules: recursive
       - name: Install build dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y autoconf automake libtool
+        run: sudo apt-get update -qq && sudo apt-get install -y autoconf automake libtool unzip
       - uses: dtolnay/rust-toolchain@stable
-      - name: Restore bundle and build
+      - name: Download and verify the FIPS-Ready bundle
         env:
-          WOLFSSL_FIPS_BUNDLE_B64: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 }}
+          BUNDLE_URL: ${{ secrets.WOLFSSL_FIPS_BUNDLE_URL }}
+          BUNDLE_SHA256: ${{ vars.WOLFSSL_FIPS_BUNDLE_SHA256 }}
         run: |
-          echo "${WOLFSSL_FIPS_BUNDLE_B64}" | base64 -d | tar -xz -C .
-          cargo build --release --no-default-features --features wolfssl-fips --bins
+          set -euo pipefail
+          curl -fsSL --retry 3 "${BUNDLE_URL}" -o "${RUNNER_TEMP}/fips-bundle"
+          echo "${BUNDLE_SHA256}  ${RUNNER_TEMP}/fips-bundle" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/fips-src"
+          if unzip -tq "${RUNNER_TEMP}/fips-bundle" >/dev/null 2>&1; then
+            unzip -q "${RUNNER_TEMP}/fips-bundle" -d "${RUNNER_TEMP}/fips-src"
+          else
+            tar -xf "${RUNNER_TEMP}/fips-bundle" -C "${RUNNER_TEMP}/fips-src"
+          fi
+          # The bundle unpacks into a single top-level directory.
+          set -- "${RUNNER_TEMP}"/fips-src/*/
+          if [ "$#" -ne 1 ]; then
+            echo "::error::Expected one top-level directory in the FIPS bundle"
+            exit 1
+          fi
+          mv "$1" external/wolfssl-fips-bundle
+      - name: Build
+        run: cargo build --release --no-default-features --features wolfssl-fips --bins
+      - name: Package
+        run: |
+          set -euo pipefail
           PKG="wolfimq-${{ needs.prepare.outputs.version }}-linux-x86_64-fips-ready"
-          mkdir -p "${PKG}/bin" "${PKG}/config"
+          mkdir -p "${PKG}/bin" "${PKG}/config" "${PKG}/scripts" "${PKG}/docs" "${PKG}/third-party/wolfssl"
           cp target/release/wolf-broker target/release/wolf-simulate target/release/wolf-bench-tls "${PKG}/bin/"
           cp config/broker.toml config/acl.conf "${PKG}/config/"
-          cp README.md SECURITY.md LICENSE LICENSE-MIT LICENSE-APACHE "${PKG}/"
+          cp scripts/generate_certs.sh "${PKG}/scripts/"
+          cp docs/*.md "${PKG}/docs/"
+          cp README.md CHANGELOG.md SECURITY.md LICENSE LICENSE-MIT LICENSE-APACHE "${PKG}/"
+          # License texts of the wolfSSL code linked into these binaries.
+          for f in COPYING LICENSING README README.md; do
+            if [ -f "external/wolfssl-fips-bundle/${f}" ]; then
+              cp "external/wolfssl-fips-bundle/${f}" "${PKG}/third-party/wolfssl/"
+            fi
+          done
           tar -czf "${PKG}.tar.gz" "${PKG}"
           sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-fips
-          path: wolfimq-*
+          path: |
+            wolfimq-*.tar.gz
+            wolfimq-*.sha256
+
+  source:
+    name: Source archive
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      # Release binaries link wolfSSL (GPLv3), so every release also ships the complete
+      # corresponding source, including the pinned wolfSSL submodule.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          submodules: recursive
+          path: checkout
+      - name: Archive sources including submodules
+        run: |
+          set -euo pipefail
+          PKG="wolfimq-${{ needs.prepare.outputs.version }}-source"
+          mv checkout "${PKG}"
+          tar --exclude-vcs -czf "${PKG}.tar.gz" "${PKG}"
+          sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-source
+          path: |
+            wolfimq-*-source.tar.gz
+            wolfimq-*-source.tar.gz.sha256
 
   benchmarks:
     name: Benchmarks
@@ -199,10 +259,11 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: [prepare, build, build-fips, benchmarks]
+    needs: [prepare, build, build-fips, source, benchmarks]
     # build-fips is usually skipped; publish as long as nothing failed.
     if: >-
       !cancelled() && needs.build.result == 'success' && needs.benchmarks.result == 'success'
+      && needs.source.result == 'success'
       && (needs.build-fips.result == 'success' || needs.build-fips.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
@@ -237,7 +298,10 @@ jobs:
               echo "| ${platform} | \`${name}\` |"
             done
             echo
-            echo "Verify downloads with \`sha256sum -c SHA256SUMS.txt\`."
+            echo "Verify downloads with \`sha256sum -c --ignore-missing SHA256SUMS.txt\`."
+            echo
+            echo "The binaries statically link wolfSSL (GPLv3). The \`-source\` archive is the complete"
+            echo "corresponding source, including the pinned wolfSSL release."
             echo
             cat artifacts/BENCHMARKS.md
           } >> notes.md

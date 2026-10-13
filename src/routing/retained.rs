@@ -37,7 +37,7 @@ impl Default for RetainedStore {
 }
 
 fn entry_size(p: &PublishPacket) -> usize {
-    p.payload.len() + p.topic.len()
+    p.memory_size()
 }
 
 impl RetainedStore {
@@ -108,6 +108,11 @@ impl RetainedStore {
                 self.max_bytes,
                 packet.topic
             );
+            // The new message MUST replace the old one (MQTT-3.3.1-5): when it cannot be
+            // stored, the stale value must not be served to new subscribers either.
+            if self.messages.remove(&packet.topic).is_some() {
+                self.current_bytes = self.current_bytes.saturating_sub(old_size);
+            }
             return RetainOutcome::RejectedQuota;
         }
 
@@ -276,6 +281,13 @@ mod tests {
             RetainOutcome::Stored
         );
         assert_eq!(store.current_bytes(), 23);
+        // A replacement that does not fit removes the old value instead of keeping it.
+        assert_eq!(
+            store.update(msg("t/02", b"0123456789-too-large"), None),
+            RetainOutcome::RejectedQuota
+        );
+        assert!(store.matches_for_filter("t/02").is_empty());
+        assert_eq!(store.current_bytes(), 9);
     }
 
     #[test]

@@ -11,6 +11,8 @@
 node_id = "wolf-broker-node-01"
 # Maximum simultaneous TCP + TLS connections (0 = unlimited).
 max_connections = 100000
+# Sessions kept in memory, connected or persisted offline, all protocols (0 = unlimited).
+max_sessions = 200000
 # Tokio worker threads (0 = one per CPU core).
 worker_threads = 0
 # Seconds a new connection may take to send its CONNECT packet.
@@ -44,19 +46,22 @@ port = 8883
 
 [listeners.mqtt_sn]
 # MQTT-SN v1.2 over UDP for sensor networks and constrained radios.
-enabled = true
-bind_address = "0.0.0.0"
+# SECURITY: MQTT-SN has no authentication or encryption and UDP source addresses can be
+# spoofed. Every SN client gets the rights of `acl_user`. Enable it only on a trusted network
+# (radio gateway, VPN) and bind it to that interface.
+enabled = false
+bind_address = "127.0.0.1"
 port = 1884
 gateway_id = 1
 # Seconds between ADVERTISE broadcasts (0 disables them).
-advertise_interval_sec = 900
+advertise_interval_sec = 0
 advertise_address = "255.255.255.255"
 # MQTT-SN v1.2 has no credentials: SN clients act as this ACL user (must exist in acl.conf).
 # Empty = anonymous identity (requires security.auth.allow_anonymous = true).
 acl_user = "sn_gateway"
 max_sessions = 10000
-# Accept connectionless QoS -1 publishes on predefined / short topic ids.
-allow_qos_minus1 = true
+# Accept connectionless QoS -1 publishes on predefined / short topic ids (no session needed).
+allow_qos_minus1 = false
 # Retransmission of unacknowledged QoS 1/2 messages (Tretry seconds, Nretry attempts).
 retry_interval_sec = 10
 max_retries = 3
@@ -79,7 +84,11 @@ server_key_file = "certs/server-key.pem"
 # Mutual TLS: every client must present a certificate signed by ca_cert_file.
 require_client_cert = true
 # Require the MQTT ClientID to equal the client certificate CN or one of its SANs.
+# Connections without a client certificate (plain TCP) are then refused.
 verify_client_identity = false
+# PEM certificate revocation list for client certificates (empty = no revocation checks).
+# Read at startup: restart the broker after publishing a new CRL, before its Next Update.
+crl_file = ""
 # "TLSv1.2" or "TLSv1.3"
 min_tls_version = "TLSv1.3"
 # wolfSSL cipher list (":" or "," separated). Empty = wolfSSL defaults.
@@ -113,10 +122,14 @@ max_packet_size = 4194304
 receive_maximum = 65535
 # Topic aliases a v5.0 client may use (0 disables them).
 topic_alias_maximum = 20
-# Upper bound announced to v5.0 clients via Server Keep Alive (0 = no limit).
+# Upper bound for client keep alive (0 = no limit). v5.0 clients are told via Server Keep
+# Alive; v3.1.1 and MQTT-SN clients asking for more are refused.
 max_keep_alive_sec = 3600
-# Highest QoS granted: 0, 1 or 2.
+# Highest QoS granted: 0, 1 or 2. v5.0 publishers above it are disconnected (0x9B);
+# v3.1.1 messages are accepted and delivered at this QoS.
 maximum_qos = 2
+# Subscriptions one session may hold (0 = unlimited).
+max_subscriptions_per_session = 10000
 allow_wildcard_subscriptions = true
 allow_retained_messages = true
 allow_shared_subscriptions = true

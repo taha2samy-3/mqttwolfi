@@ -117,9 +117,17 @@ pub struct AclRule {
     pub permission: Permission,
 }
 
-/// A substitution value is unusable when it could inject wildcards or extra topic levels.
+/// A substitution value is unusable when it could inject wildcards, extra topic levels or
+/// another macro.
 fn safe_substitution(value: &str) -> bool {
-    !value.is_empty() && !value.contains(['+', '#', '/', '\0'])
+    !value.is_empty() && !value.contains(['+', '#', '/', '%', '\0'])
+}
+
+/// A rule pattern with its macros substituted for one client.
+enum Expanded {
+    Patterns(Vec<String>),
+    /// The user name or ClientID cannot be substituted safely.
+    Unsafe,
 }
 
 impl AclRule {
@@ -130,52 +138,73 @@ impl AclRule {
         }
     }
 
-    /// Expands `%u`, `%c` and `%r` into the concrete patterns this rule stands for.
-    /// Returns an empty list when a substitution value is unsafe (the rule then never matches).
-    fn expand(&self, user: &UserAccount, client_id: &str) -> Vec<String> {
-        let mut base = self.pattern.clone();
-        if base.contains("%u") {
-            if !safe_substitution(&user.username) {
-                return Vec::new();
+    /// Expands `%u`, `%c` and `%r` into the concrete patterns this rule stands for, in a single
+    /// pass over the pattern: substituted text is never scanned for macros again.
+    fn expand(&self, user: &UserAccount, client_id: &str) -> Expanded {
+        let any_room = user.role == UserRole::Admin || user.allowed_rooms.iter().any(|r| r == "*");
+        let mut out = vec![String::new()];
+        let mut rest = self.pattern.as_str();
+        while let Some(pos) = rest.find('%') {
+            let (literal, tail) = rest.split_at(pos);
+            out.iter_mut().for_each(|p| p.push_str(literal));
+            let value: Option<&str> = match tail.as_bytes().get(1) {
+                Some(b'u') => Some(&user.username),
+                Some(b'c') => Some(client_id),
+                Some(b'r') => {
+                    if any_room {
+                        out.iter_mut().for_each(|p| p.push('+'));
+                    } else {
+                        // Room names come from the ACL file; unusable ones are skipped.
+                        let rooms: Vec<&String> = user
+                            .allowed_rooms
+                            .iter()
+                            .filter(|r| safe_substitution(r))
+                            .collect();
+                        out = out
+                            .iter()
+                            .flat_map(|p| rooms.iter().map(move |r| format!("{p}{r}")))
+                            .collect();
+                    }
+                    rest = &tail[2..];
+                    continue;
+                }
+                _ => {
+                    out.iter_mut().for_each(|p| p.push('%'));
+                    rest = &tail[1..];
+                    continue;
+                }
+            };
+            let value = value.unwrap_or_default();
+            if !safe_substitution(value) {
+                return Expanded::Unsafe;
             }
-            base = base.replace("%u", &user.username);
+            out.iter_mut().for_each(|p| p.push_str(value));
+            rest = &tail[2..];
         }
-        if base.contains("%c") {
-            if !safe_substitution(client_id) {
-                return Vec::new();
-            }
-            base = base.replace("%c", client_id);
+        out.iter_mut().for_each(|p| p.push_str(rest));
+        Expanded::Patterns(out)
+    }
+
+    /// Applies `test` to the expanded patterns. A user name or ClientID that cannot be
+    /// substituted safely makes a deny rule apply (fail closed) and an allow rule not apply.
+    fn applies(&self, user: &UserAccount, client_id: &str, test: impl Fn(&str) -> bool) -> bool {
+        match self.expand(user, client_id) {
+            Expanded::Patterns(patterns) => patterns.iter().any(|p| test(p)),
+            Expanded::Unsafe => self.permission == Permission::Deny,
         }
-        if !base.contains("%r") {
-            return vec![base];
-        }
-        if user.role == UserRole::Admin || user.allowed_rooms.iter().any(|r| r == "*") {
-            return vec![base.replace("%r", "+")];
-        }
-        user.allowed_rooms
-            .iter()
-            .filter(|room| safe_substitution(room))
-            .map(|room| base.replace("%r", room))
-            .collect()
     }
 
     /// Returns true when the (expanded) rule pattern matches a concrete topic name.
     pub fn matches_topic(&self, user: &UserAccount, client_id: &str, topic: &str) -> bool {
-        self.expand(user, client_id)
-            .iter()
-            .any(|p| topic_matches_filter(p, topic))
+        self.applies(user, client_id, |p| topic_matches_filter(p, topic))
     }
 
     fn covers_filter(&self, user: &UserAccount, client_id: &str, filter: &str) -> bool {
-        self.expand(user, client_id)
-            .iter()
-            .any(|p| filter_covered_by(p, filter))
+        self.applies(user, client_id, |p| filter_covered_by(p, filter))
     }
 
     fn overlaps_filter(&self, user: &UserAccount, client_id: &str, filter: &str) -> bool {
-        self.expand(user, client_id)
-            .iter()
-            .any(|p| filters_intersect(p, filter))
+        self.applies(user, client_id, |p| filters_intersect(p, filter))
     }
 }
 
@@ -322,6 +351,17 @@ fn dummy_hash() -> &'static str {
     })
 }
 
+/// Runs one Argon2 verification against [`dummy_hash`] (only for its cost).
+fn verify_dummy(candidate: &[u8]) -> bool {
+    PasswordHash::new(dummy_hash())
+        .map(|parsed| {
+            Argon2::default()
+                .verify_password(candidate, &parsed)
+                .is_ok()
+        })
+        .unwrap_or(false)
+}
+
 pub struct AclEngine {
     users: RwLock<Arc<HashMap<String, Arc<UserAccount>>>>,
     allow_anonymous: bool,
@@ -466,7 +506,13 @@ impl AclEngine {
             .map_err(|_| AuthError::BadCredentials)?;
         let verified = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            hash_owner.verify_password(&probe)
+            let ok = hash_owner.verify_password(&probe);
+            if !hash_owner.password_hash.starts_with("$argon2") {
+                // Password-less and legacy SHA-256 accounts would answer much faster than
+                // Argon2 ones, revealing that the user name exists.
+                let _ = verify_dummy(&probe);
+            }
+            ok
         })
         .await
         .unwrap_or(false);
@@ -617,7 +663,12 @@ impl AclEngine {
                                 "member" => UserRole::Member,
                                 "viewer" => UserRole::Viewer,
                                 "device" => UserRole::Device,
-                                custom => UserRole::Custom(custom.to_string()),
+                                "custom" => UserRole::Custom("custom".into()),
+                                other => {
+                                    return Err(syntax(format!(
+                                        "unknown role '{other}' (expected admin, moderator, member, viewer, device or custom)"
+                                    )))
+                                }
                             };
                         } else if let Some(list) = arg.strip_prefix("rooms:") {
                             rooms = list
@@ -626,6 +677,10 @@ impl AclEngine {
                                 .filter(|s| !s.is_empty())
                                 .map(String::from)
                                 .collect();
+                        } else if arg.starts_with('#') {
+                            return Err(syntax(
+                                "comments must be on their own line (a '#' after a rule is not a comment)".into(),
+                            ));
                         } else {
                             return Err(syntax(format!("unknown user attribute '{arg}'")));
                         }
@@ -639,6 +694,11 @@ impl AclEngine {
                     });
                 }
                 "topic" | "pattern" => {
+                    if parts.len() > 3 && parts[3].starts_with('#') {
+                        return Err(syntax(
+                            "comments must be on their own line (a '#' after a rule is not a comment)".into(),
+                        ));
+                    }
                     if parts.len() != 3 {
                         return Err(syntax(
                             "expected: topic <read|write|readwrite|deny> <pattern>".into(),
@@ -855,6 +915,48 @@ mod tests {
         assert!(engine.check_publish(&user, "dev1", "clients/dev1/data"));
     }
 
+    #[test]
+    fn substituted_values_are_not_expanded_again() {
+        let engine = AclEngine::new(false);
+        let mut user = UserAccount::new_custom(
+            "eve",
+            "p",
+            vec![AclRule::new("clients/%c/#", Permission::ReadWrite)],
+        );
+        user.allowed_rooms = rooms(&["*"]);
+        // ClientID "%r" must not turn the rule into clients/+/# (every client's namespace).
+        assert!(!engine.check_publish(&user, "%r", "clients/victim/cmd"));
+        assert!(!engine.check_subscribe(&user, "%r", "clients/+/#"));
+        assert!(!engine.check_publish(&user, "%r", "clients/%r/x"));
+        assert!(engine.check_publish(&user, "eve-1", "clients/eve-1/x"));
+        // A literal '%' not followed by a macro letter stays as it is.
+        let pct = UserAccount::new_custom(
+            "p",
+            "p",
+            vec![AclRule::new("rate/100%/%u", Permission::ReadWrite)],
+        );
+        assert!(engine.check_publish(&pct, "c", "rate/100%/p"));
+    }
+
+    #[test]
+    fn deny_rules_fail_closed_on_unsafe_substitutions() {
+        let engine = AclEngine::new(false);
+        let user = UserAccount::new_custom(
+            "bob",
+            "p",
+            vec![
+                AclRule::new("plant/%c/secrets/#", Permission::Deny),
+                AclRule::new("plant/#", Permission::ReadWrite),
+            ],
+        );
+        assert!(engine.check_publish(&user, "line1", "plant/line2/secrets/x"));
+        assert!(!engine.check_publish(&user, "line1", "plant/line1/secrets/x"));
+        // A ClientID with '/' cannot be substituted: the deny rule applies instead of vanishing.
+        assert!(!engine.check_publish(&user, "plant/line1", "plant/line1/secrets/x"));
+        assert!(!engine.check_read(&user, "a/b", "plant/x"));
+        assert!(!engine.check_subscribe(&user, "a/b", "plant/#"));
+    }
+
     #[tokio::test]
     async fn anonymous_fallback_only_applies_to_anonymous_clients() {
         let engine = AclEngine::new(true);
@@ -903,6 +1005,14 @@ mod tests {
         assert!(matches!(err, AclFileError::Syntax { line: 2, .. }));
         let err = AclEngine::parse_acl("user a password_hash:nothex\n").unwrap_err();
         assert!(matches!(err, AclFileError::Syntax { line: 1, .. }));
+        let err = AclEngine::parse_acl("user a role:admn\n").unwrap_err();
+        assert!(err.to_string().contains("unknown role"));
+        let err = AclEngine::parse_acl("user a  # trailing comment\n").unwrap_err();
+        assert!(err.to_string().contains("own line"));
+        let err = AclEngine::parse_acl("user a\ntopic read a/b # why\n").unwrap_err();
+        assert!(err.to_string().contains("own line"));
+        // `#` as the pattern itself is not a comment.
+        assert!(AclEngine::parse_acl("user a role:custom\ntopic deny #\n").is_ok());
     }
 
     #[test]

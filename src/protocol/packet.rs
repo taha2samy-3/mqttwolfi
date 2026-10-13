@@ -156,12 +156,37 @@ pub mod reason {
     pub const TOPIC_ALIAS_INVALID: u8 = 0x94;
     pub const PACKET_TOO_LARGE: u8 = 0x95;
     pub const QUOTA_EXCEEDED: u8 = 0x97;
+    pub const QOS_NOT_SUPPORTED: u8 = 0x9B;
     pub const PAYLOAD_FORMAT_INVALID: u8 = 0x99;
     pub const RETAIN_NOT_SUPPORTED: u8 = 0x9A;
     pub const SERVER_SHUTTING_DOWN: u8 = 0x8B;
     pub const SHARED_SUBSCRIPTIONS_NOT_SUPPORTED: u8 = 0x9E;
     pub const SUBSCRIPTION_IDENTIFIERS_NOT_SUPPORTED: u8 = 0xA1;
     pub const WILDCARD_SUBSCRIPTIONS_NOT_SUPPORTED: u8 = 0xA2;
+}
+
+/// Human-readable description of a v5.0 reason code, used as the Reason String of
+/// server-initiated DISCONNECT packets.
+pub fn reason_text(code: u8) -> &'static str {
+    match code {
+        reason::SUCCESS => "Normal disconnection",
+        reason::UNSPECIFIED_ERROR => "Unspecified error",
+        reason::MALFORMED_PACKET => "Malformed packet",
+        reason::PROTOCOL_ERROR => "Protocol error",
+        reason::NOT_AUTHORIZED => "Not authorized",
+        reason::SERVER_BUSY => "Server busy",
+        reason::SERVER_SHUTTING_DOWN => "Server shutting down",
+        reason::KEEP_ALIVE_TIMEOUT => "Keep alive timeout",
+        reason::SESSION_TAKEN_OVER => "Session taken over",
+        reason::TOPIC_NAME_INVALID => "Topic name invalid",
+        reason::RECEIVE_MAXIMUM_EXCEEDED => "Receive maximum exceeded",
+        reason::TOPIC_ALIAS_INVALID => "Topic alias invalid",
+        reason::PACKET_TOO_LARGE => "Packet too large",
+        reason::QUOTA_EXCEEDED => "Quota exceeded",
+        reason::RETAIN_NOT_SUPPORTED => "Retain not supported",
+        reason::QOS_NOT_SUPPORTED => "QoS not supported",
+        _ => "Disconnected by server",
+    }
 }
 
 /// MQTT v3.1.1 CONNACK return codes (§3.2.2.3).
@@ -289,6 +314,12 @@ impl PublishPacket {
     pub fn with_properties(mut self, properties: Properties) -> Self {
         self.properties = properties;
         self
+    }
+
+    /// Approximate memory held by the message (topic, payload and properties); used for the
+    /// byte quotas of queues, inflight windows and the retained store.
+    pub fn memory_size(&self) -> usize {
+        self.topic.len() + self.payload.len() + self.properties.memory_size()
     }
 }
 

@@ -5,6 +5,118 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [0.6.0] - 2026-10-13
+
+Fixes from a second full review (code, OASIS MQTT v3.1.1 / v5.0 / MQTT-SN v1.2 conformance,
+security, documentation and CI). Upgrading from 0.5.x is strongly recommended. Check the
+**Changed behaviour** section before upgrading.
+
+### Security
+- **A single SUBSCRIBE could crash the broker:** a topic filter with tens of thousands of
+  levels (`a////…`) overflowed the stack of the routing trie and aborted the process. Topic
+  names and filters are now limited to 200 levels (as in Mosquitto).
+- **ACL macro injection:** a ClientID of `%r` was expanded twice and turned
+  `clients/%c/#` into `clients/+/#` for users with `rooms:*`, giving access to every client's
+  namespace. Macros are now replaced in a single pass and `%` is never substituted.
+- **Deny rules failed open:** a deny rule using `%c` / `%u` was skipped when the ClientID or user
+  name contained `/`, `+` or `#`. Such deny rules now apply (fail closed).
+- **Memory limits ignored MQTT v5.0 properties:** queue, inflight and retained-store byte limits
+  counted only topic + payload, so messages with megabytes of User Properties could exhaust
+  memory. Properties are counted now.
+- **No limit on sessions or subscriptions:** new `broker.max_sessions` (default 200 000,
+  connected + offline) and `mqtt.protocol.max_subscriptions_per_session` (default 10 000).
+- **ClientID lock-out:** with `client_id_takeover = "same_user"`, any user could park an offline
+  persistent session on a victim's ClientID and lock its owner out for the session lifetime.
+  An offline session of another user is now replaced (never resumed); only connected clients
+  are protected from takeover. MQTT-SN clients cannot replace another user's MQTT session.
+- **`verify_client_identity` only applied to TLS connections:** a certificate-bound ClientID
+  could be used over plain TCP. Connections without a client certificate are now refused when
+  the option is on.
+- **Client certificate revocation:** new `security.tls.crl_file` (wolfSSL is now built with CRL
+  support). Peer RSA keys below 2048 bits and ECC keys below 256 bits are refused.
+- **Authentication could queue forever:** waiting for a password verification slot now counts
+  against `connect_timeout_sec`; the CONNECT packet (buffered before authentication) is limited
+  to 256 KiB.
+- **User name enumeration by timing:** password-less and legacy SHA-256 accounts were rejected
+  much faster than unknown users; they now cost the same Argon2id verification.
+- **MQTT-SN memory exhaustion:** topic registrations, topic name length and subscriptions per SN
+  client are bounded, and `listeners.mqtt_sn.max_sessions` now also counts persisted sessions.
+- wolfSSL return codes of ALPN / SNI setup are checked. TLS session tickets and TLS 1.3 early
+  data (0-RTT, replayable) are now explicitly compiled out.
+- **Shipped configuration:** MQTT-SN is disabled and bound to loopback in the sample
+  `broker.toml`. QoS −1 is off by default (`allow_qos_minus1 = false`), and the sample
+  `sn_gateway` identity can no longer publish drone commands.
+
+### Fixed — MQTT conformance
+- A retained message could reach a new subscriber after a newer live message, or twice
+  (§4.6). Subscribing, taking the retained snapshot and routing are now ordered.
+- Resuming a session resent every unacknowledged message at once, ignoring the new
+  connection's Receive Maximum (MQTT-3.3.4-9) and Maximum Packet Size, which made strict
+  clients disconnect in a loop. Resends now respect both, keep their original packet ids and
+  carry the remaining Message Expiry Interval.
+- A client's own Will reached its resumed session through a No Local subscription
+  (MQTT-3.8.3-3).
+- A retained message refused by the quota left the stale previous value in place
+  (MQTT-3.3.1-5). The old value is now removed, and v5.0 publishers get 0x97 (Quota exceeded).
+- Response Topic with wildcards is rejected (MQTT-3.3.2-14), as is Authentication Data without
+  Authentication Method.
+- Reason codes: a property not allowed in a packet is Malformed (0x81); an empty topic without
+  Topic Alias is a Protocol Error (0x82); a second CONNECT with another protocol level gets 0x82
+  instead of the CONNACK-only 0x84; UNSUBSCRIBE with an invalid filter gets 0x8F; a QoS 0
+  message with an invalid UTF-8 payload (Payload Format Indicator 1) gets DISCONNECT 0x99.
+- The DISCONNECT Session Expiry check used the broker-capped value instead of the value the
+  client asked for in CONNECT.
+- Expired messages kept their queue slots, so `drop_newest` dropped live messages while the
+  queue was full of expired ones.
+- During a takeover, a third connection could attach while the old connection was still running,
+  and a late SUBSCRIBE of a dying connection could leave router entries behind.
+- MQTT and MQTT-SN no longer resume each other's sessions (their inflight state differs).
+- `$SYS/broker/messages/dropped` counted one drop when a message evicted several older ones.
+
+### Fixed — MQTT-SN gateway
+- CONNACK could arrive after the first PUBLISH / REGISTER of a resumed session.
+- Persistent sessions (`CleanSession = 0`) lost their topic registrations, Will and pending
+  PUBREL on reconnect; they are kept with the session now.
+- Sleeping clients: messages were retransmitted while the client slept, a repeated PINGREQ
+  produced an early PINGRESP, a client could not publish while asleep, and a CONNECT without
+  clean session replaced the link instead of re-activating it.
+- PUBACK / REGACK return codes from the client were ignored: 0x02 (invalid topic id) now
+  triggers a new REGISTER, and 0x01 (congestion) pauses deliveries and retries.
+- A subscription by topic name returned one topic id in SUBACK and delivered with another.
+- A QoS 0 PUBLISH with an unknown topic id is answered with PUBACK 0x02, and a PINGREQ from an
+  unknown client with DISCONNECT.
+- A keep alive above `max_keep_alive_sec` is rejected.
+
+### Changed behaviour
+- v3.1.1 clients asking for a keep alive above `max_keep_alive_sec` are refused with CONNACK
+  0x02 (Mosquitto does the same); v5.0 clients are still told the limit via Server Keep Alive.
+- v3.1.1 publishes above `maximum_qos` are accepted and delivered at `maximum_qos` instead of
+  closing the connection (v3.1.1 cannot learn the limit).
+- Server DISCONNECT packets carry a Reason String (some clients, such as Paho Python 2.x,
+  ignore the reason code otherwise).
+- The ACL parser rejects unknown roles and text after a rule (comments must be on their own
+  line, since `#` is a topic character).
+- `listeners.mqtt_sn.allow_qos_minus1` defaults to `false`.
+
+### Build, CI and documentation
+- FIPS-Ready builds work again: `--disable-crypttests` stopped the integrity-hash step. The
+  release job now downloads the bundle from the secret `WOLFSSL_FIPS_BUNDLE_URL` and verifies
+  it against the variable `WOLFSSL_FIPS_BUNDLE_SHA256`. The bundle no longer goes in a secret,
+  which is limited to 48 KB.
+- Every release now includes a `-source` archive with the complete corresponding source
+  (wolfSSL submodule included), as the GPLv3 requires for the binaries.
+- Benchmarks: Mosquitto now also requires client certificates and no longer logs every packet;
+  the report states that WolfiMQ runs in-process. Errors from `cargo bench` are no longer hidden.
+- `generate_certs.sh` also produces a revoked client certificate and a CRL; `demo_debug.sh` no
+  longer kills other processes on ports 1883 / 8883 and checks that the broker really started;
+  `task run` enables plain TCP on loopback and creates the test PKI when missing.
+- New decoder robustness test (random and mutated packets; 3 million iterations in release
+  mode without a panic) and 28 new regression tests (198 tests in total).
+- Documentation updated for all of the above, plus environment-variable quoting, relative paths,
+  Unix-only signals, MQTT-SN security, Message Expiry Interval 0 and v3.1.1 session lifetime.
+
+---
+
 ## [0.5.1] - 2026-10-13
 
 Fixes from an independent review of the 0.5.0 broker core.

@@ -192,3 +192,49 @@ fn invalid_cipher_lists_are_rejected_at_startup() {
     cfg.ciphers = Some("NOT-A-CIPHER".into());
     assert!(create_tls_acceptor(&cfg).is_err());
 }
+
+#[tokio::test]
+async fn revoked_client_certificates_are_rejected() {
+    let mut cfg = server_config(true);
+    cfg.crl_file = Some(pki_file("crl.pem"));
+    let (tls_addr, _, _) = start_tls(cfg, BrokerOptions::permissive()).await;
+
+    let (mut ok, ack) =
+        RawClient::connect_tls(tls_addr, "localhost", &mtls_connector(), v5("client01"))
+            .await
+            .unwrap();
+    assert_eq!(ack.reason_code, 0);
+    ok.ping().await.unwrap();
+
+    let revoked = create_tls_connector(
+        &pki_file("ca-cert.pem"),
+        Some((
+            &pki_file("revoked-client-cert.pem"),
+            &pki_file("revoked-client-key.pem"),
+        )),
+    )
+    .unwrap();
+    assert!(
+        RawClient::connect_tls(tls_addr, "localhost", &revoked, v5("revoked01"))
+            .await
+            .is_err(),
+        "a revoked certificate must fail the handshake"
+    );
+    // Control: the same certificate is accepted when no CRL is configured.
+    let (plain_addr, _, _) = start_tls(server_config(true), BrokerOptions::permissive()).await;
+    assert!(
+        RawClient::connect_tls(plain_addr, "localhost", &revoked, v5("revoked01"))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn certificate_bound_client_ids_cannot_be_used_over_plain_tcp() {
+    let mut options = BrokerOptions::permissive();
+    options.verify_client_identity = true;
+    let (_, tcp_addr, _) = start_tls(server_config(true), options).await;
+    // Without a certificate there is no identity to match, whatever the listener.
+    let (_, ack) = RawClient::connect(tcp_addr, v5("client01")).await.unwrap();
+    assert_eq!(ack.reason_code, reason::NOT_AUTHORIZED);
+}

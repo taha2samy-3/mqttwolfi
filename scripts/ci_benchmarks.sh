@@ -10,7 +10,7 @@ trap 'rm -rf "${WORK}"' EXIT
 [ -f certs/server-cert.pem ] || bash scripts/generate_certs.sh certs >/dev/null
 
 echo "==> Micro-benchmarks (codec, routing, retained store, loopback)"
-cargo bench --bench wolf-bench 2>/dev/null | tee "${WORK}/micro.txt"
+cargo bench --bench wolf-bench | tee "${WORK}/micro.txt"
 
 echo "==> TLS 1.3 throughput (WolfiMQ, and Mosquitto when installed)"
 GITHUB_STEP_SUMMARY="" SUMMARY_FILE="${WORK}/tls.md" CONCURRENCY="${CONCURRENCY:-8}" MSG_COUNT="${MSG_COUNT:-20000}" \
@@ -36,11 +36,13 @@ cores="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo '?')"
     echo "### Micro-benchmarks"
     echo
     echo '```text'
-    grep -v '^=\+$' "${WORK}/micro.txt" | sed '/^$/N;/^\n$/D'
+    { grep -v '^=\+$' "${WORK}/micro.txt" || true; } | sed '/^$/N;/^\n$/D'
     echo '```'
     echo
     echo "> CI runners are shared virtual machines, so absolute numbers vary between runs;"
-    echo "> compare results produced on the same runner type."
+    echo "> compare results produced on the same runner type. Both brokers use TLS 1.3 with client"
+    echo "> certificates, but WolfiMQ runs inside the benchmark process while Mosquitto is a separate"
+    echo "> process, so the side-by-side figures are indicative only."
 } > "${OUT}"
 
 echo "==> Report written to ${OUT}"

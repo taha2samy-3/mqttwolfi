@@ -179,7 +179,7 @@ async fn register_and_publish_reach_mqtt_subscribers() {
 
 #[tokio::test]
 async fn qos_minus1_publish_without_connection() {
-    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let t = sn_setup(AclEngine::new(true), |cfg| cfg.allow_qos_minus1 = true).await;
     let mut gcs = connect(t.broker.addr, v3("gcs-m1")).await;
     gcs.subscribe("uav/drone_01/telemetry/gps", QoS::AtMostOnce)
         .await
@@ -687,19 +687,296 @@ async fn unacknowledged_messages_survive_an_sn_reconnect() {
     };
     assert_eq!(&data[..], b"keep-me");
 
-    // Reconnect without acknowledging: the message is delivered again.
+    // Reconnect without acknowledging: CONNACK first (§6.2), then the message again with DUP.
     c.send(&connect(false)).await;
-    let mut redelivered = false;
-    for _ in 0..3 {
-        if let SnPacket::Publish { data, .. } = c.recv().await {
-            assert_eq!(&data[..], b"keep-me");
-            redelivered = true;
-            break;
-        }
-    }
-    assert!(redelivered);
+    assert_eq!(c.recv().await, SnPacket::ConnAck { return_code: 0 });
+    let SnPacket::Publish {
+        dup: true, data, ..
+    } = c.recv().await
+    else {
+        panic!("expected the unacknowledged PUBLISH again")
+    };
+    assert_eq!(&data[..], b"keep-me");
 }
 
 async fn connect_v3_helper(t: &SnTest) -> wolf_mqtt::client::RawClient {
     connect(t.broker.addr, v3("gcs-persist")).await
+}
+
+fn connect_packet(client_id: &str, clean_session: bool) -> SnPacket {
+    SnPacket::Connect {
+        will: false,
+        clean_session,
+        duration: 60,
+        client_id: client_id.into(),
+    }
+}
+
+#[tokio::test]
+async fn registered_topics_survive_a_persistent_reconnect() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let mut gcs = connect(t.broker.addr, v3("gcs-reg")).await;
+    gcs.subscribe("fleet/#", QoS::AtLeastOnce).await.unwrap();
+
+    let c = SnClient::new(t.gw).await;
+    c.send(&connect_packet("reg-keeper", false)).await;
+    assert_eq!(c.recv().await, SnPacket::ConnAck { return_code: 0 });
+    c.send(&SnPacket::Register {
+        topic_id: 0,
+        msg_id: 1,
+        topic_name: "fleet/alpha".into(),
+    })
+    .await;
+    let SnPacket::RegAck {
+        topic_id,
+        return_code: 0,
+        ..
+    } = c.recv().await
+    else {
+        panic!("expected REGACK")
+    };
+    c.send(&SnPacket::Disconnect { duration: None }).await;
+    c.recv().await;
+
+    // Same client from a new address (e.g. after a NAT rebinding), without clean session.
+    let c2 = SnClient::new(t.gw).await;
+    c2.send(&connect_packet("reg-keeper", false)).await;
+    assert_eq!(c2.recv().await, SnPacket::ConnAck { return_code: 0 });
+    c2.send(&sn_publish(
+        1,
+        TopicIdType::Normal,
+        topic_id,
+        2,
+        b"still-known",
+    ))
+    .await;
+    assert_eq!(
+        c2.recv().await,
+        SnPacket::PubAck {
+            topic_id,
+            msg_id: 2,
+            return_code: 0
+        }
+    );
+    let p = next_publish(&mut gcs).await;
+    assert_eq!(p.topic, "fleet/alpha");
+
+    // A clean session forgets the registrations.
+    c2.send(&connect_packet("reg-keeper", true)).await;
+    assert_eq!(c2.recv().await, SnPacket::ConnAck { return_code: 0 });
+    c2.send(&sn_publish(1, TopicIdType::Normal, topic_id, 3, b"gone"))
+        .await;
+    assert_eq!(
+        c2.recv().await,
+        SnPacket::PubAck {
+            topic_id,
+            msg_id: 3,
+            return_code: return_code::REJECTED_INVALID_TOPIC_ID
+        }
+    );
+}
+
+#[tokio::test]
+async fn offline_persistent_sessions_count_against_the_session_limit() {
+    let t = sn_setup(AclEngine::new(true), |cfg| cfg.max_sessions = 1).await;
+    let a = SnClient::new(t.gw).await;
+    a.send(&connect_packet("persisted", false)).await;
+    assert_eq!(a.recv().await, SnPacket::ConnAck { return_code: 0 });
+    a.send(&SnPacket::Disconnect { duration: None }).await;
+    a.recv().await;
+
+    let b = SnClient::new(t.gw).await;
+    b.send(&connect_packet("newcomer", true)).await;
+    assert_eq!(
+        b.recv().await,
+        SnPacket::ConnAck {
+            return_code: return_code::REJECTED_CONGESTION
+        }
+    );
+    // The owner of the stored session can still come back.
+    a.send(&connect_packet("persisted", false)).await;
+    assert_eq!(a.recv().await, SnPacket::ConnAck { return_code: 0 });
+}
+
+#[tokio::test]
+async fn pingreq_from_an_unknown_client_is_answered_with_disconnect() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let c = SnClient::new(t.gw).await;
+    c.send(&SnPacket::PingReq { client_id: None }).await;
+    assert_eq!(c.recv().await, SnPacket::Disconnect { duration: None });
+}
+
+#[tokio::test]
+async fn qos0_publish_to_an_unknown_topic_id_is_rejected() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let c = SnClient::new(t.gw).await;
+    c.connect("lost-ids", 60).await;
+    c.send(&sn_publish(0, TopicIdType::Normal, 77, 0, b"x"))
+        .await;
+    assert_eq!(
+        c.recv().await,
+        SnPacket::PubAck {
+            topic_id: 77,
+            msg_id: 0,
+            return_code: return_code::REJECTED_INVALID_TOPIC_ID
+        }
+    );
+}
+
+#[tokio::test]
+async fn overlong_topic_names_are_rejected() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let c = SnClient::new(t.gw).await;
+    c.connect("long-topics", 60).await;
+    c.send(&SnPacket::Register {
+        topic_id: 0,
+        msg_id: 1,
+        topic_name: "a/".repeat(400),
+    })
+    .await;
+    assert_eq!(
+        c.recv().await,
+        SnPacket::RegAck {
+            topic_id: 0,
+            msg_id: 1,
+            return_code: return_code::REJECTED_INVALID_TOPIC_ID
+        }
+    );
+}
+
+#[tokio::test]
+async fn subscription_topic_id_is_used_for_delivery() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let c = SnClient::new(t.gw).await;
+    c.connect("sub-ids", 60).await;
+    // The topic is also predefined (id 2); a subscription by name still uses the id in SUBACK.
+    let SnPacket::SubAck {
+        topic_id,
+        return_code: 0,
+        ..
+    } = c.subscribe_name("uav/drone_01/commands", 0, 1).await
+    else {
+        panic!("expected SUBACK")
+    };
+    assert_ne!(topic_id, 0);
+
+    let mut gcs = connect(t.broker.addr, v3("gcs-subid")).await;
+    gcs.publish(msg("uav/drone_01/commands", b"go", QoS::AtMostOnce))
+        .await
+        .unwrap();
+    let SnPacket::Publish {
+        topic_id_type: TopicIdType::Normal,
+        topic_id: delivered,
+        ..
+    } = c.recv().await
+    else {
+        panic!("expected PUBLISH with the registered topic id")
+    };
+    assert_eq!(delivered, topic_id);
+}
+
+#[tokio::test]
+async fn puback_invalid_topic_id_makes_the_gateway_register_again() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let c = SnClient::new(t.gw).await;
+    c.connect("forgetful", 60).await;
+    assert!(matches!(
+        c.subscribe_name("fleet/#", 1, 1).await,
+        SnPacket::SubAck { return_code: 0, .. }
+    ));
+    let mut gcs = connect(t.broker.addr, v3("gcs-forget")).await;
+    gcs.publish(msg("fleet/beta", b"hello", QoS::AtLeastOnce))
+        .await
+        .unwrap();
+
+    for round in 0..2 {
+        let SnPacket::Register {
+            topic_id,
+            msg_id,
+            topic_name,
+        } = c.recv().await
+        else {
+            panic!("round {round}: expected REGISTER")
+        };
+        assert_eq!(topic_name, "fleet/beta");
+        c.send(&SnPacket::RegAck {
+            topic_id,
+            msg_id,
+            return_code: 0,
+        })
+        .await;
+        let SnPacket::Publish {
+            topic_id: pub_id,
+            msg_id,
+            data,
+            ..
+        } = c.recv().await
+        else {
+            panic!("round {round}: expected PUBLISH")
+        };
+        assert_eq!(&data[..], b"hello");
+        // First round: the client claims it lost the registration.
+        let rc = if round == 0 {
+            return_code::REJECTED_INVALID_TOPIC_ID
+        } else {
+            0
+        };
+        c.send(&SnPacket::PubAck {
+            topic_id: pub_id,
+            msg_id,
+            return_code: rc,
+        })
+        .await;
+    }
+    assert!(c.recv_timeout(QUIET).await.is_none());
+}
+
+#[tokio::test]
+async fn keep_alive_above_the_broker_maximum_is_rejected() {
+    let t = sn_setup(AclEngine::new(true), |_| {}).await;
+    let c = SnClient::new(t.gw).await;
+    c.send(&SnPacket::Connect {
+        will: false,
+        clean_session: true,
+        duration: u16::MAX,
+        client_id: "forever".into(),
+    })
+    .await;
+    assert_eq!(
+        c.recv().await,
+        SnPacket::ConnAck {
+            return_code: return_code::REJECTED_NOT_SUPPORTED
+        }
+    );
+}
+
+#[tokio::test]
+async fn sn_clients_cannot_replace_an_offline_mqtt_session_of_another_user() {
+    let acl = AclEngine::new(false);
+    acl.load_from_acl_file("config/acl.conf").await.unwrap();
+    let t = sn_setup(acl, |cfg| cfg.acl_user = "sn_gateway".into()).await;
+
+    // A persistent MQTT session owned by dev_sarah, currently offline.
+    let mut conn = v5("plc-7").with_credentials("dev_sarah", "sarah_dev_pass");
+    conn.properties = wolf_mqtt::protocol::Properties(vec![
+        wolf_mqtt::protocol::Property::SessionExpiryInterval(600),
+    ]);
+    connect(t.broker.addr, conn)
+        .await
+        .disconnect()
+        .await
+        .unwrap();
+
+    // An (unauthenticated) MQTT-SN client claiming the same ClientID is refused.
+    let sn = SnClient::new(t.gw).await;
+    sn.send(&connect_packet("plc-7", true)).await;
+    assert_eq!(
+        sn.recv().await,
+        SnPacket::ConnAck {
+            return_code: return_code::REJECTED_CONGESTION
+        }
+    );
+    let kept = t.broker.ctx.session_by_client_id("plc-7").unwrap();
+    assert_eq!(kept.transport, wolf_mqtt::session::Transport::Mqtt);
+    assert_eq!(kept.user().username, "dev_sarah");
 }

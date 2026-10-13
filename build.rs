@@ -6,8 +6,10 @@
 //!            any target whose C cross compiler is installed (e.g. `aarch64-linux-gnu-gcc`).
 //!
 //! FIPS-Ready build (`--no-default-features --features wolfssl-fips`)
-//!   Source : the wolfSSL FIPS-Ready bundle, which is not open source. Point
-//!            WOLFSSL_FIPS_BUNDLE_DIR at it (default: external/wolfssl-fips-bundle).
+//!   Source : the wolfSSL FIPS-Ready bundle, a separate download from wolfssl.com (not in this
+//!            repository). Point WOLFSSL_FIPS_BUNDLE_DIR at it (default:
+//!            external/wolfssl-fips-bundle). Build natively: the integrity hash step runs
+//!            wolfCrypt's test program.
 //!   Build  : wolfSSL's autotools build with `--enable-fips=ready`, the only build system
 //!            wolfSSL supports for FIPS (its CMake build has no FIPS support).
 //!   Note   : "FIPS-Ready" means FIPS-approved algorithms only. It is not a CMVP-validated
@@ -65,6 +67,11 @@ fn build_standard(src: &Path) {
         .define("WOLFSSL_CURVE25519", "yes")
         .define("WOLFSSL_DTLS", "no")
         .define("WOLFSSL_SYS_CA_CERTS", "no")
+        // Client certificate revocation (security.tls.crl_file).
+        .define("WOLFSSL_CRL", "yes")
+        // Pinned off: TLS 1.3 0-RTT data is replayable, and the broker keeps no TLS sessions.
+        .define("WOLFSSL_EARLYDATA", "no")
+        .define("WOLFSSL_SESSION_TICKET", "no")
         // Needed for client certificate identity checks (verify_client_identity).
         .cflag("-DKEEP_PEER_CERT");
     let dst = cfg.build();
@@ -117,8 +124,12 @@ fn build_fips(bundle: &Path) {
         "--enable-sni",
         "--enable-harden",
         "--disable-oldtls",
+        "--enable-crl",
+        "--disable-earlydata",
+        "--disable-session-ticket",
         "--disable-examples",
-        "--disable-crypttests",
+        // fips-hash.sh runs wolfcrypt/test/testwolfcrypt to read the integrity hash, so the
+        // crypt tests must be built (and the build must run natively, not cross-compiled).
         "CPPFLAGS=-DKEEP_PEER_CERT",
     ]);
     configure.arg(format!("--prefix={}", prefix.display()));

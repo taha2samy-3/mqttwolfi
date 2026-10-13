@@ -143,3 +143,93 @@ async fn unacknowledged_deliveries_are_capped_by_the_broker() {
     };
     assert_eq!(&next.payload[..], &[3]);
 }
+
+#[tokio::test]
+async fn deeply_nested_topics_are_rejected_without_harming_the_broker() {
+    // A filter with tens of thousands of levels used to overflow the stack of the routing trie.
+    let b = open_broker().await;
+    let mut c = connect(b.addr, v5("deep")).await;
+    let deep_filter = format!("a{}", "/".repeat(65_000));
+    assert_eq!(
+        c.subscribe(&deep_filter, QoS::AtMostOnce).await.unwrap(),
+        0x8F
+    );
+    let deepest_allowed = vec!["d"; 200].join("/");
+    assert_eq!(
+        c.subscribe(&deepest_allowed, QoS::AtMostOnce)
+            .await
+            .unwrap(),
+        0
+    );
+    c.publish(msg(&deepest_allowed, b"ok", QoS::AtMostOnce))
+        .await
+        .unwrap();
+    assert_eq!(&next_publish(&mut c).await.payload[..], b"ok");
+}
+
+#[tokio::test]
+async fn queue_byte_limit_counts_user_properties() {
+    let mut options = BrokerOptions::permissive();
+    options.queue_limits.max_bytes = 16 * 1024;
+    let b = start_broker(options, AclEngine::new(true)).await;
+    let mut conn = v5("props-slow");
+    conn.properties = Properties(vec![Property::SessionExpiryInterval(60)]);
+    let mut c = connect(b.addr, conn.clone()).await;
+    c.subscribe("qp/#", QoS::AtLeastOnce).await.unwrap();
+    c.disconnect().await.unwrap();
+
+    // One-byte payloads carrying 4 KiB of User Properties each: only a few fit in 16 KiB.
+    let mut publ = connect(b.addr, v5("props-fast")).await;
+    for i in 0..20u8 {
+        publ.publish(
+            PublishPacket::new("qp/x", Bytes::from(vec![i]))
+                .with_qos(QoS::AtLeastOnce, None)
+                .with_properties(Properties(vec![Property::UserProperty(
+                    "k".into(),
+                    "v".repeat(4096),
+                )])),
+        )
+        .await
+        .unwrap();
+    }
+    assert!(
+        b.ctx
+            .session_by_client_id("props-slow")
+            .unwrap()
+            .queue
+            .queued_bytes()
+            <= 16 * 1024
+    );
+    assert!(
+        b.ctx
+            .session_by_client_id("props-slow")
+            .unwrap()
+            .queue
+            .queued_messages()
+            < 5
+    );
+}
+
+#[tokio::test]
+async fn session_and_subscription_limits_are_enforced() {
+    let mut options = BrokerOptions::permissive();
+    options.max_sessions = 2;
+    options.max_subscriptions_per_session = 2;
+    let b = start_broker(options, AclEngine::new(true)).await;
+
+    let mut a = connect(b.addr, v5("limit-a")).await;
+    assert_eq!(a.subscribe("s/1", QoS::AtMostOnce).await.unwrap(), 0);
+    assert_eq!(a.subscribe("s/2", QoS::AtMostOnce).await.unwrap(), 0);
+    // Replacing an existing subscription is always possible; a third one is not.
+    assert_eq!(a.subscribe("s/2", QoS::AtLeastOnce).await.unwrap(), 1);
+    assert_eq!(a.subscribe("s/3", QoS::AtMostOnce).await.unwrap(), 0x97);
+
+    let _b2 = connect(b.addr, v5("limit-b")).await;
+    let (_, ack) = RawClient::connect(b.addr, v5("limit-c")).await.unwrap();
+    assert_eq!(
+        ack.reason_code, 0x97,
+        "third session refused (Quota exceeded)"
+    );
+    // An existing ClientID can still reconnect.
+    let _again = connect(b.addr, v5("limit-a")).await;
+}

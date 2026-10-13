@@ -95,3 +95,11 @@ pub fn test_pki() -> &'static Path {
 pub fn pki_file(name: &str) -> String {
     test_pki().join(name).to_string_lossy().into_owned()
 }
+
+/// True when the packets contain a DISCONNECT with the given reason code.
+pub fn disconnected_with(got: &[MqttPacket], code: u8) -> bool {
+    got.iter().any(|p| {
+        matches!(p, MqttPacket::Disconnect { reason_code, properties }
+            if *reason_code == code && properties.reason_string().is_some())
+    })
+}

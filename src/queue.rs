@@ -39,7 +39,7 @@ impl Delivery {
     }
 
     pub fn size(&self) -> usize {
-        self.publish.topic.len() + self.publish.payload.len()
+        self.publish.memory_size()
     }
 
     pub fn is_expired(&self, now: Instant) -> bool {
@@ -58,8 +58,8 @@ pub enum Outbound {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushResult {
     Queued,
-    /// The message was queued after discarding the oldest queued message(s).
-    QueuedDroppedOldest,
+    /// The message was queued after discarding this many of the oldest queued messages.
+    QueuedDroppedOldest(usize),
     /// The incoming message was discarded.
     Dropped,
     /// The queue is closed.
@@ -145,17 +145,37 @@ impl OutboundQueue {
         };
         let mut result = PushResult::Queued;
         if over(&st) {
+            // Expired messages would be discarded on delivery anyway: free their room first, so
+            // they never push out (or keep out) live messages.
+            let now = Instant::now();
+            let (mut freed, mut expired) = (0, 0);
+            st.publish.retain(|d| {
+                let keep = !d.is_expired(now);
+                if !keep {
+                    freed += d.size();
+                    expired += 1;
+                }
+                keep
+            });
+            st.publish_bytes -= freed;
+            st.dropped += expired;
+        }
+        if over(&st) {
             if limits.policy == QueueFullPolicy::DropNewest || size > limits.max_bytes {
                 st.dropped += 1;
                 return PushResult::Dropped;
             }
+            let mut evicted = 0;
             while over(&st) {
                 let Some(old) = st.publish.pop_front() else {
                     break;
                 };
                 st.publish_bytes -= old.size();
                 st.dropped += 1;
-                result = PushResult::QueuedDroppedOldest;
+                evicted += 1;
+            }
+            if evicted > 0 {
+                result = PushResult::QueuedDroppedOldest(evicted);
             }
         }
         st.publish_bytes += size;
@@ -184,19 +204,34 @@ impl OutboundQueue {
     /// consumer can pause the publish lane and resume it with [`OutboundQueue::wake`].
     /// Returns `None` once the queue is closed and has nothing deliverable left.
     pub async fn pop(&self, allow_publish: impl Fn() -> bool) -> Option<Outbound> {
+        self.pop_or_ready(allow_publish, || false)
+            .await
+            .map(|item| item.expect("`ready` is never true"))
+    }
+
+    /// Like [`OutboundQueue::pop`], but also returns `Some(None)` as soon as `ready` holds after
+    /// a wake-up (for work the consumer keeps outside the queue, e.g. resends after a resume).
+    pub async fn pop_or_ready(
+        &self,
+        allow_publish: impl Fn() -> bool,
+        ready: impl Fn() -> bool,
+    ) -> Option<Option<Outbound>> {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             let allow = allow_publish();
             if let Some(item) = self.try_pop(allow) {
-                return Some(item);
+                return Some(Some(item));
             }
             {
                 let st = self.lock();
                 if st.closed && (st.control.is_empty() && (st.publish.is_empty() || !allow)) {
                     return None;
                 }
+            }
+            if ready() {
+                return Some(None);
             }
             notified.await;
         }
@@ -281,7 +316,10 @@ mod tests {
         for i in 1..=5 {
             assert_eq!(q.push_publish(delivery(i)), PushResult::Queued);
         }
-        assert_eq!(q.push_publish(delivery(6)), PushResult::QueuedDroppedOldest);
+        assert_eq!(
+            q.push_publish(delivery(6)),
+            PushResult::QueuedDroppedOldest(1)
+        );
         assert_eq!(q.queued_messages(), 5);
         assert_eq!(q.dropped(), 1);
         assert_eq!(payload(q.try_pop(true).unwrap()), "msg_2");
@@ -313,12 +351,33 @@ mod tests {
             q.push_publish(delivery(i));
         }
         assert_eq!(q.queued_bytes(), 18);
-        assert_eq!(q.push_publish(delivery(4)), PushResult::QueuedDroppedOldest);
+        assert_eq!(
+            q.push_publish(delivery(4)),
+            PushResult::QueuedDroppedOldest(1)
+        );
         assert_eq!(q.queued_bytes(), 18);
         // A single message larger than the whole budget is dropped without evicting others.
         let huge = Delivery::new(PublishPacket::new("t", Bytes::from(vec![0u8; 64])), None);
         assert_eq!(q.push_publish(huge), PushResult::Dropped);
         assert_eq!(q.queued_messages(), 3);
+    }
+
+    #[test]
+    fn expired_messages_make_room_before_the_overflow_policy_applies() {
+        let q = OutboundQueue::new(limits(2, QueueFullPolicy::DropNewest));
+        let past = Instant::now();
+        for i in 1..=2 {
+            let d = Delivery::new(
+                PublishPacket::new("t", Bytes::from(format!("old_{i}"))),
+                Some(past),
+            );
+            assert_eq!(q.push_publish(d), PushResult::Queued);
+        }
+        assert_eq!(q.push_publish(delivery(3)), PushResult::Queued);
+        assert_eq!(q.queued_messages(), 1);
+        assert_eq!(q.queued_bytes(), 6);
+        assert_eq!(q.dropped(), 2);
+        assert_eq!(payload(q.try_pop(true).unwrap()), "msg_3");
     }
 
     #[test]

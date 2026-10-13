@@ -33,7 +33,7 @@ optional FIPS-Ready build), and ships as a single binary for Linux, Windows and 
 | Sessions | Clean and persistent sessions (v3.1.1 `CleanSession=0`, v5.0 Session Expiry), session takeover |
 | MQTT v5.0 | Properties forwarding, topic aliases, subscription identifiers, No Local, Retain As Published, Retain Handling, shared subscriptions (`$share/…`), Receive Maximum, Maximum Packet Size, Message Expiry, Will Delay, reason codes, server DISCONNECT |
 | Retained / Will | Retained store with quotas and expiry; Last Will on abnormal close, keep-alive timeout or takeover |
-| Security | Argon2id passwords, ACL with roles and `%u` / `%c` / `%r` macros, ClientID ↔ certificate binding, connection / packet / queue limits |
+| Security | Argon2id passwords, ACL with roles and `%u` / `%c` / `%r` macros, ClientID ↔ certificate binding, client certificate revocation (CRL), limits on connections, sessions, subscriptions, packets, queues and topic depth |
 | Operations | TOML config + `WOLFIMQ_*` environment overrides, `$SYS/broker/...` metrics, SIGHUP ACL reload, graceful SIGTERM |
 | MQTT-SN | Predefined and short topic ids, REGISTER, QoS −1, Will, sleeping clients, retransmission, forwarder encapsulation |
 
@@ -62,7 +62,8 @@ bash scripts/generate_certs.sh certs        # throw-away test PKI; use real cert
 
 ### Build from source
 
-Requirements: Rust ≥ 1.85, CMake, a C compiler, and `openssl` (only for the test PKI).
+Requirements: Rust ≥ 1.85, CMake, a C compiler, and OpenSSL ≥ 1.1.1 command line tools (only
+for the test PKI; on macOS the system LibreSSL does not work: `brew install openssl@3`).
 
 ```bash
 git clone --recursive <repository-url> && cd wolfimq   # or: git submodule update --init
@@ -72,15 +73,19 @@ cargo build --release
 
 ### Try it
 
-The sample configuration enables TLS on 8883 and MQTT-SN on 1884. For a quick local test,
-enable plain TCP on loopback through the environment:
+The sample configuration enables mutual TLS on 8883 (MQTT-SN is disabled). Create a test PKI
+in `certs/`, then, for a quick local test, also enable plain TCP on loopback through the
+environment:
 
 ```bash
+bash scripts/generate_certs.sh certs    # throw-away CA, server and client certificates
 WOLFIMQ_LISTENERS__TCP__ENABLED=true ./target/release/wolf-broker --config config/broker.toml
 ./target/release/wolf-simulate          # in another terminal: runs a scripted pub/sub session
 ```
 
-`wolf-simulate --tls` does the same over TLS using `certs/`.
+`wolf-simulate --tls` does the same over TLS using `certs/`. The sample `config/acl.conf`
+contains example accounts with **publicly known passwords**: replace them before exposing the
+broker.
 
 ## Configuration
 
@@ -109,15 +114,20 @@ the ACL format, TLS / PKI setup, systemd and kernel tuning.
 ## Security
 
 - **Use TLS outside localhost.** Plain TCP defaults to `127.0.0.1`. The TLS listener uses
-  wolfSSL with TLS 1.3 by default (TLS 1.2 optional), mutual TLS, ALPN and configurable
-  cipher suites. `verify_client_identity` binds the MQTT ClientID to the certificate CN / SAN.
-- **Passwords** are Argon2id hashes in `config/acl.conf` (`--hash-password`). Unknown users take
-  as long to reject as known ones, and concurrent verifications are bounded.
+  wolfSSL with TLS 1.3 by default (TLS 1.2 optional), mutual TLS, CRL revocation checks, ALPN
+  and configurable cipher suites; no session resumption and no 0-RTT. `verify_client_identity`
+  binds the MQTT ClientID to the certificate CN / SAN and then refuses connections without a
+  certificate.
+- **Passwords** are Argon2id hashes in `config/acl.conf` (`--hash-password`). Rejecting an
+  unknown user costs the same Argon2id verification as a known one, and concurrent
+  verifications are bounded.
 - **Authorization** uses first-match ACL rules per user, followed by role defaults
   (`admin`, `moderator`, `member`, `viewer`, `device`). A subscription is granted only if an
-  allow rule covers the entire filter; Will topics are checked like publishes.
-- **Limits**: packet size, connections, per-session queue (count and bytes, `drop_oldest` or
-  `drop_newest`), retained store, CONNECT deadline and TLS handshake timeout.
+  allow rule covers the entire filter; Will topics are checked like publishes. ClientIDs and
+  user names cannot inject wildcards or macros into rules.
+- **Limits**: packet size, topic depth, connections, sessions, subscriptions per session,
+  per-session queue (count and bytes, `drop_oldest` or `drop_newest`), retained store,
+  CONNECT + authentication deadline and TLS handshake timeout.
 
 Report vulnerabilities as described in [SECURITY.md](SECURITY.md).
 
@@ -136,12 +146,16 @@ The UDP gateway shares sessions, subscriptions and retained messages with the MQ
 so a drone publishing over MQTT-SN reaches a ground station subscribed over TLS and vice versa.
 
 - **Identity:** MQTT-SN v1.2 has no credentials. All SN clients act as the ACL user named in
-  `listeners.mqtt_sn.acl_user` (or as the anonymous identity when it is empty).
+  `listeners.mqtt_sn.acl_user` (or as the anonymous identity when it is empty), so give that
+  user minimal rights.
 - **Topics:** predefined topic ids (configured), two-character short topics, and REGISTER;
   the gateway registers new topic names with the client before publishing on them.
-- **Delivery:** QoS −1 (connectionless, predefined / short topics), 0, 1, 2 with retransmission;
-  sleeping clients get buffered messages on wake-up; Will on timeout.
-- **Caution:** traffic is unencrypted and clients are identified by UDP address.
+- **Delivery:** QoS 0, 1, 2 with retransmission and QoS −1 (connectionless, predefined / short
+  topics; off by default); sleeping clients get buffered messages on wake-up; Will on timeout;
+  persistent sessions keep topic registrations across reconnects.
+- **Caution:** traffic is unauthenticated and unencrypted, and clients are identified by a UDP
+  address that can be spoofed. The gateway is disabled in the sample configuration; enable it
+  only on a trusted network.
 
 ## Benchmarks
 

@@ -399,3 +399,33 @@ async fn takeover_never_resumes_a_non_persistent_session() {
         .unwrap();
     assert_no_publish(&mut c).await;
 }
+
+#[tokio::test]
+async fn publish_above_maximum_qos_is_downgraded_not_refused() {
+    // v3.1.1 cannot learn the broker's Maximum QoS, so the message is accepted.
+    let mut options = wolf_mqtt::broker::BrokerOptions::permissive();
+    options.maximum_qos = QoS::AtLeastOnce;
+    let b = start_broker(options, wolf_mqtt::auth::AclEngine::new(true)).await;
+    let mut sub = connect(b.addr, v3("mq-sub")).await;
+    sub.subscribe("mq/#", QoS::ExactlyOnce).await.unwrap();
+    let mut publ = connect(b.addr, v3("mq-pub")).await;
+    publ.publish(msg("mq/x", b"two", QoS::ExactlyOnce))
+        .await
+        .unwrap();
+    let p = next_publish(&mut sub).await;
+    assert_eq!((&p.payload[..], p.qos), (&b"two"[..], QoS::AtLeastOnce));
+    publ.ping().await.unwrap();
+}
+
+#[tokio::test]
+async fn keep_alive_above_the_broker_maximum_is_refused() {
+    // v3.1.1 has no Server Keep Alive, so the client must be told by refusing it.
+    let b = open_broker().await;
+    let mut conn = v3("lazy");
+    conn.keep_alive_sec = 7200;
+    let (_, ack) = RawClient::connect(b.addr, conn).await.unwrap();
+    assert_eq!(ack.reason_code, connack_v3::IDENTIFIER_REJECTED);
+    let mut ok = v3("lazy");
+    ok.keep_alive_sec = 3600;
+    connect(b.addr, ok).await.ping().await.unwrap();
+}

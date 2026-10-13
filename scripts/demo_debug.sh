@@ -35,40 +35,51 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# 2. Check if ports 1883 or 8883 are already occupied
-if command -v fuser >/dev/null 2>&1; then
-    fuser -k 1883/tcp 2>/dev/null || true
-    fuser -k 8883/tcp 2>/dev/null || true
-fi
+port_in_use() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
 
-# 3. Start WolfiMQ Broker in DEBUG mode in the background
-echo -e "${BOLD}==> [1/2] Starting WolfiMQ Broker in DEBUG mode (RUST_LOG=debug)...${RESET}"
+# 2. Refuse to start when another broker already uses the ports (it is not ours to stop).
+for port in 1883 8883; do
+    if port_in_use "${port}"; then
+        echo -e "${RED}Port ${port} is already in use (another MQTT broker?). Stop it and retry.${RESET}"
+        exit 1
+    fi
+done
+
+# 3. Build, then start WolfiMQ in DEBUG mode in the background
+echo -e "${BOLD}==> [1/2] Building and starting WolfiMQ in DEBUG mode...${RESET}"
+cargo build --bins
 # The sample configuration keeps plain TCP disabled; enable it on loopback for the demo.
 WOLFIMQ_LISTENERS__TCP__ENABLED=true WOLFIMQ_LISTENERS__TCP__BIND_ADDRESS=127.0.0.1 \
-RUST_LOG="wolf_mqtt=debug,wolf_broker=debug,info" cargo run --bin wolf-broker -- --config config/broker.toml > >(while IFS= read -r line; do echo -e "${MAGENTA}[BROKER-LOG]${RESET} $line"; done) 2>&1 &
+RUST_LOG="wolf_mqtt=debug,wolf_broker=debug,info" ./target/debug/wolf-broker --config config/broker.toml \
+    > >(while IFS= read -r line; do echo -e "${MAGENTA}[BROKER-LOG]${RESET} $line"; done) 2>&1 &
 BROKER_PID=$!
 
 echo -e "    Broker PID: ${BOLD}${BROKER_PID}${RESET}"
-echo -e "    Awaiting listener initialization on 127.0.0.1:1883..."
+echo -e "    Waiting for the TCP listener on 127.0.0.1:1883..."
 
-# Wait up to 10 seconds for the TCP listener to be ready
 READY=false
-for _ in {1..20}; do
-    if command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 1883 2>/dev/null; then
+for _ in {1..40}; do
+    if port_in_use 1883; then
         READY=true
         break
     fi
-    sleep 0.5
+    if ! kill -0 "${BROKER_PID}" 2>/dev/null; then
+        break
+    fi
+    sleep 0.25
 done
 
 if [ "$READY" = false ]; then
-    sleep 1.5
+    echo -e "${RED}The broker did not start listening on 127.0.0.1:1883; see the log above.${RESET}"
+    exit 1
 fi
 
-echo -e "${GREEN}✔ Broker is active and listening on TCP (1883) & TLS (8883)!${RESET}\n"
+echo -e "${GREEN}✔ Broker is listening on TCP 127.0.0.1:1883 and TLS 8883${RESET}\n"
 
 # 4. Run the interactive protocol traffic simulation
 echo -e "${BOLD}==> [2/2] Launching Protocol Traffic Simulator...${RESET}"
-cargo run --bin wolf-simulate -- "$@"
+./target/debug/wolf-simulate "$@"
 
 echo -e "\n${GREEN}✔ Protocol simulation completed successfully!${RESET}"

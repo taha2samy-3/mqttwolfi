@@ -48,7 +48,7 @@ tasks:
   test:integration:
     desc: "Integration suites only"
     cmds:
-      - cargo test --tests
+      - cargo test --test '*'
 
   bench:
     desc: "Codec / routing micro-benchmarks (release mode)"
@@ -120,7 +120,8 @@ tasks:
         mkdir -p "dist/${PKG}/third-party/wolfssl"
         cp external/wolfssl/COPYING external/wolfssl/LICENSING "dist/${PKG}/third-party/wolfssl/"
         tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
-        (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+        if command -v sha256sum >/dev/null; then SUM="sha256sum"; else SUM="shasum -a 256"; fi
+        (cd dist && ${SUM} "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
         echo "Created dist/${PKG}.tar.gz"
 
   ci:
@@ -131,13 +132,18 @@ tasks:
       - task: test
 
   run:
-    desc: "Run the broker with config/broker.toml"
+    desc: "Run the broker with config/broker.toml (plus plain TCP on 127.0.0.1:1883 for development)"
+    deps: [certs:ensure]
+    env:
+      WOLFIMQ_LISTENERS__TCP__ENABLED: "true"
     cmds:
       - cargo run --bin wolf-broker -- --config config/broker.toml
 
   run:debug:
-    desc: "Run the broker with debug logging"
+    desc: "Like run, with debug logging"
+    deps: [certs:ensure]
     env:
+      WOLFIMQ_LISTENERS__TCP__ENABLED: "true"
       RUST_LOG: "wolf_mqtt=debug,wolf_broker=debug,info"
     cmds:
       - cargo run --bin wolf-broker -- --config config/broker.toml
@@ -149,6 +155,7 @@ tasks:
 
   simulate:tls:
     desc: "Run the traffic simulator over TLS (port 8883)"
+    deps: [certs:ensure]
     cmds:
       - cargo run --bin wolf-simulate -- --tls
 

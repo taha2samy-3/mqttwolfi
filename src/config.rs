@@ -57,6 +57,9 @@ pub struct BrokerSettings {
     pub node_id: String,
     /// Maximum simultaneous TCP + TLS connections (0 = unlimited).
     pub max_connections: usize,
+    /// Sessions kept by the broker, connected or persisted offline, over all protocols
+    /// (0 = unlimited). New sessions beyond it are refused; existing ones can always resume.
+    pub max_sessions: usize,
     /// Tokio worker threads (0 = one per CPU core).
     pub worker_threads: usize,
     /// Seconds a new connection may take to complete its CONNECT packet.
@@ -70,6 +73,7 @@ impl Default for BrokerSettings {
         Self {
             node_id: "wolf-broker-node-01".into(),
             max_connections: 100_000,
+            max_sessions: 200_000,
             worker_threads: 0,
             connect_timeout_sec: 10,
             shutdown_grace_sec: 5,
@@ -157,9 +161,10 @@ pub struct MqttSnListenerConfig {
     /// ACL identity used for MQTT-SN clients (MQTT-SN v1.2 has no credentials). The user must
     /// exist in the ACL file. Empty = the anonymous identity (requires `allow_anonymous`).
     pub acl_user: String,
-    /// Maximum concurrent MQTT-SN client sessions.
+    /// Maximum MQTT-SN sessions (connected or persisted).
     pub max_sessions: usize,
-    /// Accept QoS -1 publishes from clients without a session (§6.8).
+    /// Accept QoS -1 publishes from clients without a session (§6.8). Such datagrams are
+    /// unauthenticated and their source address can be spoofed.
     pub allow_qos_minus1: bool,
     /// Seconds before an unacknowledged QoS 1/2 message is retransmitted (Tretry, §6.13).
     pub retry_interval_sec: u64,
@@ -181,7 +186,7 @@ impl Default for MqttSnListenerConfig {
             advertise_address: "255.255.255.255".into(),
             acl_user: String::new(),
             max_sessions: 10_000,
-            allow_qos_minus1: true,
+            allow_qos_minus1: false,
             retry_interval_sec: 10,
             max_idle_sec: 3600,
             max_retries: 3,
@@ -207,6 +212,9 @@ pub struct WolfTlsConfig {
     pub require_client_cert: bool,
     /// Require the MQTT ClientID to equal the client certificate's CN or one of its SANs.
     pub verify_client_identity: bool,
+    /// PEM certificate revocation list checked against client certificates (mutual TLS only;
+    /// empty = no revocation checks). Read at startup.
+    pub crl_file: String,
     pub min_tls_version: String,
     /// wolfSSL cipher list (colon or comma separated). Empty = wolfSSL defaults.
     pub ciphers: String,
@@ -222,6 +230,7 @@ impl Default for WolfTlsConfig {
             server_key_file: "certs/server-key.pem".into(),
             require_client_cert: true,
             verify_client_identity: false,
+            crl_file: String::new(),
             min_tls_version: "TLSv1.3".into(),
             ciphers: String::new(),
             alpn_protocols: vec!["mqtt".into()],
@@ -278,6 +287,8 @@ pub struct ProtocolSettings {
     pub max_keep_alive_sec: u16,
     /// Highest QoS the broker grants (0, 1 or 2).
     pub maximum_qos: u8,
+    /// Subscriptions one session may hold (0 = unlimited).
+    pub max_subscriptions_per_session: usize,
     pub allow_wildcard_subscriptions: bool,
     pub allow_retained_messages: bool,
     pub allow_shared_subscriptions: bool,
@@ -293,6 +304,7 @@ impl Default for ProtocolSettings {
             topic_alias_maximum: 20,
             max_keep_alive_sec: 3600,
             maximum_qos: 2,
+            max_subscriptions_per_session: 10_000,
             allow_wildcard_subscriptions: true,
             allow_retained_messages: true,
             allow_shared_subscriptions: true,
@@ -569,6 +581,9 @@ impl AppConfig {
                     "verify_client_identity requires require_client_cert = true".into(),
                 );
             }
+            if !tls.crl_file.is_empty() && !tls.require_client_cert {
+                return invalid("crl_file requires require_client_cert = true".into());
+            }
             if tls
                 .alpn_protocols
                 .iter()
@@ -602,11 +617,12 @@ impl AppConfig {
                 return invalid("listeners.mqtt_sn.max_sessions must be at least 1".into());
             }
             for (id, topic) in &sn.predefined_topics {
+                // 0x0000 and 0xFFFF are reserved topic ids (MQTT-SN v1.2 §5.3.11).
                 match id.parse::<u16>() {
-                    Ok(n) if n > 0 => {}
+                    Ok(n) if n > 0 && n < u16::MAX => {}
                     _ => {
                         return invalid(format!(
-                            "predefined topic id '{id}' must be an integer 1..65535"
+                            "predefined topic id '{id}' must be an integer 1..65534"
                         ))
                     }
                 }

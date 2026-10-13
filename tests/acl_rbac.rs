@@ -8,7 +8,7 @@ use std::time::Duration;
 use wolf_mqtt::auth::AclEngine;
 use wolf_mqtt::broker::BrokerOptions;
 use wolf_mqtt::client::RawClient;
-use wolf_mqtt::protocol::{connack_v3, reason, MqttPacket, QoS};
+use wolf_mqtt::protocol::{connack_v3, reason, QoS};
 
 async fn acl_broker(options: BrokerOptions, allow_anonymous: bool) -> TestBroker {
     let acl = AclEngine::new(allow_anonymous);
@@ -263,7 +263,7 @@ async fn client_id_takeover_policy() {
     // ... but the same user reconnecting takes over the session.
     let _again = login(b.addr, "shared-id", "dev_sarah", "sarah_dev_pass").await;
     let got = sarah.wait_closed(Duration::from_secs(2)).await.unwrap();
-    assert!(got.contains(&MqttPacket::disconnect(reason::SESSION_TAKEN_OVER)));
+    assert!(disconnected_with(&got, reason::SESSION_TAKEN_OVER));
 
     // With client_id_takeover = "any" a different user may take over.
     let mut options = BrokerOptions::permissive();
@@ -370,4 +370,29 @@ async fn sessions_are_never_resumed_by_another_user() {
         .await
         .unwrap();
     assert_no_publish(&mut alex).await;
+}
+
+#[tokio::test]
+async fn an_offline_session_cannot_lock_its_client_id_against_other_users() {
+    // Default policy (same_user): a parked persistent session of one user must not keep
+    // another user out of the ClientID for the whole session lifetime.
+    let b = acl_broker(BrokerOptions::permissive(), false).await;
+    let mut squat = v5("device-42").with_credentials("dev_sarah", "sarah_dev_pass");
+    squat.properties = wolf_mqtt::Properties(vec![wolf_mqtt::Property::SessionExpiryInterval(600)]);
+    let mut sarah = connect(b.addr, squat).await;
+    sarah
+        .subscribe("rooms/engineering/chat", QoS::AtMostOnce)
+        .await
+        .unwrap();
+    sarah.disconnect().await.unwrap();
+
+    let mut owner = v5("device-42").with_credentials("ops_alex", "alex_ops_pass");
+    owner.clean_start = false;
+    let (_alex, ack) = RawClient::connect(b.addr, owner).await.unwrap();
+    assert_eq!(ack.reason_code, 0);
+    assert!(
+        !ack.session_present,
+        "the other user's session is replaced, not resumed"
+    );
+    assert_eq!(b.ctx.subscription_count(), 0);
 }

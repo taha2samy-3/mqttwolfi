@@ -120,6 +120,23 @@ impl Router {
         Ok(previous.is_none())
     }
 
+    /// Subscriptions (normal and shared) held by a session.
+    pub fn subscription_count_of(&self, session: SessionId) -> usize {
+        self.sessions.get(&session).map_or(0, HashMap::len)
+            + self.session_shares.get(&session).map_or(0, HashMap::len)
+    }
+
+    /// Whether the session holds a subscription with exactly this filter.
+    pub fn has_subscription(&self, session: SessionId, filter: &str) -> bool {
+        self.sessions
+            .get(&session)
+            .is_some_and(|m| m.contains_key(filter))
+            || self
+                .session_shares
+                .get(&session)
+                .is_some_and(|m| m.contains_key(filter))
+    }
+
     /// Removes a subscription. Returns true if it existed.
     pub fn unsubscribe(&mut self, session: SessionId, filter: &str) -> bool {
         if let Some(shares) = self.session_shares.get_mut(&session) {

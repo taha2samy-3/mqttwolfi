@@ -3,7 +3,9 @@
 
 use crate::auth::{AclEngine, UserAccount};
 use crate::config::AppConfig;
-use crate::protocol::{Properties, Property, PublishPacket, QoS, SubscriptionOptions};
+use crate::protocol::{
+    Properties, Property, PublishPacket, QoS, RetainHandling, SubscriptionOptions,
+};
 use crate::queue::{Delivery, PushResult, QueueLimits};
 use crate::routing::{RetainOutcome, RetainedStore, Router, SessionId, Subscription, TopicError};
 use crate::session::{Attachment, PendingWill, Session, Transport};
@@ -21,6 +23,10 @@ use tracing::{debug, info, warn};
 pub struct BrokerOptions {
     pub node_id: String,
     pub max_connections: usize,
+    /// Sessions kept by the broker, connected or offline (0 = unlimited).
+    pub max_sessions: usize,
+    /// Subscriptions one session may hold (0 = unlimited).
+    pub max_subscriptions_per_session: usize,
     pub connect_timeout: Duration,
     pub max_packet_size: usize,
     pub allow_v311: bool,
@@ -57,6 +63,8 @@ impl From<&AppConfig> for BrokerOptions {
         Self {
             node_id: c.broker.node_id.clone(),
             max_connections: c.broker.max_connections,
+            max_sessions: c.broker.max_sessions,
+            max_subscriptions_per_session: p.max_subscriptions_per_session,
             connect_timeout: Duration::from_secs(c.broker.connect_timeout_sec.max(1)),
             max_packet_size: p.max_packet_size as usize,
             allow_v311: p.allow_v311,
@@ -121,6 +129,32 @@ pub enum OpenError {
     ClientIdInUse,
     /// The previous connection did not release the session in time.
     Busy,
+    /// The broker holds `max_sessions` sessions already.
+    SessionLimit,
+}
+
+/// Why a subscription was not added.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscribeError {
+    InvalidFilter(TopicError),
+    /// The session holds `max_subscriptions_per_session` subscriptions already.
+    TooManySubscriptions,
+}
+
+impl From<TopicError> for SubscribeError {
+    fn from(e: TopicError) -> Self {
+        SubscribeError::InvalidFilter(e)
+    }
+}
+
+/// Result of routing one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Routed {
+    /// Sessions the message was queued for.
+    pub receivers: usize,
+    /// The message asked to be retained but the retained store quota refused it (the previous
+    /// retained message of the topic was removed).
+    pub retained_rejected: bool,
 }
 
 /// A connection's handle on its session.
@@ -245,6 +279,14 @@ impl BrokerContext {
         read(&self.sessions).len()
     }
 
+    /// Sessions (connected or persisted) created by one transport.
+    pub fn session_count_for(&self, transport: Transport) -> usize {
+        read(&self.sessions)
+            .values()
+            .filter(|s| s.transport == transport)
+            .count()
+    }
+
     pub fn connected_count(&self) -> usize {
         read(&self.sessions)
             .values()
@@ -278,7 +320,16 @@ impl BrokerContext {
         for _ in 0..5 {
             // 1. Disconnect whoever currently holds a session with this ClientID.
             if let Some(old) = self.session_by_client_id(client_id) {
-                if !self.options.client_id_takeover_any && old.user().username != user.username {
+                // A connected client of another user keeps its ClientID. An offline session of
+                // another user is replaced (never resumed), so nobody can lock an account out of
+                // its ClientID by parking a persistent session on it.
+                // MQTT-SN clients are not authenticated, so they never replace the MQTT session of
+                // another user, connected or not.
+                if !self.options.client_id_takeover_any
+                    && old.user().username != user.username
+                    && (old.is_connected()
+                        || (transport == Transport::MqttSn && old.transport == Transport::Mqtt))
+                {
                     warn!(
                         "ClientID '{}' is in use by user '{}'; takeover by '{}' refused",
                         client_id,
@@ -287,18 +338,37 @@ impl BrokerContext {
                     );
                     return Err(OpenError::ClientIdInUse);
                 }
-                let attachment = old.state().attachment.take();
-                if let Some(mut att) = attachment {
+                // The attachment stays until the old connection has released the session, so
+                // a third connection cannot attach while the old one is still running.
+                let handles = old
+                    .state()
+                    .attachment
+                    .as_mut()
+                    .map(|att| (att.epoch, att.kick.take(), att.released.take()));
+                if let Some((epoch, kick, released)) = handles {
                     info!(
                         "ClientID '{}' reconnected; closing the previous connection",
                         client_id
                     );
-                    old.state().disconnected_at = Some(Instant::now());
-                    if let Some(kick) = att.kick.take() {
+                    if let Some(kick) = kick {
                         let _ = kick.send(KICK_SESSION_TAKEN_OVER);
                     }
-                    if let Some(released) = att.released.take() {
-                        let _ = tokio::time::timeout(Duration::from_secs(5), released).await;
+                    match released {
+                        Some(released) => {
+                            if tokio::time::timeout(Duration::from_secs(5), released)
+                                .await
+                                .is_err()
+                            {
+                                // The old connection did not finish in time: detach it.
+                                let mut st = old.state();
+                                if st.current_epoch() == Some(epoch) {
+                                    st.attachment = None;
+                                    st.disconnected_at = Some(Instant::now());
+                                }
+                            }
+                        }
+                        // Another connection is already taking the session over.
+                        None => tokio::time::sleep(Duration::from_millis(100)).await,
                     }
                 }
             }
@@ -312,13 +382,16 @@ impl BrokerContext {
                     // Another connection attached in the meantime; go around again.
                     continue;
                 }
-                // Only a persistent session (expiry > 0) of the same user can be resumed
-                // (MQTT-3.1.2-6 / §3.1.2.4); anything else starts fresh.
+                // Only a persistent session (expiry > 0) of the same user and protocol family
+                // can be resumed (MQTT-3.1.2-6 / §3.1.2.4); anything else starts fresh. MQTT and
+                // MQTT-SN keep different inflight state, so they never resume each other's
+                // sessions.
                 let resumable = |s: &Arc<Session>| {
                     let st = s.state();
                     !s.queue.is_closed()
                         && st.expiry_interval > 0
                         && st.user.username == user.username
+                        && s.transport == transport
                 };
                 let (session, present) = match existing {
                     Some(s) if !clean_start && resumable(&s) => {
@@ -327,6 +400,14 @@ impl BrokerContext {
                         (s, true)
                     }
                     other => {
+                        let limit = self.options.max_sessions;
+                        if other.is_none() && limit > 0 && read(&self.sessions).len() >= limit {
+                            warn!(
+                                "Session limit ({}) reached; refusing ClientID '{}'",
+                                limit, client_id
+                            );
+                            return Err(OpenError::SessionLimit);
+                        }
                         discarded = other;
                         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
                         let s = Arc::new(Session::new(
@@ -412,7 +493,7 @@ impl BrokerContext {
         }
         drop(st);
         if let Some((w, owner)) = publish_now {
-            self.publish_will(&session.client_id, &owner, w);
+            self.publish_will(session, &owner, w);
         }
         if !taken_over {
             if expiry == 0 {
@@ -447,7 +528,7 @@ impl BrokerContext {
         };
         self.remove_session(session);
         if let Some(pw) = pending {
-            self.publish_will(&session.client_id, &pw.owner, pw.message);
+            self.publish_will(session, &pw.owner, pw.message);
         }
         true
     }
@@ -464,17 +545,20 @@ impl BrokerContext {
         self.remove_session(session);
         let pending = session.state().pending_will.take();
         if let Some(pw) = pending {
-            self.publish_will(&session.client_id, &pw.owner, pw.message);
+            self.publish_will(session, &pw.owner, pw.message);
         }
     }
 
     fn remove_session(&self, session: &Arc<Session>) {
+        // Closed first: `subscribe` refuses closed sessions under the router lock, so a late
+        // SUBSCRIBE of a dying connection cannot leave router entries behind.
+        session.queue.close();
         write(&self.sessions).remove(&session.id);
         write(&self.router).remove_session(session.id);
-        session.queue.close();
     }
 
-    fn publish_will(&self, client_id: &str, owner: &UserAccount, mut will: PublishPacket) {
+    fn publish_will(&self, session: &Session, owner: &UserAccount, mut will: PublishPacket) {
+        let client_id = &session.client_id;
         if !self.may_publish(owner, client_id, &will.topic) {
             warn!(
                 "Will of '{}' on '{}' not published: not authorized",
@@ -487,7 +571,8 @@ impl BrokerContext {
             .retain(|p| !matches!(p, Property::WillDelayInterval(_)));
         will.packet_id = None;
         will.dup = false;
-        self.route_message(None, will);
+        // Published on behalf of the session, so its own No Local subscriptions skip it.
+        self.route_message(Some(session.id), will);
     }
 
     // ── Authorization ────────────────────────────────────────────────────────
@@ -516,14 +601,41 @@ impl BrokerContext {
 
     // ── Subscriptions ────────────────────────────────────────────────────────
 
-    /// Adds a subscription; returns whether it is new (for Retain Handling).
+    /// Adds (or replaces) a subscription and queues the retained messages its Retain Handling
+    /// asks for (§3.3.1.3). Returns whether the subscription is new.
+    ///
+    /// Both happen under the router write lock, and publishers update the retained store under
+    /// the router read lock, so a message published at the same moment is either part of the
+    /// retained snapshot or routed live to the new subscription: never both, never out of
+    /// order (§4.6).
     pub fn subscribe(
         &self,
-        session: SessionId,
+        session: &Session,
         filter: &str,
         sub: Subscription,
-    ) -> Result<bool, TopicError> {
-        write(&self.router).subscribe(session, filter, sub)
+    ) -> Result<bool, SubscribeError> {
+        let mut router = write(&self.router);
+        if session.queue.is_closed() {
+            // The session ended while this SUBSCRIBE was being processed.
+            return Ok(false);
+        }
+        let limit = self.options.max_subscriptions_per_session;
+        if limit > 0
+            && router.subscription_count_of(session.id) >= limit
+            && !router.has_subscription(session.id, filter)
+        {
+            return Err(SubscribeError::TooManySubscriptions);
+        }
+        let is_new = router.subscribe(session.id, filter, sub)?;
+        let send_retained = match sub.options.retain_handling {
+            RetainHandling::SendAlways => true,
+            RetainHandling::SendIfNew => is_new,
+            RetainHandling::DoNotSend => false,
+        };
+        if send_retained {
+            self.queue_retained(session, filter, &sub);
+        }
+        Ok(is_new)
     }
 
     pub fn unsubscribe(&self, session: SessionId, filter: &str) -> bool {
@@ -538,8 +650,9 @@ impl BrokerContext {
         read(&self.router).session_filters(session)
     }
 
-    /// Queues the retained messages matching a new subscription (§3.3.1.3).
-    pub fn deliver_retained(&self, session: &Session, filter: &str, sub: &Subscription) -> usize {
+    /// Queues the retained messages matching a new subscription (§3.3.1.3). Called with the
+    /// router write lock held.
+    fn queue_retained(&self, session: &Session, filter: &str, sub: &Subscription) -> usize {
         // Shared subscriptions never receive retained messages (§4.8.2).
         if filter.starts_with("$share/") {
             return 0;
@@ -556,18 +669,30 @@ impl BrokerContext {
             if let Some(id) = sub.identifier {
                 p.properties.push(Property::SubscriptionIdentifier(id));
             }
-            if session.queue.push_publish(Delivery::new(p, expires_at)) != PushResult::Dropped {
-                n += 1;
+            match session.queue.push_publish(Delivery::new(p, expires_at)) {
+                PushResult::Queued => n += 1,
+                PushResult::QueuedDroppedOldest(evicted) => {
+                    n += 1;
+                    self.count_dropped(evicted);
+                }
+                PushResult::Dropped => self.count_dropped(1),
+                PushResult::Closed => {}
             }
         }
         n
     }
 
+    fn count_dropped(&self, n: usize) {
+        self.metrics
+            .messages_dropped
+            .fetch_add(n as u64, Ordering::Relaxed);
+    }
+
     // ── Publishing ───────────────────────────────────────────────────────────
 
     /// Routes a message to every matching session and updates the retained store.
-    /// `origin` is the publishing session (for No Local). Returns the number of targets.
-    pub fn publish(&self, origin: Option<SessionId>, msg: PublishPacket) -> usize {
+    /// `origin` is the publishing session (for No Local).
+    pub fn publish(&self, origin: Option<SessionId>, msg: PublishPacket) -> Routed {
         self.metrics
             .messages_received
             .fetch_add(1, Ordering::Relaxed);
@@ -578,13 +703,16 @@ impl BrokerContext {
     }
 
     /// Fan-out without traffic accounting (broker-generated messages).
-    fn route_message(&self, origin: Option<SessionId>, msg: PublishPacket) -> usize {
+    fn route_message(&self, origin: Option<SessionId>, msg: PublishPacket) -> Routed {
         let now = Instant::now();
         let expires_at = msg
             .properties
             .message_expiry_interval()
             .map(|s| now + Duration::from_secs(s as u64));
 
+        // Held until every target is queued; see `subscribe` for why.
+        let router = read(&self.router);
+        let mut retained_rejected = false;
         if msg.retain && self.options.allow_retained_messages {
             let mut stored = msg.clone();
             stored.properties.retain(|p| {
@@ -593,15 +721,11 @@ impl BrokerContext {
                     Property::TopicAlias(_) | Property::SubscriptionIdentifier(_)
                 )
             });
-            if lock(&self.retained).update(stored, expires_at) == RetainOutcome::RejectedQuota {
-                self.metrics
-                    .messages_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            retained_rejected =
+                lock(&self.retained).update(stored, expires_at) == RetainOutcome::RejectedQuota;
         }
 
         let targets: Vec<(Arc<Session>, crate::routing::Target)> = {
-            let router = read(&self.router);
             let sessions = read(&self.sessions);
             router
                 .route(&msg.topic, origin, |id| {
@@ -637,15 +761,24 @@ impl BrokerContext {
             }
             match session.queue.push_publish(Delivery::new(p, expires_at)) {
                 PushResult::Queued | PushResult::Closed => {}
-                PushResult::QueuedDroppedOldest | PushResult::Dropped => {
-                    self.metrics
-                        .messages_dropped
-                        .fetch_add(1, Ordering::Relaxed);
+                PushResult::QueuedDroppedOldest(evicted) => {
+                    self.count_dropped(evicted);
+                    debug!(
+                        "Queue full for '{}'; {} older message(s) dropped",
+                        session.client_id, evicted
+                    );
+                }
+                PushResult::Dropped => {
+                    self.count_dropped(1);
                     debug!("Queue full for '{}'; message dropped", session.client_id);
                 }
             }
         }
-        count
+        drop(router);
+        Routed {
+            receivers: count,
+            retained_rejected,
+        }
     }
 
     pub fn retained_count(&self) -> usize {
@@ -678,7 +811,7 @@ impl BrokerContext {
                 }
             };
             if let Some(pw) = due_will {
-                self.publish_will(&s.client_id, &pw.owner, pw.message);
+                self.publish_will(&s, &pw.owner, pw.message);
             }
             if self.discard_if_expired(&s, now) {
                 info!("Session '{}' expired", s.client_id);
