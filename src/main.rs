@@ -157,22 +157,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if config.listeners.mqtt_sn.enabled {
-        let sn_server = wolf_mqtt::server_sn::MqttSnServer::new(
+        match wolf_mqtt::server_sn::MqttSnServer::bind(
             config.listeners.mqtt_sn.clone(),
             shared_context.clone(),
-        );
-        listeners_active += 1;
-        info!(
-            "WolfiMQ MQTT-SN (UDP) listener active on {}:{} (Gateway ID: {})",
-            config.listeners.mqtt_sn.bind_address,
-            config.listeners.mqtt_sn.port,
-            config.listeners.mqtt_sn.gateway_id
-        );
-        tokio::spawn(async move {
-            if let Err(e) = sn_server.run().await {
-                error!("MQTT-SN UDP server failure: {}", e);
+        )
+        .await
+        {
+            Ok(sn_server) => {
+                let local_addr = sn_server.local_addr()?;
+                listeners_active += 1;
+                info!(
+                    "WolfiMQ MQTT-SN (UDP) listener active on {} (Gateway ID: {})",
+                    local_addr, config.listeners.mqtt_sn.gateway_id
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = sn_server.run().await {
+                        error!("MQTT-SN UDP server failure: {}", e);
+                    }
+                });
             }
-        });
+            Err(e) => {
+                error!("Failed to bind MQTT-SN UDP listener: {}", e);
+                return Err(format!("Failed to bind MQTT-SN UDP listener: {}", e).into());
+            }
+        }
     }
 
     if config.listeners.tcp.enabled {

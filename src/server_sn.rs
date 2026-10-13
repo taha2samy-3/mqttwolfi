@@ -52,13 +52,20 @@ impl SnClientSession {
 pub struct MqttSnServer {
     config: MqttSnListenerConfig,
     context: BrokerContext,
+    socket: Arc<UdpSocket>,
     predefined_id_to_name: Arc<HashMap<u16, String>>,
     predefined_name_to_id: Arc<HashMap<String, u16>>,
     sessions: Arc<RwLock<HashMap<SocketAddr, SnClientSession>>>,
 }
 
 impl MqttSnServer {
-    pub fn new(config: MqttSnListenerConfig, context: BrokerContext) -> Self {
+    /// Binds the MQTT-SN server to the address specified in the configuration.
+    pub async fn bind(
+        config: MqttSnListenerConfig,
+        context: BrokerContext,
+    ) -> Result<Self, std::io::Error> {
+        let bind_addr = format!("{}:{}", config.bind_address, config.port);
+        let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
         let mut id_to_name = HashMap::new();
         let mut name_to_id = HashMap::new();
 
@@ -69,27 +76,32 @@ impl MqttSnServer {
             }
         }
 
-        Self {
+        Ok(Self {
             config,
             context,
+            socket,
             predefined_id_to_name: Arc::new(id_to_name),
             predefined_name_to_id: Arc::new(name_to_id),
             sessions: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
+    }
+
+    /// Returns the local socket address this MQTT-SN listener is bound to.
+    pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
+        self.socket.local_addr()
     }
 
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let bind_addr = format!("{}:{}", self.config.bind_address, self.config.port);
-        let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
+        let local_addr = self.socket.local_addr()?;
         info!(
             "WolfiMQ MQTT-SN (UDP) listener running on {} (Gateway ID: {})",
-            bind_addr, self.config.gateway_id
+            local_addr, self.config.gateway_id
         );
 
         let (outbound_tx, mut outbound_rx) = mpsc::channel::<(SocketAddr, BytesMut)>(1024);
 
         // Task 1: Outbound UDP transmitter
-        let out_socket = Arc::clone(&socket);
+        let out_socket = Arc::clone(&self.socket);
         tokio::spawn(async move {
             while let Some((dest, buf)) = outbound_rx.recv().await {
                 if let Err(e) = out_socket.send_to(&buf, dest).await {
@@ -100,7 +112,7 @@ impl MqttSnServer {
 
         // Task 2: Periodic ADVERTISE broadcast
         if self.config.advertise_interval_sec > 0 {
-            let adv_socket = Arc::clone(&socket);
+            let adv_socket = Arc::clone(&self.socket);
             let gw_id = self.config.gateway_id;
             let duration = self.config.advertise_interval_sec * 3;
             let interval =
@@ -122,7 +134,7 @@ impl MqttSnServer {
         // Main Loop: Inbound Datagram receiver
         let mut recv_buf = [0u8; 4096];
         loop {
-            let (len, peer) = match socket.recv_from(&mut recv_buf).await {
+            let (len, peer) = match self.socket.recv_from(&mut recv_buf).await {
                 Ok(res) => res,
                 Err(e) => {
                     error!("Error receiving UDP packet on MQTT-SN listener: {}", e);
