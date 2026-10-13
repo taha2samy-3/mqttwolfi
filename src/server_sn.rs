@@ -81,7 +81,10 @@ async fn dispatch_publish(context: &BrokerContext, pub_pkt: PublishPacket) {
     let mut forward_pkt = pub_pkt;
     forward_pkt.retain = false;
     let mut forward_buf = BytesMut::new();
-    if MqttPacket::Publish(forward_pkt).encode(&mut forward_buf).is_ok() {
+    if MqttPacket::Publish(forward_pkt)
+        .encode(&mut forward_buf)
+        .is_ok()
+    {
         let frozen = forward_buf.freeze();
         let clients_guard = context.clients.read().await;
         for target_id in matched_ids {
@@ -182,7 +185,11 @@ impl MqttSnServer {
                             // MQTT-SN standard timeout threshold is 1.5 * duration
                             let timeout_sec = (session.duration_sec as u64) * 3 / 2;
                             if now.duration_since(session.last_seen).as_secs() >= timeout_sec {
-                                expired_peers.push((peer, session.internal_id, session.will.clone()));
+                                expired_peers.push((
+                                    peer,
+                                    session.internal_id,
+                                    session.will.clone(),
+                                ));
                             }
                         }
                     }
@@ -568,35 +575,37 @@ impl MqttSnServer {
                             let mut slice = &raw_mqtt_bytes[..];
                             if let Ok(MqttPacket::Publish(p)) = MqttPacket::decode(&mut slice) {
                                 // Find topic id for this topic
-                                let (tid_type, tid) =
-                                    if let Some(&pid) = forward_predefined.get(&p.topic) {
-                                        (TopicIdType::Predefined, pid)
-                                    } else if p.topic.len() == 2 {
-                                        let bytes = p.topic.as_bytes();
-                                        let short_id = u16::from_be_bytes([bytes[0], bytes[1]]);
-                                        (TopicIdType::Short, short_id)
-                                    } else {
-                                        let mut lock = forward_sessions.write().await;
-                                        if let Some(s) = lock.get_mut(&target_peer) {
-                                            if let Some(&nid) = s.name_to_topic_id.get(&p.topic) {
-                                                (TopicIdType::Normal, nid)
-                                            } else {
-                                                let nid = s.register_topic(&p.topic);
-                                                // Dynamic registration per OASIS MQTT-SN v1.2 §5.4.8
-                                                let reg_pkt = SnPacket::Register {
-                                                    topic_id: nid,
-                                                    msg_id: 0,
-                                                    topic_name: p.topic.clone(),
-                                                };
-                                                let mut reg_buf = BytesMut::new();
-                                                reg_pkt.encode(&mut reg_buf);
-                                                let _ = forward_outbound.send((target_peer, reg_buf)).await;
-                                                (TopicIdType::Normal, nid)
-                                            }
+                                let (tid_type, tid) = if let Some(&pid) =
+                                    forward_predefined.get(&p.topic)
+                                {
+                                    (TopicIdType::Predefined, pid)
+                                } else if p.topic.len() == 2 {
+                                    let bytes = p.topic.as_bytes();
+                                    let short_id = u16::from_be_bytes([bytes[0], bytes[1]]);
+                                    (TopicIdType::Short, short_id)
+                                } else {
+                                    let mut lock = forward_sessions.write().await;
+                                    if let Some(s) = lock.get_mut(&target_peer) {
+                                        if let Some(&nid) = s.name_to_topic_id.get(&p.topic) {
+                                            (TopicIdType::Normal, nid)
                                         } else {
-                                            (TopicIdType::Normal, 0)
+                                            let nid = s.register_topic(&p.topic);
+                                            // Dynamic registration per OASIS MQTT-SN v1.2 §5.4.8
+                                            let reg_pkt = SnPacket::Register {
+                                                topic_id: nid,
+                                                msg_id: 0,
+                                                topic_name: p.topic.clone(),
+                                            };
+                                            let mut reg_buf = BytesMut::new();
+                                            reg_pkt.encode(&mut reg_buf);
+                                            let _ =
+                                                forward_outbound.send((target_peer, reg_buf)).await;
+                                            (TopicIdType::Normal, nid)
                                         }
-                                    };
+                                    } else {
+                                        (TopicIdType::Normal, 0)
+                                    }
+                                };
 
                                 let fwd_pkt = SnPacket::Publish {
                                     dup: p.dup,

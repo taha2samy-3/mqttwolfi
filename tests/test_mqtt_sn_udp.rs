@@ -583,3 +583,204 @@ async fn test_mqtt_sn_sleeping_client_lifecycle() {
     let ping_resp = recv_sn_packet(&client_sock).await;
     assert_eq!(ping_resp, SnPacket::PingResp);
 }
+
+#[tokio::test]
+async fn test_mqtt_sn_sleeping_client_buffered_messages() {
+    let (server_addr, _context) = spawn_test_sn_server().await;
+    let sleepy_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let publisher_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // 1. Sleepy client connects
+    let mut buf = BytesMut::new();
+    SnPacket::Connect {
+        will: false,
+        clean_session: true,
+        duration: 300,
+        client_id: "sleepy-uav-1".into(),
+    }
+    .encode(&mut buf);
+    sleepy_sock.send_to(&buf, server_addr).await.unwrap();
+    let _ = recv_sn_packet(&sleepy_sock).await; // ConnAck
+
+    // 2. Sleepy client subscribes to "uav/mission"
+    buf.clear();
+    SnPacket::Subscribe {
+        dup: false,
+        qos: 0,
+        topic_id_type: TopicIdType::Normal,
+        msg_id: 10,
+        topic_id: 0,
+        topic_name: Some("uav/mission".into()),
+    }
+    .encode(&mut buf);
+    sleepy_sock.send_to(&buf, server_addr).await.unwrap();
+    let suback = recv_sn_packet(&sleepy_sock).await;
+    let assigned_tid = match suback {
+        SnPacket::SubAck { topic_id, .. } => topic_id,
+        other => panic!("Expected SubAck, got {:?}", other),
+    };
+
+    // 3. Sleepy client enters Asleep state
+    buf.clear();
+    SnPacket::Disconnect {
+        duration: Some(300),
+    }
+    .encode(&mut buf);
+    sleepy_sock.send_to(&buf, server_addr).await.unwrap();
+    let disc_ack = recv_sn_packet(&sleepy_sock).await;
+    assert_eq!(disc_ack, SnPacket::Disconnect { duration: None });
+
+    // 4. Publisher connects and publishes to "uav/mission" while sleepy is asleep
+    buf.clear();
+    SnPacket::Connect {
+        will: false,
+        clean_session: true,
+        duration: 60,
+        client_id: "base-station-pub".into(),
+    }
+    .encode(&mut buf);
+    publisher_sock.send_to(&buf, server_addr).await.unwrap();
+    let _ = recv_sn_packet(&publisher_sock).await; // ConnAck
+
+    buf.clear();
+    SnPacket::Register {
+        topic_id: 0,
+        msg_id: 1,
+        topic_name: "uav/mission".into(),
+    }
+    .encode(&mut buf);
+    publisher_sock.send_to(&buf, server_addr).await.unwrap();
+    let regack = recv_sn_packet(&publisher_sock).await;
+    let pub_tid = match regack {
+        SnPacket::RegAck { topic_id, .. } => topic_id,
+        other => panic!("Expected RegAck, got {:?}", other),
+    };
+
+    buf.clear();
+    SnPacket::Publish {
+        dup: false,
+        qos: 0,
+        retain: false,
+        topic_id_type: TopicIdType::Normal,
+        topic_id: pub_tid,
+        msg_id: 0,
+        data: Bytes::from_static(b"COMMAND:RETURN_BASE"),
+    }
+    .encode(&mut buf);
+    publisher_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // Small delay to ensure message was routed and buffered
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // 5. Sleepy client wakes up with PingReq { client_id }
+    buf.clear();
+    SnPacket::PingReq {
+        client_id: Some("sleepy-uav-1".into()),
+    }
+    .encode(&mut buf);
+    sleepy_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // Sleepy client MUST receive the buffered Publish first!
+    let buffered_pub = recv_sn_packet(&sleepy_sock).await;
+    match buffered_pub {
+        SnPacket::Publish { topic_id, data, .. } => {
+            assert_eq!(topic_id, assigned_tid);
+            assert_eq!(data, Bytes::from_static(b"COMMAND:RETURN_BASE"));
+        }
+        other => panic!("Expected buffered Publish, got {:?}", other),
+    }
+
+    // Sleepy client receives PingResp to conclude waking transaction
+    let ping_resp = recv_sn_packet(&sleepy_sock).await;
+    assert_eq!(ping_resp, SnPacket::PingResp);
+}
+
+#[tokio::test]
+async fn test_mqtt_sn_keepalive_timeout_and_lwt_broadcast() {
+    let (server_addr, _context) = spawn_test_sn_server().await;
+    let dying_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let monitor_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // 1. Monitor connects and subscribes to "telemetry/drone_loss"
+    let mut buf = BytesMut::new();
+    SnPacket::Connect {
+        will: false,
+        clean_session: true,
+        duration: 100,
+        client_id: "fleet-monitor".into(),
+    }
+    .encode(&mut buf);
+    monitor_sock.send_to(&buf, server_addr).await.unwrap();
+    let _ = recv_sn_packet(&monitor_sock).await; // ConnAck
+
+    buf.clear();
+    SnPacket::Subscribe {
+        dup: false,
+        qos: 0,
+        topic_id_type: TopicIdType::Normal,
+        msg_id: 1,
+        topic_id: 0,
+        topic_name: Some("telemetry/drone_loss".into()),
+    }
+    .encode(&mut buf);
+    monitor_sock.send_to(&buf, server_addr).await.unwrap();
+    let suback = recv_sn_packet(&monitor_sock).await;
+    let monitor_tid = match suback {
+        SnPacket::SubAck { topic_id, .. } => topic_id,
+        other => panic!("Expected SubAck, got {:?}", other),
+    };
+
+    // 2. Dying client connects with duration = 1s and sets Will
+    buf.clear();
+    SnPacket::Connect {
+        will: true,
+        clean_session: true,
+        duration: 1, // 1 second keepalive!
+        client_id: "dying-drone-404".into(),
+    }
+    .encode(&mut buf);
+    dying_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // LWT handshake
+    let req1 = recv_sn_packet(&dying_sock).await;
+    assert_eq!(req1, SnPacket::WillTopicReq);
+
+    buf.clear();
+    SnPacket::WillTopic {
+        qos: 0,
+        retain: false,
+        will_topic: "telemetry/drone_loss".into(),
+    }
+    .encode(&mut buf);
+    dying_sock.send_to(&buf, server_addr).await.unwrap();
+
+    let req2 = recv_sn_packet(&dying_sock).await;
+    assert_eq!(req2, SnPacket::WillMsgReq);
+
+    buf.clear();
+    SnPacket::WillMsg {
+        will_msg: Bytes::from_static(b"DRONE_SIGNAL_LOST_MAYDAY"),
+    }
+    .encode(&mut buf);
+    dying_sock.send_to(&buf, server_addr).await.unwrap();
+
+    let connack = recv_sn_packet(&dying_sock).await;
+    assert_eq!(connack, SnPacket::ConnAck { return_code: 0x00 });
+
+    // 3. Dying client goes silent. Reaper detects timeout after 1.5 * 1s = 1.5s
+    // Monitor should receive the LWT PUBLISH!
+    let lwt_received = tokio::time::timeout(
+        std::time::Duration::from_secs(4),
+        recv_sn_packet(&monitor_sock),
+    )
+    .await
+    .expect("Timed out waiting for LWT publish from reaper");
+
+    match lwt_received {
+        SnPacket::Publish { topic_id, data, .. } => {
+            assert_eq!(topic_id, monitor_tid);
+            assert_eq!(data, Bytes::from_static(b"DRONE_SIGNAL_LOST_MAYDAY"));
+        }
+        other => panic!("Expected LWT Publish, got {:?}", other),
+    }
+}

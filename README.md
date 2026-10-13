@@ -268,9 +268,9 @@ queue_full_policy = "drop_oldest"
 
 ## Testing & CI Suite
 
-WolfiMQ validates stability across **76 automated test cases** (43 Unit Tests + 33 Integration & E2E Tests across 12 test suites):
+WolfiMQ validates stability across **82 automated test cases** (43 Unit Tests + 39 Integration & E2E Tests across 12 test suites):
 - **43 Unit Tests:** Packet codecs, variable-byte integers, bounds-checked CONNECT framing, Argon2id hashing, Topic Trie matching & pruning, `$SYS` topic root wildcard isolation, retained store quota limit, configuration validation, and MQTT-SN v1.2 frame serialization / deserialization roundtrips.
-- **5 MQTT-SN UDP Tests:** Connect/Ping/Disconnect lifecycle, Register & QoS 1 publish, QoS -1 predefined telemetry, cross-protocol UDP-to-TCP delivery, and cross-protocol TCP-to-UDP command delivery ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)).
+- **11 MQTT-SN UDP Tests:** Connect/Ping/Disconnect lifecycle, Register & QoS 1 publish, QoS -1 predefined telemetry, cross-protocol UDP-to-TCP delivery, cross-protocol TCP-to-UDP command delivery, LWT handshake flow (§5.4.4), Unsubscribe flow (§5.4.16), QoS 2 four-way handshake (§5.4.10), sleeping client lifecycle (§5.4.18), sleeping client buffered message queue & flush (§5.4.20), and keepalive timeout reaper with LWT broadcast (§5.4.5) ([`tests/test_mqtt_sn_udp.rs`](tests/test_mqtt_sn_udp.rs)).
 - **5 MQTT 5.0 Conformance & Interop Tests:** Live TCP pub/sub exchange, raw frame properties parsing, will properties LWT delivery, MQTT 5 reason codes (`0x86` vs `0x05`), and v3.1.1/v5.0 cross-version interoperability.
 - **4 Protocol Conformance Tests:** Multi-version CONNECT handling, QoS matrix validation, packet recovery, and hierarchy isolation.
 - **7 Unified Listeners & Hardening Tests:** Cross-listener message routing (TCP 1883 $\leftrightarrow$ TLS 8883), live UNSUBSCRIBE / UNSUBACK with trie pruning, retained QoS 1 delivery with packet IDs, duplicate CONNECT disconnects, QoS 2 deduplication, QoS 1 LWT delivery, and MQTT 5.0 CONNACK raw wire properties verification.
