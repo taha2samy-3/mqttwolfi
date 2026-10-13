@@ -3,7 +3,7 @@ name: Release
 # Publish a release:   git tag -a v0.5.0 -m "WolfiMQ v0.5.0" && git push origin v0.5.0
 # or run this workflow manually with an existing tag.
 on:
-  push:
+  push: 
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
     inputs:
