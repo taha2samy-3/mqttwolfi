@@ -1,15 +1,13 @@
 use bytes::{Buf, Bytes, BytesMut};
-use rustls_pki_types::ServerName;
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
 use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS};
 use wolf_mqtt::server::BrokerServer;
-use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector};
+use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector, WolfTlsStream};
 
 #[allow(dead_code)]
 #[derive(Default, Debug, Clone)]
@@ -208,9 +206,8 @@ async fn run_tls_client_workload(
         let bname = broker_name.to_string();
 
         let handle = tokio::spawn(async move {
-            let server_name = ServerName::try_from("localhost")?.to_owned();
             let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
-            let mut tls = connector_clone.connect(server_name, tcp).await?;
+            let mut tls = connector_clone.connect("localhost", tcp).await?;
             let mut buf = BytesMut::with_capacity(8192);
 
             let client_id = format!(
@@ -246,9 +243,9 @@ async fn run_tls_client_workload(
             .await?;
             let _ = read_next_packet(&mut tls, &mut buf).await?;
 
-            Ok::<(TlsStream<TcpStream>, BytesMut, String), Box<dyn std::error::Error + Send + Sync>>(
-                (tls, buf, topic),
-            )
+            Ok::<(WolfTlsStream, BytesMut, String), Box<dyn std::error::Error + Send + Sync>>((
+                tls, buf, topic,
+            ))
         });
         connect_handles.push(handle);
     }

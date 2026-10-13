@@ -170,8 +170,8 @@ impl BrokerServer {
         }
     }
 
-    /// Runs the server event loop with TLS encryption enabled.
-    pub async fn run_tls(self, acceptor: tokio_rustls::TlsAcceptor) -> Result<(), std::io::Error> {
+    /// Runs the server event loop with wolfSSL TLS encryption enabled.
+    pub async fn run_tls(self, acceptor: crate::tls::WolfTlsAcceptor) -> Result<(), std::io::Error> {
         let context = self.context;
         info!(
             "WolfiMQ TLS server running on {}",

@@ -1,15 +1,13 @@
 use bytes::{Buf, Bytes, BytesMut};
-use rustls_pki_types::ServerName;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::client::TlsStream;
 use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS};
 use wolf_mqtt::server::BrokerServer;
-use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector};
+use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector, WolfTlsStream};
 
-async fn send_packet(stream: &mut TlsStream<TcpStream>, packet: MqttPacket) {
+async fn send_packet(stream: &mut WolfTlsStream, packet: MqttPacket) {
     let mut buf = BytesMut::new();
     packet.encode(&mut buf).expect("Packet encode failed");
     stream
@@ -18,7 +16,7 @@ async fn send_packet(stream: &mut TlsStream<TcpStream>, packet: MqttPacket) {
         .expect("TLS socket write failed");
 }
 
-async fn read_packet(stream: &mut TlsStream<TcpStream>, buf: &mut BytesMut) -> MqttPacket {
+async fn read_packet(stream: &mut WolfTlsStream, buf: &mut BytesMut) -> MqttPacket {
     loop {
         if !buf.is_empty() {
             let mut slice = &buf[..];
@@ -59,14 +57,10 @@ async fn test_tls13_mtls_e2e_pub_sub_exchange() {
     )
     .expect("Failed to create TLS connector");
 
-    let server_name = ServerName::try_from("localhost")
-        .expect("Invalid server name")
-        .to_owned();
-
     // 3. Connect Subscriber over TLS 1.3
     let tcp_sub = TcpStream::connect(addr).await.unwrap();
     let mut tls_sub = connector
-        .connect(server_name.clone(), tcp_sub)
+        .connect("localhost", tcp_sub)
         .await
         .expect("Subscriber TLS handshake failed");
 
@@ -127,7 +121,7 @@ async fn test_tls13_mtls_e2e_pub_sub_exchange() {
     // 4. Connect Publisher over TLS 1.3
     let tcp_pub = TcpStream::connect(addr).await.unwrap();
     let mut tls_pub = connector
-        .connect(server_name, tcp_pub)
+        .connect("localhost", tcp_pub)
         .await
         .expect("Publisher TLS handshake failed");
 

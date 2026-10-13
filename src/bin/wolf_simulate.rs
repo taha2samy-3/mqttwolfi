@@ -1,13 +1,11 @@
 use bytes::{Buf, Bytes, BytesMut};
-use rustls_pki_types::ServerName;
 use std::env;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls::client::TlsStream;
 use wolf_mqtt::protocol::{ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS};
-use wolf_mqtt::tls::create_tls_connector;
+use wolf_mqtt::tls::{create_tls_connector, WolfTlsStream};
 
 static PID_GEN: AtomicU16 = AtomicU16::new(1);
 
@@ -22,7 +20,7 @@ fn next_pid() -> u16 {
 
 enum AnyStream {
     Tcp(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Tls(Box<WolfTlsStream>),
 }
 
 impl AsyncRead for AnyStream {
@@ -93,8 +91,7 @@ impl ClientSession {
             let ca_file = "certs/ca-cert.pem";
             let connector = create_tls_connector(ca_file, None)?;
             let tcp = TcpStream::connect((host, port)).await?;
-            let server_name = ServerName::try_from("localhost")?.to_owned();
-            let tls = connector.connect(server_name, tcp).await?;
+            let tls = connector.connect("localhost", tcp).await?;
             AnyStream::Tls(Box::new(tls))
         } else {
             let tcp = TcpStream::connect((host, port)).await?;
