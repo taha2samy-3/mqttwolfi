@@ -189,7 +189,7 @@ impl WolfTlsStream {
     pub async fn accept(stream: TcpStream, ctx: &Arc<WolfContext>) -> io::Result<Self> {
         let raw_ssl = unsafe { wolfSSL_new(ctx.as_ptr()) };
         if raw_ssl.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "wolfSSL_new failed"));
+            return Err(io::Error::other("wolfSSL_new failed"));
         }
 
         // Set ALPN "mqtt"
@@ -201,7 +201,7 @@ impl WolfTlsStream {
         let fd = stream.as_raw_fd();
         if unsafe { wolfSSL_set_fd(raw_ssl, fd) } != WOLFSSL_SUCCESS {
             unsafe { wolfSSL_free(raw_ssl) };
-            return Err(io::Error::new(io::ErrorKind::Other, "wolfSSL_set_fd failed"));
+            return Err(io::Error::other("wolfSSL_set_fd failed"));
         }
 
         let ssl = Arc::new(Mutex::new(WolfSslPtr(raw_ssl)));
@@ -231,10 +231,10 @@ impl WolfTlsStream {
             } else {
                 let guard = ssl.lock().unwrap();
                 unsafe { wolfSSL_free(guard.0) };
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("wolfSSL_accept failed with error code: {}", err),
-                ));
+                return Err(io::Error::other(format!(
+                    "wolfSSL_accept failed with error code: {}",
+                    err
+                )));
             }
         }
 
@@ -248,14 +248,19 @@ impl WolfTlsStream {
     ) -> io::Result<Self> {
         let raw_ssl = unsafe { wolfSSL_new(ctx.as_ptr()) };
         if raw_ssl.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "wolfSSL_new failed"));
+            return Err(io::Error::other("wolfSSL_new failed"));
         }
 
         // Set SNI Hostname
         if !domain.is_empty() {
             let c_domain = CString::new(domain).unwrap_or_default();
             unsafe {
-                wolfSSL_UseSNI(raw_ssl, 0, c_domain.as_ptr() as *const _, domain.len() as u16);
+                wolfSSL_UseSNI(
+                    raw_ssl,
+                    0,
+                    c_domain.as_ptr() as *const _,
+                    domain.len() as u16,
+                );
             }
         }
 
@@ -268,7 +273,7 @@ impl WolfTlsStream {
         let fd = stream.as_raw_fd();
         if unsafe { wolfSSL_set_fd(raw_ssl, fd) } != WOLFSSL_SUCCESS {
             unsafe { wolfSSL_free(raw_ssl) };
-            return Err(io::Error::new(io::ErrorKind::Other, "wolfSSL_set_fd failed"));
+            return Err(io::Error::other("wolfSSL_set_fd failed"));
         }
 
         let ssl = Arc::new(Mutex::new(WolfSslPtr(raw_ssl)));
@@ -286,22 +291,22 @@ impl WolfTlsStream {
                 unsafe { wolfSSL_get_error(guard.0, ret) }
             };
             if err == WOLFSSL_ERROR_WANT_READ {
-                let _ = stream.try_io(Interest::READABLE, || {
+                let _: io::Result<()> = stream.try_io(Interest::READABLE, || {
                     Err(io::Error::from(io::ErrorKind::WouldBlock))
                 });
                 stream.readable().await?;
             } else if err == WOLFSSL_ERROR_WANT_WRITE {
-                let _ = stream.try_io(Interest::WRITABLE, || {
+                let _: io::Result<()> = stream.try_io(Interest::WRITABLE, || {
                     Err(io::Error::from(io::ErrorKind::WouldBlock))
                 });
                 stream.writable().await?;
             } else {
                 let guard = ssl.lock().unwrap();
                 unsafe { wolfSSL_free(guard.0) };
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("wolfSSL_connect failed with error code: {}", err),
-                ));
+                return Err(io::Error::other(format!(
+                    "wolfSSL_connect failed with error code: {}",
+                    err
+                )));
             }
         }
 
@@ -353,7 +358,7 @@ impl AsyncRead for WolfTlsStream {
             }
 
             if err == WOLFSSL_ERROR_WANT_READ {
-                let _ = this.stream.try_io(Interest::READABLE, || {
+                let _: io::Result<()> = this.stream.try_io(Interest::READABLE, || {
                     Err(io::Error::from(io::ErrorKind::WouldBlock))
                 });
                 match this.stream.poll_read_ready(cx) {
@@ -362,7 +367,7 @@ impl AsyncRead for WolfTlsStream {
                     Poll::Pending => return Poll::Pending,
                 }
             } else if err == WOLFSSL_ERROR_WANT_WRITE {
-                let _ = this.stream.try_io(Interest::WRITABLE, || {
+                let _: io::Result<()> = this.stream.try_io(Interest::WRITABLE, || {
                     Err(io::Error::from(io::ErrorKind::WouldBlock))
                 });
                 match this.stream.poll_write_ready(cx) {
@@ -373,10 +378,10 @@ impl AsyncRead for WolfTlsStream {
             } else if err == WOLFSSL_ERROR_ZERO_RETURN || ret == 0 {
                 return Poll::Ready(Ok(()));
             } else {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("wolfSSL_read failed with error: {}", err),
-                )));
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "wolfSSL_read failed with error: {}",
+                    err
+                ))));
             }
         }
     }
@@ -416,7 +421,7 @@ impl AsyncWrite for WolfTlsStream {
             }
 
             if err == WOLFSSL_ERROR_WANT_WRITE {
-                let _ = this.stream.try_io(Interest::WRITABLE, || {
+                let _: io::Result<()> = this.stream.try_io(Interest::WRITABLE, || {
                     Err(io::Error::from(io::ErrorKind::WouldBlock))
                 });
                 match this.stream.poll_write_ready(cx) {
@@ -425,7 +430,7 @@ impl AsyncWrite for WolfTlsStream {
                     Poll::Pending => return Poll::Pending,
                 }
             } else if err == WOLFSSL_ERROR_WANT_READ {
-                let _ = this.stream.try_io(Interest::READABLE, || {
+                let _: io::Result<()> = this.stream.try_io(Interest::READABLE, || {
                     Err(io::Error::from(io::ErrorKind::WouldBlock))
                 });
                 match this.stream.poll_read_ready(cx) {
@@ -434,10 +439,10 @@ impl AsyncWrite for WolfTlsStream {
                     Poll::Pending => return Poll::Pending,
                 }
             } else {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("wolfSSL_write failed with error: {}", err),
-                )));
+                return Poll::Ready(Err(io::Error::other(format!(
+                    "wolfSSL_write failed with error: {}",
+                    err
+                ))));
             }
         }
     }
@@ -490,9 +495,8 @@ pub fn create_tls_acceptor(
     }
 
     let c_key = CString::new(key_path)?;
-    if unsafe {
-        wolfSSL_CTX_use_PrivateKey_file(ctx.as_ptr(), c_key.as_ptr(), SSL_FILETYPE_PEM)
-    } != WOLFSSL_SUCCESS
+    if unsafe { wolfSSL_CTX_use_PrivateKey_file(ctx.as_ptr(), c_key.as_ptr(), SSL_FILETYPE_PEM) }
+        != WOLFSSL_SUCCESS
     {
         return Err(format!("Failed to load server private key from {}", key_path).into());
     }
@@ -543,9 +547,8 @@ pub fn create_tls_connector(
     let ctx = Arc::new(WolfContext { raw: raw_ctx });
 
     let c_ca = CString::new(ca_cert_path)?;
-    if unsafe {
-        wolfSSL_CTX_load_verify_locations(ctx.as_ptr(), c_ca.as_ptr(), std::ptr::null())
-    } != WOLFSSL_SUCCESS
+    if unsafe { wolfSSL_CTX_load_verify_locations(ctx.as_ptr(), c_ca.as_ptr(), std::ptr::null()) }
+        != WOLFSSL_SUCCESS
     {
         return Err(format!("Failed to load CA verify locations from {}", ca_cert_path).into());
     }
