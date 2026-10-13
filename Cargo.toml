@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["WolfMQTT Team"]
 description = "MQTT v3.1.1 / v5.0 and MQTT-SN v1.2 broker in Rust with wolfSSL TLS (standard and FIPS-Ready builds)"
 license = "MIT OR Apache-2.0"
-rust-version = "1.82"
+rust-version = "1.85"
 build = "build.rs"
 exclude = ["external/wolfssl/build", "certs/*.pem"]
 

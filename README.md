@@ -62,7 +62,7 @@ bash scripts/generate_certs.sh certs        # throw-away test PKI; use real cert
 
 ### Build from source
 
-Requirements: Rust ≥ 1.82, CMake, a C compiler, and `openssl` (only for the test PKI).
+Requirements: Rust ≥ 1.85, CMake, a C compiler, and `openssl` (only for the test PKI).
 
 ```bash
 git clone --recursive <repository-url> && cd wolfimq   # or: git submodule update --init
