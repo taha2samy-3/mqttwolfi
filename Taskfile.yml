@@ -1,7 +1,8 @@
 version: '3'
 
-env:
-  RUST_LOG: "info"
+vars:
+  VERSION:
+    sh: sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1
 
 tasks:
   default:
@@ -10,140 +11,148 @@ tasks:
       - task --list
 
   check:
-    desc: "Quick type-check without full build"
+    desc: "Type-check all targets"
     cmds:
       - cargo check --all-targets
 
-  lint:
-    desc: "Run Clippy linter with strict warnings"
-    cmds:
-      - cargo clippy --all-targets --features wolfssl -- -D warnings
-
   fmt:
-    desc: "Verify source code formatting (rustfmt)"
+    desc: "Verify formatting"
     cmds:
-      - cargo fmt -- --check
+      - cargo fmt --all -- --check
 
   fmt:fix:
-    desc: "Auto-format Rust source files"
+    desc: "Format the source code"
     cmds:
-      - cargo fmt
+      - cargo fmt --all
+
+  lint:
+    desc: "Clippy with warnings as errors"
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
 
   certs:gen:
-    desc: "Generate local test PKI/mTLS certificates (Root CA, Server, Client)"
+    desc: "Generate a throw-away test PKI in certs/ (CA, server, client)"
     cmds:
-      - bash scripts/generate_certs.sh
+      - bash scripts/generate_certs.sh certs
 
   test:
-    desc: "Run all primary tests (Unit + Integration)"
-    deps: [test:unit, test:integration]
+    desc: "Unit tests plus the live TCP / TLS / MQTT-SN / CLI integration suites"
+    cmds:
+      - cargo test --lib --bins --tests
 
   test:unit:
-    desc: "Run unit tests for MQTT packet parsers and protocol logic"
+    desc: "Unit tests only"
     cmds:
-      - cargo test --lib -- --nocapture
+      - cargo test --lib
 
   test:integration:
-    desc: "Run integration tests (Client life cycle, Pub/Sub, QoS)"
+    desc: "Integration suites only"
     cmds:
-      - cargo test --test '*' -- --nocapture
-
-  test:e2e:
-    desc: "Run live TCP network end-to-end socket communication tests"
-    cmds:
-      - cargo test --test test_e2e_network -- --nocapture
-
-  test:all:
-    desc: "Run all test suites including unit, integration, and E2E tests"
-    cmds:
-      - task test:unit
-      - task test:integration
-      - task test:e2e
+      - cargo test --tests
 
   bench:
-    desc: "Run high-precision performance benchmarks in release mode"
+    desc: "Codec / routing micro-benchmarks (release mode)"
     cmds:
       - cargo bench --bench wolf-bench
 
   bench:tls:
-    desc: "Run active TLS 1.3 / mTLS high-load performance benchmark (8 concurrent clients)"
+    desc: "TLS 1.3 / mTLS throughput benchmark (8 clients)"
+    deps: [certs:ensure]
     cmds:
       - cargo run --release --bin wolf-bench-tls -- --concurrency 8 --count 10000
 
-  bench:tls:stress:
-    desc: "Run extreme high-concurrency TLS 1.3 stress benchmark (16 concurrent clients)"
-    cmds:
-      - cargo run --release --bin wolf-bench-tls -- --concurrency 16 --count 16000
-
   bench:tls:compare:
-    desc: "Run comparative TLS benchmark against other brokers (Mosquitto)"
+    desc: "TLS benchmark side by side with a local Mosquitto, if installed"
     cmds:
       - bash scripts/run_ci_tls_benchmark.sh
 
-  test:miri:
-    desc: "Run Miri test suite to detect undefined behavior and FFI pointer safety"
+  bench:report:
+    desc: "Run all benchmarks and write BENCHMARKS.md (what CI publishes)"
     cmds:
-      - cargo miri test --lib
+      - bash scripts/ci_benchmarks.sh BENCHMARKS.md
+
+  certs:ensure:
+    internal: true
+    status:
+      - test -f certs/server-cert.pem
+    cmds:
+      - bash scripts/generate_certs.sh certs
 
   build:
-    desc: "Compile binary in debug mode"
+    desc: "Debug build"
     cmds:
       - cargo build
 
   build:release:
-    desc: "Compile binary in optimized release mode (standard wolfSSL TLS 1.3)"
+    desc: "Optimized release build for this machine"
     cmds:
-      - cargo build --release --features wolfssl
+      - cargo build --release --bins
 
   build:release:fips:
-    desc: "Compile binary in optimized release mode with wolfSSL FIPS 140-2/3 Cryptographic Module"
+    desc: "FIPS-Ready release build (requires the wolfSSL FIPS bundle, see build.rs)"
     cmds:
-      - cargo build --release --no-default-features --features wolfssl-fips
+      - cargo build --release --no-default-features --features wolfssl-fips --bins
+
+  build:cross:
+    desc: "Cross-compile with zig, e.g. task build:cross TARGET=aarch64-unknown-linux-gnu"
+    requires:
+      vars: [TARGET]
+    cmds:
+      - rustup target add {{.TARGET}}
+      - cargo zigbuild --release --target {{.TARGET}} --bins
 
   package:release:
-    desc: "Create release distribution tarball with binaries, configs, scripts, and docs"
+    desc: "Package the native release build into dist/"
+    deps: [build:release]
+    vars:
+      TRIPLE:
+        sh: rustc -vV | sed -n 's/^host: //p'
     cmds:
-      - task: build:release
       - |
-        PKG="wolfimq-v0.2.1-linux-amd64-wolfssl"
-        mkdir -p "${PKG}/bin" "${PKG}/config" "${PKG}/scripts" "${PKG}/docs"
-        cp target/release/wolf-broker target/release/wolf-bench-tls "${PKG}/bin/"
-        cp config/broker.toml config/acl.conf "${PKG}/config/"
-        cp scripts/generate_certs.sh "${PKG}/scripts/"
-        cp README.md LICENSE "${PKG}/"
-        cp docs/CONFIGURATION_AND_CONTROL.md "${PKG}/docs/"
-        tar -czvf "${PKG}.tar.gz" "${PKG}"
-        sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
-        rm -rf "${PKG}"
-        echo "Package created: ${PKG}.tar.gz"
+        set -euo pipefail
+        PKG="wolfimq-{{.VERSION}}-{{.TRIPLE}}"
+        rm -rf "dist/${PKG}" && mkdir -p "dist/${PKG}/bin" "dist/${PKG}/config" "dist/${PKG}/scripts" "dist/${PKG}/docs"
+        cp target/release/wolf-broker target/release/wolf-simulate target/release/wolf-bench-tls "dist/${PKG}/bin/"
+        cp config/broker.toml config/acl.conf "dist/${PKG}/config/"
+        cp scripts/generate_certs.sh "dist/${PKG}/scripts/"
+        cp docs/*.md "dist/${PKG}/docs/"
+        cp README.md CHANGELOG.md SECURITY.md LICENSE LICENSE-MIT LICENSE-APACHE "dist/${PKG}/"
+        mkdir -p "dist/${PKG}/third-party/wolfssl"
+        cp external/wolfssl/COPYING external/wolfssl/LICENSING "dist/${PKG}/third-party/wolfssl/"
+        tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+        (cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256")
+        echo "Created dist/${PKG}.tar.gz"
 
   ci:
-    desc: "Run full local CI pipeline (Format + Check + Lint + All Tests + E2E + Bench)"
+    desc: "Local CI: format, lint, tests"
     cmds:
-      - task fmt
-      - task check
-      - task lint
-      - task test
-      - task test:e2e
-      - task bench
-    silent: false
+      - task: fmt
+      - task: lint
+      - task: test
+
+  run:
+    desc: "Run the broker with config/broker.toml"
+    cmds:
+      - cargo run --bin wolf-broker -- --config config/broker.toml
 
   run:debug:
-    desc: "Run WolfiMQ broker with verbose DEBUG tracing logs"
+    desc: "Run the broker with debug logging"
+    env:
+      RUST_LOG: "wolf_mqtt=debug,wolf_broker=debug,info"
     cmds:
-      - RUST_LOG="wolf_mqtt=debug,wolf_broker=debug,info" cargo run --bin wolf-broker -- --config config/broker.toml
+      - cargo run --bin wolf-broker -- --config config/broker.toml
 
   simulate:
-    desc: "Run live traffic simulator against local broker (TCP port 1883)"
+    desc: "Run the traffic simulator against a local broker (TCP 1883)"
     cmds:
       - cargo run --bin wolf-simulate
 
   simulate:tls:
-    desc: "Run live traffic simulator over TLS 1.3 encrypted connection (port 8883)"
+    desc: "Run the traffic simulator over TLS (port 8883)"
     cmds:
       - cargo run --bin wolf-simulate -- --tls
 
   demo:
-    desc: "Run end-to-end interactive demo (Broker with DEBUG logs + Live Simulator)"
+    desc: "Start the broker with debug logs and run the simulator against it"
     cmds:
       - bash scripts/demo_debug.sh

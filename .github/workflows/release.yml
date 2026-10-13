@@ -115,6 +115,9 @@ jobs:
           cp scripts/generate_certs.sh "${PKG}/scripts/"
           cp docs/*.md "${PKG}/docs/"
           cp README.md CHANGELOG.md SECURITY.md LICENSE LICENSE-MIT LICENSE-APACHE "${PKG}/"
+          # The binaries statically link wolfSSL (GPLv3): ship its license texts.
+          mkdir -p "${PKG}/third-party/wolfssl"
+          cp external/wolfssl/COPYING external/wolfssl/LICENSING "${PKG}/third-party/wolfssl/"
           if [[ -n "${EXT}" ]]; then
             7z a -tzip "${PKG}.zip" "${PKG}" >/dev/null
             ARCHIVE="${PKG}.zip"

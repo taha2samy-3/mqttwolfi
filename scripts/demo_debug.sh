@@ -20,11 +20,10 @@ echo -e "${CYAN}================================================================
 # 1. Ensure test PKI certificates exist
 if [ ! -f "certs/server-cert.pem" ] || [ ! -f "certs/ca-cert.pem" ]; then
     echo -e "${YELLOW}==> Generating test PKI TLS certificates (scripts/generate_certs.sh)...${RESET}"
-    bash scripts/generate_certs.sh
+    bash scripts/generate_certs.sh certs
 fi
 
 BROKER_PID=""
-LOG_FILE="$(mktemp /tmp/wolfimq_debug_XXXXXX.log)"
 
 cleanup() {
     echo -e "\n${YELLOW}==> Stopping background processes and cleaning up...${RESET}"
@@ -32,7 +31,6 @@ cleanup() {
         kill -15 "${BROKER_PID}" 2>/dev/null || true
         wait "${BROKER_PID}" 2>/dev/null || true
     fi
-    rm -f "${LOG_FILE}"
     echo -e "${GREEN}==> All processes cleanly terminated.${RESET}"
 }
 trap cleanup EXIT INT TERM
@@ -45,6 +43,8 @@ fi
 
 # 3. Start WolfiMQ Broker in DEBUG mode in the background
 echo -e "${BOLD}==> [1/2] Starting WolfiMQ Broker in DEBUG mode (RUST_LOG=debug)...${RESET}"
+# The sample configuration keeps plain TCP disabled; enable it on loopback for the demo.
+WOLFIMQ_LISTENERS__TCP__ENABLED=true WOLFIMQ_LISTENERS__TCP__BIND_ADDRESS=127.0.0.1 \
 RUST_LOG="wolf_mqtt=debug,wolf_broker=debug,info" cargo run --bin wolf-broker -- --config config/broker.toml > >(while IFS= read -r line; do echo -e "${MAGENTA}[BROKER-LOG]${RESET} $line"; done) 2>&1 &
 BROKER_PID=$!
 
