@@ -196,7 +196,10 @@ impl WolfTlsStream {
         tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, Self::do_accept(stream, ctx))
             .await
             .map_err(|_| {
-                warn!("TLS handshake timed out after {}s", TLS_HANDSHAKE_TIMEOUT.as_secs());
+                warn!(
+                    "TLS handshake timed out after {}s",
+                    TLS_HANDSHAKE_TIMEOUT.as_secs()
+                );
                 io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timeout")
             })?
     }

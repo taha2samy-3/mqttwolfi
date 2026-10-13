@@ -307,11 +307,7 @@ impl MqttSnServer {
 
                 // Authenticate: MQTT-SN has no built-in credentials.
                 // We use anonymous auth; if allow_anonymous=false, reject the connection.
-                let auth_result = self
-                    .context
-                    .acl
-                    .authenticate(None, None, &client_id)
-                    .await;
+                let auth_result = self.context.acl.authenticate(None, None, &client_id).await;
 
                 let user = match auth_result {
                     Ok(u) => u,
@@ -530,7 +526,8 @@ impl MqttSnServer {
                 // Guard: must be authenticated (i.e., CONNECT received)
                 let session_info = {
                     let lock = self.sessions.read().await;
-                    lock.get(&peer).map(|s| (s.is_authenticated, s.user.clone(), s.client_id_str.clone()))
+                    lock.get(&peer)
+                        .map(|s| (s.is_authenticated, s.user.clone(), s.client_id_str.clone()))
                 };
                 let (is_auth, user_opt, client_id_str) = match session_info {
                     Some(info) => info,
@@ -567,7 +564,9 @@ impl MqttSnServer {
                 if let Some(topic) = resolved_topic {
                     // ACL: Check publish authorization
                     let acl_allowed = if let Some(ref user) = user_opt {
-                        self.context.acl.check_publish(user.as_ref(), &client_id_str, &topic)
+                        self.context
+                            .acl
+                            .check_publish(user.as_ref(), &client_id_str, &topic)
                     } else {
                         false
                     };
@@ -684,18 +683,28 @@ impl MqttSnServer {
                 // Guard: must have a valid authenticated session (CONNECT received)
                 let session_info = {
                     let lock = self.sessions.read().await;
-                    lock.get(&peer).map(|s| (
-                        s.is_authenticated,
-                        s.user.clone(),
-                        s.client_id_str.clone(),
-                        s.internal_id,
-                    ))
+                    lock.get(&peer).map(|s| {
+                        (
+                            s.is_authenticated,
+                            s.user.clone(),
+                            s.client_id_str.clone(),
+                            s.internal_id,
+                        )
+                    })
                 };
                 let (is_auth, user_opt, client_id_str, internal_id) = match session_info {
                     Some(info) => info,
                     None => {
-                        warn!("MQTT-SN SUBSCRIBE from {} without session (no CONNECT); ignoring", peer);
-                        let suback = SnPacket::SubAck { qos, topic_id: 0, msg_id, return_code: 0x03 };
+                        warn!(
+                            "MQTT-SN SUBSCRIBE from {} without session (no CONNECT); ignoring",
+                            peer
+                        );
+                        let suback = SnPacket::SubAck {
+                            qos,
+                            topic_id: 0,
+                            msg_id,
+                            return_code: 0x03,
+                        };
                         let mut buf = BytesMut::new();
                         suback.encode(&mut buf);
                         let _ = outbound.send((peer, buf)).await;
@@ -704,7 +713,12 @@ impl MqttSnServer {
                 };
                 if !is_auth {
                     warn!("MQTT-SN SUBSCRIBE from {} without CONNECT; ignoring", peer);
-                    let suback = SnPacket::SubAck { qos, topic_id: 0, msg_id, return_code: 0x03 };
+                    let suback = SnPacket::SubAck {
+                        qos,
+                        topic_id: 0,
+                        msg_id,
+                        return_code: 0x03,
+                    };
                     let mut buf = BytesMut::new();
                     suback.encode(&mut buf);
                     let _ = outbound.send((peer, buf)).await;
@@ -718,7 +732,12 @@ impl MqttSnServer {
                         let bytes = topic_id.to_be_bytes();
                         if bytes.iter().any(|&b| b == b'+' || b == b'#') {
                             warn!("MQTT-SN SUBSCRIBE rejected from {}: short topic ID contains wildcard byte", peer);
-                            let suback = SnPacket::SubAck { qos, topic_id: 0, msg_id, return_code: 0x02 };
+                            let suback = SnPacket::SubAck {
+                                qos,
+                                topic_id: 0,
+                                msg_id,
+                                return_code: 0x02,
+                            };
                             let mut buf = BytesMut::new();
                             suback.encode(&mut buf);
                             let _ = outbound.send((peer, buf)).await;
@@ -732,7 +751,9 @@ impl MqttSnServer {
                 if let Some(topic) = resolved_topic {
                     // ACL: Check subscribe authorization
                     let acl_allowed = if let Some(ref user) = user_opt {
-                        self.context.acl.check_subscribe(user.as_ref(), &client_id_str, &topic)
+                        self.context
+                            .acl
+                            .check_subscribe(user.as_ref(), &client_id_str, &topic)
                     } else {
                         false
                     };
@@ -741,7 +762,12 @@ impl MqttSnServer {
                             "MQTT-SN SUBSCRIBE denied for client '{}' ({}): topic '{}'",
                             client_id_str, peer, topic
                         );
-                        let suback = SnPacket::SubAck { qos, topic_id: 0, msg_id, return_code: 0x03 };
+                        let suback = SnPacket::SubAck {
+                            qos,
+                            topic_id: 0,
+                            msg_id,
+                            return_code: 0x03,
+                        };
                         let mut buf = BytesMut::new();
                         suback.encode(&mut buf);
                         let _ = outbound.send((peer, buf)).await;
@@ -966,7 +992,8 @@ impl MqttSnServer {
                     // Permanent disconnect: clean up session, client channel, AND router subscriptions
                     let cleanup = {
                         let mut lock = self.sessions.write().await;
-                        lock.remove(&peer).map(|s| (s.internal_id, s.subscribed_topics))
+                        lock.remove(&peer)
+                            .map(|s| (s.internal_id, s.subscribed_topics))
                     };
                     if let Some((id, subscribed_topics)) = cleanup {
                         // Remove from active clients map
@@ -994,7 +1021,6 @@ impl MqttSnServer {
                 SnPacket::Disconnect { duration: None }.encode(&mut buf);
                 let _ = outbound.send((peer, buf)).await;
             }
-
 
             SnPacket::EncapMsg {
                 ctrl: _,

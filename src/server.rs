@@ -254,7 +254,9 @@ impl BrokerServer {
             let keep_alive_duration = if !is_connected {
                 Some(std::time::Duration::from_secs(60)) // initial connect timeout
             } else if client_keep_alive > 0 {
-                Some(std::time::Duration::from_millis((client_keep_alive as u64) * 1500))
+                Some(std::time::Duration::from_millis(
+                    (client_keep_alive as u64) * 1500,
+                ))
             } else {
                 // OASIS MQTT v3.1.1 §3.1.2.10: Keep Alive of 0 disables inactivity timeout
                 None
@@ -391,7 +393,9 @@ impl BrokerServer {
                                             };
 
                                             if !allowed {
-                                                let reason_code = if client_protocol_version == ProtocolVersion::V500 {
+                                                let reason_code = if client_protocol_version
+                                                    == ProtocolVersion::V500
+                                                {
                                                     0x85 // Client Identifier not valid
                                                 } else {
                                                     0x02
@@ -402,7 +406,10 @@ impl BrokerServer {
                                                 };
                                                 let mut ack_buf = BytesMut::new();
                                                 if connack
-                                                    .encode_for_version(&mut ack_buf, client_protocol_version)
+                                                    .encode_for_version(
+                                                        &mut ack_buf,
+                                                        client_protocol_version,
+                                                    )
                                                     .is_ok()
                                                 {
                                                     let _ = tx.send(ack_buf.freeze()).await;
@@ -436,7 +443,10 @@ impl BrokerServer {
                                         };
                                         let mut ack_buf = BytesMut::new();
                                         if connack
-                                            .encode_for_version(&mut ack_buf, client_protocol_version)
+                                            .encode_for_version(
+                                                &mut ack_buf,
+                                                client_protocol_version,
+                                            )
                                             .is_ok()
                                         {
                                             let _ = tx.send(ack_buf.freeze()).await;
@@ -460,7 +470,10 @@ impl BrokerServer {
                                         };
                                         let mut ack_buf = BytesMut::new();
                                         if connack
-                                            .encode_for_version(&mut ack_buf, client_protocol_version)
+                                            .encode_for_version(
+                                                &mut ack_buf,
+                                                client_protocol_version,
+                                            )
                                             .is_ok()
                                         {
                                             let _ = tx.send(ack_buf.freeze()).await;
@@ -509,7 +522,9 @@ impl BrokerServer {
                                                 user.username, topic_filter
                                             );
                                             return_codes.push(0x80); // Unauthorized
-                                        } else if let Err(e) = router_guard.subscribe(topic_filter, client_id) {
+                                        } else if let Err(e) =
+                                            router_guard.subscribe(topic_filter, client_id)
+                                        {
                                             warn!(
                                                 "Subscribe topic filter '{}' invalid: {:?}",
                                                 topic_filter, e
@@ -524,8 +539,10 @@ impl BrokerServer {
                                             if !subscribed_topics.contains(topic_filter) {
                                                 subscribed_topics.push(topic_filter.clone());
                                             }
-                                            client_qos_map.insert(topic_filter.clone(), granted_qos);
-                                            authorized_filters.push((topic_filter.clone(), granted_qos));
+                                            client_qos_map
+                                                .insert(topic_filter.clone(), granted_qos);
+                                            authorized_filters
+                                                .push((topic_filter.clone(), granted_qos));
                                             return_codes.push(granted_qos as u8);
                                         }
                                     }
@@ -537,7 +554,10 @@ impl BrokerServer {
                                     return_codes,
                                 };
                                 let mut ack_buf = BytesMut::new();
-                                if suback.encode_for_version(&mut ack_buf, client_protocol_version).is_ok() {
+                                if suback
+                                    .encode_for_version(&mut ack_buf, client_protocol_version)
+                                    .is_ok()
+                                {
                                     let _ = tx.send(ack_buf.freeze()).await;
                                 }
 
@@ -557,7 +577,9 @@ impl BrokerServer {
                                     ret_pkt.retain = true;
                                     let filter_qos = authorized_filters
                                         .iter()
-                                        .filter(|(f, _)| crate::auth::mqtt_topic_match(f, &ret_pkt.topic))
+                                        .filter(|(f, _)| {
+                                            crate::auth::mqtt_topic_match(f, &ret_pkt.topic)
+                                        })
                                         .map(|(_, q)| *q)
                                         .max()
                                         .unwrap_or(ret_pkt.qos);
@@ -571,7 +593,10 @@ impl BrokerServer {
                                     }
                                     let mut ret_buf = BytesMut::new();
                                     let ret_packet = MqttPacket::Publish(ret_pkt);
-                                    if ret_packet.encode_for_version(&mut ret_buf, client_protocol_version).is_ok() {
+                                    if ret_packet
+                                        .encode_for_version(&mut ret_buf, client_protocol_version)
+                                        .is_ok()
+                                    {
                                         let _ = tx.send(ret_buf.freeze()).await;
                                     }
                                 }
@@ -601,7 +626,10 @@ impl BrokerServer {
 
                                 let unsuback = MqttPacket::UnsubAck { packet_id };
                                 let mut ack_buf = BytesMut::new();
-                                if unsuback.encode_for_version(&mut ack_buf, client_protocol_version).is_ok() {
+                                if unsuback
+                                    .encode_for_version(&mut ack_buf, client_protocol_version)
+                                    .is_ok()
+                                {
                                     let _ = tx.send(ack_buf.freeze()).await;
                                 }
                             }
@@ -706,8 +734,9 @@ impl BrokerServer {
                                         forward_pkt.retain = false;
                                         forward_pkt.qos = effective_qos;
                                         if effective_qos != QoS::AtMostOnce {
-                                            forward_pkt.packet_id =
-                                                Some(next_outbound_pid.fetch_add(1, Ordering::Relaxed));
+                                            forward_pkt.packet_id = Some(
+                                                next_outbound_pid.fetch_add(1, Ordering::Relaxed),
+                                            );
                                         } else {
                                             forward_pkt.packet_id = None;
                                         }

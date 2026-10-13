@@ -331,13 +331,17 @@ impl AclEngine {
 
                 if let Some(user) = user_opt {
                     let user_clone = Arc::clone(&user);
-                    let verified =
-                        tokio::task::spawn_blocking(move || user_clone.verify_password(&pass_bytes))
-                            .await
-                            .unwrap_or(false);
+                    let verified = tokio::task::spawn_blocking(move || {
+                        user_clone.verify_password(&pass_bytes)
+                    })
+                    .await
+                    .unwrap_or(false);
 
                     if !verified {
-                        warn!("Authentication failed for user '{}': invalid credentials", u);
+                        warn!(
+                            "Authentication failed for user '{}': invalid credentials",
+                            u
+                        );
                         return Err(AuthError::BadCredentials);
                     }
 
@@ -370,7 +374,10 @@ impl AclEngine {
                     .await
                     .unwrap_or(());
 
-                    warn!("Authentication failed for user '{}': invalid credentials", u);
+                    warn!(
+                        "Authentication failed for user '{}': invalid credentials",
+                        u
+                    );
                     Err(AuthError::BadCredentials)
                 }
             }
