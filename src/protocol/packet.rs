@@ -659,7 +659,7 @@ impl MqttPacket {
                             if check.remaining() >= p_len + 3 {
                                 check.advance(p_len);
                                 let topic_len = check.get_u16() as usize;
-                                topic_len > 0 && check.remaining() >= topic_len + 1
+                                topic_len > 0 && check.remaining() > topic_len
                             } else {
                                 false
                             }
