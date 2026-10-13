@@ -279,7 +279,11 @@ impl AclEngine {
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
             allow_anonymous,
-            default_rules: Vec::new(), // Secure default: deny by default
+            default_rules: if allow_anonymous {
+                vec![AclRule::new("#", Permission::ReadWrite)]
+            } else {
+                Vec::new()
+            },
         }
     }
 
