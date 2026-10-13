@@ -14,8 +14,8 @@ use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::ptr::NonNull;
-use std::sync::Arc;
-use std::task::{ready, Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{ready, Context, Poll, Wake, Waker};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
@@ -293,6 +293,67 @@ fn alpn_list(protocols: &[String]) -> Result<Option<CString>, TlsError> {
         .map_err(|_| TlsError::InvalidSetting("invalid ALPN protocol name".into()))
 }
 
+/// Which half of a split stream is polling (see [`DirectionWaiters`]).
+#[derive(Clone, Copy)]
+enum Role {
+    Reader = 0,
+    Writer = 1,
+}
+
+/// Wakers of every task waiting for one readiness direction of the socket.
+///
+/// Tokio remembers only the most recent waker per direction. After `tokio::io::split`, a read
+/// may need the socket to be writable (wolfSSL answering a TLS 1.3 KeyUpdate) while the writer
+/// half waits for writability too; registering the reader's waker would silently drop the
+/// writer's. Tokio is therefore given one proxy waker per direction that wakes all waiters.
+#[derive(Default)]
+struct DirectionWaiters {
+    waiters: Mutex<[Option<Waker>; 2]>,
+}
+
+impl DirectionWaiters {
+    fn register(&self, role: Role, waker: &Waker) {
+        let mut w = self.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = &mut w[role as usize];
+        if !slot.as_ref().is_some_and(|old| old.will_wake(waker)) {
+            *slot = Some(waker.clone());
+        }
+    }
+}
+
+impl Wake for DirectionWaiters {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let waiters = std::mem::take(&mut *self.waiters.lock().unwrap_or_else(|e| e.into_inner()));
+        for w in waiters.into_iter().flatten() {
+            w.wake();
+        }
+    }
+}
+
+struct Readiness {
+    read: Arc<DirectionWaiters>,
+    write: Arc<DirectionWaiters>,
+    read_proxy: Waker,
+    write_proxy: Waker,
+}
+
+impl Readiness {
+    fn new() -> Self {
+        let read = Arc::new(DirectionWaiters::default());
+        let write = Arc::new(DirectionWaiters::default());
+        Self {
+            read_proxy: Waker::from(Arc::clone(&read)),
+            write_proxy: Waker::from(Arc::clone(&write)),
+            read,
+            write,
+        }
+    }
+}
+
 /// Outcome of one wolfSSL operation attempt.
 enum Step {
     Done(c_int),
@@ -306,6 +367,7 @@ pub struct WolfTlsStream {
     // Field order matters: the SSL object is freed before the socket is closed.
     ssl: SslHandle,
     stream: TcpStream,
+    readiness: Readiness,
     shutdown_sent: bool,
 }
 
@@ -319,6 +381,7 @@ impl WolfTlsStream {
         Ok(Self {
             ssl,
             stream,
+            readiness: Readiness::new(),
             shutdown_sent: false,
         })
     }
@@ -340,6 +403,7 @@ impl WolfTlsStream {
     fn poll_op(
         &mut self,
         cx: &mut Context<'_>,
+        role: Role,
         mut op: impl FnMut(*mut WOLFSSL) -> c_int,
     ) -> Poll<io::Result<Option<c_int>>> {
         // Optimistic attempt: wolfSSL may complete from its internal buffers without the socket.
@@ -353,9 +417,13 @@ impl WolfTlsStream {
         };
         loop {
             if want == Interest::READABLE {
-                ready!(self.stream.poll_read_ready(cx))?;
+                self.readiness.read.register(role, cx.waker());
+                let mut proxy = Context::from_waker(&self.readiness.read_proxy);
+                ready!(self.stream.poll_read_ready(&mut proxy))?;
             } else {
-                ready!(self.stream.poll_write_ready(cx))?;
+                self.readiness.write.register(role, cx.waker());
+                let mut proxy = Context::from_waker(&self.readiness.write_proxy);
+                ready!(self.stream.poll_write_ready(&mut proxy))?;
             }
             let ssl = self.ssl.ptr();
             let this = &*self;
@@ -379,7 +447,7 @@ impl WolfTlsStream {
 
     async fn handshake(&mut self, server: bool) -> io::Result<()> {
         let result = poll_fn(|cx| {
-            self.poll_op(cx, |ssl| {
+            self.poll_op(cx, Role::Writer, |ssl| {
                 // SAFETY: ssl is valid for the lifetime of self.
                 unsafe {
                     if server {
@@ -457,7 +525,9 @@ impl AsyncRead for WolfTlsStream {
         let len = unfilled.len().min(c_int::MAX as usize) as c_int;
         let ptr = unfilled.as_mut_ptr();
         // SAFETY: `ptr` points to `len` writable bytes owned by `buf` for this call.
-        let n = ready!(this.poll_op(cx, |ssl| unsafe { wolfSSL_read(ssl, ptr.cast(), len) }))?;
+        let n = ready!(this.poll_op(cx, Role::Reader, |ssl| unsafe {
+            wolfSSL_read(ssl, ptr.cast(), len)
+        }))?;
         if let Some(n) = n {
             buf.advance(n as usize);
         }
@@ -478,7 +548,7 @@ impl AsyncWrite for WolfTlsStream {
         let len = buf.len().min(c_int::MAX as usize) as c_int;
         // SAFETY: `buf` is readable for `len` bytes; wolfSSL requires the same buffer on retry,
         // which AsyncWrite callers provide.
-        let n = ready!(this.poll_op(cx, |ssl| unsafe {
+        let n = ready!(this.poll_op(cx, Role::Writer, |ssl| unsafe {
             wolfSSL_write(ssl, buf.as_ptr().cast(), len)
         }))?;
         match n {
