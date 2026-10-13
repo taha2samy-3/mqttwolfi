@@ -12,12 +12,18 @@ pub enum TopicError {
     InvalidSingleWildcardPosition,
     #[error("invalid shared subscription")]
     InvalidSharedSubscription,
+    #[error("topic contains U+0000")]
+    InvalidCharacter,
 }
 
 /// Validates a topic filter (§4.7.1).
 pub fn validate_topic_filter(filter: &str) -> Result<(), TopicError> {
     if filter.is_empty() {
         return Err(TopicError::EmptyTopic);
+    }
+    // U+0000 is never allowed in MQTT strings (§1.5.4).
+    if filter.contains('\0') {
+        return Err(TopicError::InvalidCharacter);
     }
     let levels: Vec<&str> = filter.split('/').collect();
     let last = levels.len() - 1;
@@ -32,9 +38,10 @@ pub fn validate_topic_filter(filter: &str) -> Result<(), TopicError> {
     Ok(())
 }
 
-/// A topic name used in PUBLISH must be non-empty and free of wildcards (§4.7.3).
+/// A topic name used in PUBLISH must be non-empty and free of wildcards (§4.7.3) and of
+/// U+0000 (§1.5.4).
 pub fn is_valid_topic_name(topic: &str) -> bool {
-    !topic.is_empty() && !topic.contains(['+', '#'])
+    !topic.is_empty() && !topic.contains(['+', '#', '\0'])
 }
 
 pub fn has_wildcards(filter: &str) -> bool {
@@ -166,6 +173,13 @@ mod tests {
         ] {
             assert!(validate_topic_filter(ok).is_ok(), "{ok}");
         }
+    }
+
+    #[test]
+    fn nul_is_rejected_in_names_and_filters() {
+        assert_eq!(validate_topic_filter("a/\0"), Err(TopicError::InvalidCharacter));
+        assert!(!is_valid_topic_name("\0A"));
+        assert!(is_valid_topic_name("AB"));
     }
 
     #[test]

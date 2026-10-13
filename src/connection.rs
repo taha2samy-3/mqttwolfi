@@ -14,7 +14,7 @@ use crate::protocol::{
 use crate::queue::Outbound;
 use crate::routing::topic::has_wildcards;
 use crate::routing::{is_valid_topic_name, parse_shared_subscription, validate_topic_filter};
-use crate::session::{InflightOut, Session, Transport};
+use crate::session::{InflightOut, PubRecOutcome, Session, Transport};
 use bytes::{Bytes, BytesMut};
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
@@ -233,7 +233,10 @@ where
         session_present
     );
 
-    let client_receive_max = connect.properties.receive_maximum().unwrap_or(u16::MAX) as usize;
+    // Outbound flow control: the client's Receive Maximum, capped by the broker's own inflight
+    // limit (v3.1.1 clients announce nothing, so the broker limit applies).
+    let client_receive_max = (connect.properties.receive_maximum().unwrap_or(u16::MAX) as usize)
+        .min(ctx.options.max_inflight_messages);
     let client_max_packet = connect
         .properties
         .maximum_packet_size()
@@ -259,7 +262,7 @@ where
         ctx: &ctx,
         session: &session,
         version,
-        user,
+        user: Arc::clone(&user),
         will: connect.will.clone(),
         connect_expiry: expiry,
         topic_aliases: HashMap::new(),
@@ -327,7 +330,7 @@ where
         writer.abort();
     }
     let will = if exit.publishes_will() {
-        conn.will.take()
+        conn.will.take().map(|w| (w, user))
     } else {
         None
     };
@@ -534,11 +537,7 @@ impl Conn<'_> {
         match pkt {
             MqttPacket::Publish(p) => self.on_publish(p),
             MqttPacket::PubAck { packet_id, .. } => {
-                let mut st = self.session.state();
-                if matches!(st.inflight.get(&packet_id), Some(InflightOut::Publish(p)) if p.qos == QoS::AtLeastOnce)
-                {
-                    st.inflight.remove(&packet_id);
-                    drop(st);
+                if self.session.state().complete_qos1(packet_id) {
                     self.session.queue.wake();
                 }
                 None
@@ -547,24 +546,20 @@ impl Conn<'_> {
                 packet_id,
                 reason_code,
             } => {
-                let mut st = self.session.state();
-                let known = matches!(st.inflight.get(&packet_id), Some(InflightOut::Publish(p)) if p.qos == QoS::ExactlyOnce)
-                    || matches!(st.inflight.get(&packet_id), Some(InflightOut::PubRel));
-                if known && reason_code >= 0x80 {
+                let outcome = self.session.state().pubrec(packet_id, reason_code >= 0x80);
+                let code = match outcome {
                     // The receiver refused the message; the QoS 2 flow ends here (§4.3.3).
-                    st.inflight.remove(&packet_id);
-                    drop(st);
-                    self.session.queue.wake();
-                    return None;
-                }
-                if known {
-                    st.inflight.insert(packet_id, InflightOut::PubRel);
-                }
-                drop(st);
-                let code = if known || !self.v5() {
-                    reason::SUCCESS
-                } else {
-                    reason::PACKET_IDENTIFIER_NOT_FOUND
+                    PubRecOutcome::Ended => {
+                        self.session.queue.wake();
+                        return None;
+                    }
+                    PubRecOutcome::Release => {
+                        // The payload is no longer held, so byte-based flow control can resume.
+                        self.session.queue.wake();
+                        reason::SUCCESS
+                    }
+                    PubRecOutcome::Unknown if self.v5() => reason::PACKET_IDENTIFIER_NOT_FOUND,
+                    PubRecOutcome::Unknown => reason::SUCCESS,
                 };
                 self.send(MqttPacket::PubRel {
                     packet_id,
@@ -572,10 +567,7 @@ impl Conn<'_> {
                 })
             }
             MqttPacket::PubComp { packet_id, .. } => {
-                let mut st = self.session.state();
-                if matches!(st.inflight.get(&packet_id), Some(InflightOut::PubRel)) {
-                    st.inflight.remove(&packet_id);
-                    drop(st);
+                if self.session.state().complete_qos2(packet_id) {
                     self.session.queue.wake();
                 }
                 None
@@ -859,12 +851,7 @@ async fn run_writer<W>(
     out.extend_from_slice(&connack);
     if params.resend_inflight {
         // §4.4: resend unacknowledged PUBLISH (DUP = 1) and PUBREL with their original ids.
-        let pending: Vec<(u16, InflightOut)> = session
-            .state()
-            .inflight
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
+        let pending = session.state().resend_list();
         for (pid, item) in pending {
             let pkt = match item {
                 InflightOut::Publish(mut p) => {
@@ -880,8 +867,14 @@ async fn run_writer<W>(
         return;
     }
 
+    // Flow control: bounded by message count (Receive Maximum / broker limit) and by the bytes
+    // held for retransmission, so unacknowledged messages cannot exceed the queue budget.
     let recv_max = params.client_receive_max.max(1);
-    let can_publish = || session.state().inflight_count() < recv_max;
+    let max_bytes = ctx.options.queue_limits.max_bytes;
+    let can_publish = || {
+        let st = session.state();
+        st.inflight_count() < recv_max && st.inflight_bytes() < max_bytes
+    };
     loop {
         let item = tokio::select! {
             biased;
@@ -964,7 +957,7 @@ fn encode_outbound(
         // §3.1.2.11.4: a packet larger than the client's maximum is discarded.
         out.truncate(start);
         if let Some(pid) = packet_id {
-            session.state().inflight.remove(&pid);
+            session.state().forget(pid);
         }
         ctx.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
         return;

@@ -13,7 +13,7 @@ use crate::routing::topic::has_wildcards;
 use crate::routing::{is_valid_topic_name, Subscription};
 use crate::session::{Session, Transport};
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -56,8 +56,10 @@ enum InflightKind {
         topic_id: u16,
         then: Box<Delivery>,
     },
+    /// PUBLISH sent; the delivery is kept so it can be re-queued if the link is lost.
     Publish {
         qos: i8,
+        delivery: Box<Delivery>,
     },
     PubRel,
 }
@@ -119,6 +121,8 @@ struct SnLink {
     key: LinkKey,
     session: Arc<Session>,
     epoch: u64,
+    /// ACL identity the client connected with (owner of its Will).
+    owner: Arc<UserAccount>,
     closed: AtomicBool,
     wake: Notify,
     st: Mutex<LinkState>,
@@ -142,6 +146,8 @@ struct Gateway {
     predef_by_id: HashMap<u16, String>,
     predef_by_name: HashMap<String, u16>,
     links: Mutex<HashMap<LinkKey, Arc<SnLink>>>,
+    /// Clients whose CONNECT is being processed (it may wait for a session takeover).
+    connecting: Mutex<HashSet<LinkKey>>,
 }
 
 pub struct MqttSnServer {
@@ -184,6 +190,7 @@ impl MqttSnServer {
                 predef_by_id,
                 predef_by_name,
                 links: Mutex::new(HashMap::new()),
+                connecting: Mutex::new(HashSet::new()),
             }),
         })
     }
@@ -324,6 +331,7 @@ impl Gateway {
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         let mut shutdown = self.ctx.shutdown_signal();
         let retry_after = Duration::from_secs(self.config.retry_interval_sec.max(1));
+        let max_idle = Duration::from_secs(self.config.max_idle_sec.max(1));
         loop {
             tokio::select! {
                 _ = tick.tick() => {}
@@ -345,6 +353,8 @@ impl Gateway {
                         Mode::Active if st.keep_alive > 0 => {
                             Some(Duration::from_millis(st.keep_alive as u64 * 1500))
                         }
+                        // Keep-alive 0 would let dead UDP clients hold a session forever.
+                        Mode::Active => Some(max_idle),
                         Mode::Asleep { duration } | Mode::Awake { duration } if duration > 0 => {
                             Some(Duration::from_millis(duration as u64 * 1500))
                         }
@@ -397,15 +407,26 @@ impl Gateway {
                 links.remove(&link.key);
             }
         }
-        let (will, release) = {
+        let (will, release, unacked) = {
             let mut st = link.st();
-            (st.will.take(), st.release.take())
+            let unacked = match st.inflight.take().map(|i| i.kind) {
+                Some(InflightKind::Publish { delivery, .. }) => Some(delivery),
+                Some(InflightKind::Register { then, .. }) => Some(then),
+                Some(InflightKind::PubRel) | None => None,
+            };
+            (st.will.take(), st.release.take(), unacked)
         };
-        self.ctx.connection_closed(
-            &link.session,
-            link.epoch,
-            if abnormal { will } else { None },
-        );
+        // The unacknowledged message stays with the session for its next connection (QoS 1/2
+        // guarantee); it disappears with the session if the session does not persist.
+        if let Some(d) = unacked {
+            link.session.queue.push_front_publish(*d);
+        }
+        let will = if abnormal {
+            will.map(|w| (w, Arc::clone(&link.owner)))
+        } else {
+            None
+        };
+        self.ctx.connection_closed(&link.session, link.epoch, will);
         drop(release);
         link.wake.notify_one();
         link.session.queue.wake();
@@ -449,8 +470,26 @@ impl Gateway {
                 duration,
                 client_id,
             } => {
-                self.on_connect(key, link, will, clean_session, duration, client_id)
-                    .await
+                // Opening a session can wait for another connection to release it, so CONNECT
+                // runs in its own task instead of stalling every other client of the gateway.
+                let first = self
+                    .connecting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key.clone());
+                if !first {
+                    debug!("Duplicate MQTT-SN CONNECT from {} ignored", key.addr);
+                    return;
+                }
+                let gw = Arc::clone(self);
+                tokio::spawn(async move {
+                    gw.on_connect(key.clone(), link, will, clean_session, duration, client_id)
+                        .await;
+                    gw.connecting
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&key);
+                });
             }
             SnPacket::WillTopic {
                 qos,
@@ -617,7 +656,7 @@ impl Gateway {
                             if i.msg_id == msg_id
                                 && matches!(
                                     i.kind,
-                                    InflightKind::Publish { qos: 2 } | InflightKind::PubRel
+                                    InflightKind::Publish { qos: 2, .. } | InflightKind::PubRel
                                 ) =>
                         {
                             i.kind = InflightKind::PubRel;
@@ -800,7 +839,13 @@ impl Gateway {
         let expiry = self.ctx.session_expiry_for(None, clean_session, false);
         let opened = match self
             .ctx
-            .open_session(&client_id, user, clean_session, expiry, Transport::MqttSn)
+            .open_session(
+                &client_id,
+                Arc::clone(&user),
+                clean_session,
+                expiry,
+                Transport::MqttSn,
+            )
             .await
         {
             Ok(o) => o,
@@ -814,6 +859,7 @@ impl Gateway {
             key: key.clone(),
             session: Arc::clone(&opened.session),
             epoch: opened.epoch,
+            owner: user,
             closed: AtomicBool::new(false),
             wake: Notify::new(),
             st: Mutex::new(LinkState {
@@ -1167,6 +1213,7 @@ impl Gateway {
         topic_id: u16,
     ) {
         let qos = d.publish.qos as i8;
+        let topic = d.publish.topic.clone();
         let packet = {
             let mut st = link.st();
             let msg_id = if qos > 0 { st.next_msg_id() } else { 0 };
@@ -1183,7 +1230,10 @@ impl Gateway {
                 st.inflight = Some(Inflight {
                     msg_id,
                     packet: packet.clone(),
-                    kind: InflightKind::Publish { qos },
+                    kind: InflightKind::Publish {
+                        qos,
+                        delivery: Box::new(d),
+                    },
                     sent_at: Instant::now(),
                     retries: 0,
                 });
@@ -1192,10 +1242,7 @@ impl Gateway {
         };
         let mut probe = BytesMut::new();
         if packet.encode(&mut probe).is_err() {
-            warn!(
-                "Message on '{}' too large for MQTT-SN; dropped",
-                d.publish.topic
-            );
+            warn!("Message on '{}' too large for MQTT-SN; dropped", topic);
             link.st().inflight = None;
             return;
         }

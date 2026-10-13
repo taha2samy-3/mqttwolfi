@@ -163,6 +163,8 @@ pub struct MqttSnListenerConfig {
     pub allow_qos_minus1: bool,
     /// Seconds before an unacknowledged QoS 1/2 message is retransmitted (Tretry, §6.13).
     pub retry_interval_sec: u64,
+    /// Idle time after which a client that connected with keep-alive 0 is dropped.
+    pub max_idle_sec: u64,
     /// Retransmissions before the client is considered lost (Nretry, §6.13).
     pub max_retries: u8,
     pub predefined_topics: HashMap<String, String>,
@@ -181,6 +183,7 @@ impl Default for MqttSnListenerConfig {
             max_sessions: 10_000,
             allow_qos_minus1: true,
             retry_interval_sec: 10,
+            max_idle_sec: 3600,
             max_retries: 3,
             predefined_topics: HashMap::new(),
         }
@@ -311,6 +314,9 @@ pub struct QueueSettings {
     pub max_queued_bytes: usize,
     /// "drop_oldest" or "drop_newest".
     pub queue_full_policy: String,
+    /// Unacknowledged outbound QoS 1/2 messages per session (also capped by the client's
+    /// Receive Maximum and, in bytes, by `max_queued_bytes`).
+    pub max_inflight_messages: u16,
     /// Messages without a Message Expiry Interval are dropped after waiting this long in a
     /// session queue (0 = never).
     pub default_message_expiry_sec: u32,
@@ -325,6 +331,7 @@ impl Default for QueueSettings {
             max_queued_messages: 5000,
             max_queued_bytes: 8_388_608,
             queue_full_policy: "drop_oldest".into(),
+            max_inflight_messages: 32,
             default_message_expiry_sec: 0,
             max_session_expiry_sec: 86_400,
         }
@@ -528,6 +535,9 @@ impl AppConfig {
         if q.max_queued_messages == 0 {
             return invalid("max_queued_messages must be at least 1".into());
         }
+        if q.max_inflight_messages == 0 {
+            return invalid("max_inflight_messages must be at least 1".into());
+        }
         if (p.max_packet_size as usize) > q.max_queued_bytes {
             return invalid(format!(
                 "max_packet_size ({} bytes) cannot exceed per-session max_queued_bytes ({} bytes)",
@@ -701,6 +711,7 @@ mod tests {
             |c| c.mqtt.protocol.max_packet_size = 10,
             |c| c.mqtt.protocol.maximum_qos = 3,
             |c| c.mqtt.protocol.receive_maximum = 0,
+            |c| c.mqtt.queues.max_inflight_messages = 0,
             |c| c.mqtt.queues.max_queued_bytes = 1024,
             |c| c.security.auth.client_id_takeover = "nobody".into(),
             |c| c.security.auth.password_hash_algorithm = "bcrypt".into(),

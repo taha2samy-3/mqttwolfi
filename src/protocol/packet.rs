@@ -1,4 +1,4 @@
-//! MQTT v3.1.1 and v5.0 control packet codec.
+b//! MQTT v3.1.1 and v5.0 control packet codec.
 //!
 //! Every packet is encoded and decoded for an explicit protocol version. MQTT v5.0 property
 //! blocks are always parsed and validated (never guessed from payload bytes), and malformed

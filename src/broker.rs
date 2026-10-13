@@ -6,7 +6,7 @@ use crate::config::AppConfig;
 use crate::protocol::{Properties, Property, PublishPacket, QoS, SubscriptionOptions};
 use crate::queue::{Delivery, PushResult, QueueLimits};
 use crate::routing::{RetainOutcome, RetainedStore, Router, SessionId, Subscription, TopicError};
-use crate::session::{Attachment, Session, Transport};
+use crate::session::{Attachment, PendingWill, Session, Transport};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -33,6 +33,8 @@ pub struct BrokerOptions {
     pub allow_retained_messages: bool,
     pub allow_shared_subscriptions: bool,
     pub queue_limits: QueueLimits,
+    /// Server-side cap on unacknowledged outbound QoS 1/2 messages per session.
+    pub max_inflight_messages: usize,
     pub default_message_expiry: Option<Duration>,
     pub max_session_expiry_sec: u32,
     pub client_id_takeover_any: bool,
@@ -72,6 +74,7 @@ impl From<&AppConfig> for BrokerOptions {
                 policy: q.policy(),
                 max_control: 4096,
             },
+            max_inflight_messages: q.max_inflight_messages.max(1) as usize,
             default_message_expiry: (q.default_message_expiry_sec > 0)
                 .then(|| Duration::from_secs(q.default_message_expiry_sec as u64)),
             max_session_expiry_sec: q.max_session_expiry_sec,
@@ -309,8 +312,20 @@ impl BrokerContext {
                     // Another connection attached in the meantime; go around again.
                     continue;
                 }
+                // Only a persistent session (expiry > 0) of the same user can be resumed
+                // (MQTT-3.1.2-6 / §3.1.2.4); anything else starts fresh.
+                let resumable = |s: &Arc<Session>| {
+                    let st = s.state();
+                    !s.queue.is_closed()
+                        && st.expiry_interval > 0
+                        && st.user.username == user.username
+                };
                 let (session, present) = match existing {
-                    Some(s) if !clean_start && !s.queue.is_closed() => (s, true),
+                    Some(s) if !clean_start && resumable(&s) => {
+                        // Replies queued for the previous connection must not reach this one.
+                        s.queue.clear_control();
+                        (s, true)
+                    }
                     other => {
                         discarded = other;
                         let id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
@@ -360,55 +375,85 @@ impl BrokerContext {
         Err(OpenError::Busy)
     }
 
-    /// Called when a connection ends. `will` is the connection's Will Message if it must be
-    /// published (i.e. the connection did not end with a normal DISCONNECT).
+    /// Called when a connection ends. `will` is the connection's Will Message and the account
+    /// that set it, if it must be published (the connection did not end with a normal
+    /// DISCONNECT).
     pub fn connection_closed(
         &self,
         session: &Arc<Session>,
         epoch: u64,
-        will: Option<PublishPacket>,
+        will: Option<(PublishPacket, Arc<UserAccount>)>,
     ) {
         let now = Instant::now();
-        let will_delay = |w: &PublishPacket| w.properties.will_delay_interval().unwrap_or(0);
         let mut st = session.state();
-        if st.current_epoch() != Some(epoch) {
-            // Taken over by a newer connection: the session continues, so only an undelayed
-            // Will is published (§3.1.3.2.2).
-            drop(st);
-            if let Some(w) = will.filter(|w| will_delay(w) == 0) {
-                self.publish_will(session, w);
-            }
-            return;
+        let taken_over = st.current_epoch() != Some(epoch);
+        if !taken_over {
+            st.attachment = None;
+            st.disconnected_at = Some(now);
+            // Cleared under the state lock so a resuming connection cannot interleave.
+            session.queue.clear_control();
         }
-        st.attachment = None;
-        st.disconnected_at = Some(now);
         let expiry = st.expiry_interval;
         let mut publish_now = None;
-        if let Some(w) = will {
-            let delay = will_delay(&w).min(expiry);
-            if delay == 0 {
-                publish_now = Some(w);
-            } else {
-                st.pending_will = Some((w, now + Duration::from_secs(delay as u64)));
+        if let Some((w, owner)) = will {
+            let delay = w.properties.will_delay_interval().unwrap_or(0).min(expiry);
+            if delay == 0 || session.queue.is_closed() {
+                // No delay, or the session already ended (taken over with a clean start).
+                publish_now = Some((w, owner));
+            } else if st.attachment.is_none() {
+                st.pending_will = Some(PendingWill {
+                    message: w,
+                    owner,
+                    due: now + Duration::from_secs(delay as u64),
+                });
             }
+            // Otherwise a new connection already resumed the session within the Will Delay
+            // Interval, which cancels the Will (§3.1.3.2.2).
         }
         drop(st);
-        session.queue.clear_control();
-        if let Some(w) = publish_now {
-            self.publish_will(session, w);
+        if let Some((w, owner)) = publish_now {
+            self.publish_will(&session.client_id, &owner, w);
         }
-        if expiry == 0 {
-            self.discard_session(session);
-        } else {
-            debug!(
-                "Session '{}' kept for {}s after disconnect",
-                session.client_id, expiry
-            );
+        if !taken_over {
+            if expiry == 0 {
+                self.discard_if_expired(session, now);
+            } else {
+                debug!(
+                    "Session '{}' kept for {}s after disconnect",
+                    session.client_id, expiry
+                );
+            }
         }
     }
 
-    /// Ends a session: removes its subscriptions, drops queued messages and publishes a Will
-    /// that was still waiting for its delay.
+    /// Discards a session whose connection is gone and whose expiry interval has elapsed. The
+    /// check and the removal of the ClientID mapping happen under the ClientID lock, so a
+    /// connection resuming the session at the same moment cannot lose it.
+    fn discard_if_expired(&self, session: &Arc<Session>, now: Instant) -> bool {
+        let pending = {
+            let mut ids = lock(&self.client_ids);
+            let mut st = session.state();
+            let expired = st.attachment.is_none()
+                && st
+                    .disconnected_at
+                    .is_some_and(|t| now >= t + Duration::from_secs(st.expiry_interval as u64));
+            if !expired {
+                return false;
+            }
+            if ids.get(&session.client_id) == Some(&session.id) {
+                ids.remove(&session.client_id);
+            }
+            st.pending_will.take()
+        };
+        self.remove_session(session);
+        if let Some(pw) = pending {
+            self.publish_will(&session.client_id, &pw.owner, pw.message);
+        }
+        true
+    }
+
+    /// Ends a session unconditionally (it was replaced by a clean start): removes its
+    /// subscriptions, drops queued messages and publishes a Will still waiting for its delay.
     pub fn discard_session(&self, session: &Arc<Session>) {
         {
             let mut ids = lock(&self.client_ids);
@@ -416,31 +461,28 @@ impl BrokerContext {
                 ids.remove(&session.client_id);
             }
         }
-        write(&self.sessions).remove(&session.id);
-        write(&self.router).remove_session(session.id);
-        session.queue.close();
+        self.remove_session(session);
         let pending = session.state().pending_will.take();
-        if let Some((w, _)) = pending {
-            self.publish_will(session, w);
+        if let Some(pw) = pending {
+            self.publish_will(&session.client_id, &pw.owner, pw.message);
         }
     }
 
-    fn publish_will(&self, session: &Arc<Session>, mut will: PublishPacket) {
-        let user = session.user();
-        if !self
-            .acl
-            .check_publish(&user, &session.client_id, &will.topic)
-        {
+    fn remove_session(&self, session: &Arc<Session>) {
+        write(&self.sessions).remove(&session.id);
+        write(&self.router).remove_session(session.id);
+        session.queue.close();
+    }
+
+    fn publish_will(&self, client_id: &str, owner: &UserAccount, mut will: PublishPacket) {
+        if !self.acl.check_publish(owner, client_id, &will.topic) {
             warn!(
                 "Will of '{}' on '{}' not published: not authorized",
-                session.client_id, will.topic
+                client_id, will.topic
             );
             return;
         }
-        info!(
-            "Publishing Will of '{}' on '{}'",
-            session.client_id, will.topic
-        );
+        info!("Publishing Will of '{}' on '{}'", client_id, will.topic);
         will.properties
             .retain(|p| !matches!(p, Property::WillDelayInterval(_)));
         will.packet_id = None;
@@ -555,8 +597,17 @@ impl BrokerContext {
                 Property::TopicAlias(_) | Property::SubscriptionIdentifier(_)
             )
         });
-        let count = targets.len();
+        let mut count = 0;
         for (session, target) in targets {
+            // Re-check read access at delivery time: covers ACL reloads and sessions whose
+            // subscriptions predate a rule change.
+            if !self
+                .acl
+                .check_read(&session.user(), &session.client_id, &base.topic)
+            {
+                continue;
+            }
+            count += 1;
             let mut p = base.clone();
             p.qos = p.qos.min(target.qos);
             p.retain = p.retain && target.retain_as_published;
@@ -595,25 +646,21 @@ impl BrokerContext {
     pub fn housekeeping(&self, now: Instant) {
         let sessions: Vec<Arc<Session>> = read(&self.sessions).values().cloned().collect();
         for s in sessions {
-            let (expired, due_will) = {
+            let due_will = {
                 let mut st = s.state();
-                let expired = st.attachment.is_none()
-                    && st
-                        .disconnected_at
-                        .is_some_and(|t| now >= t + Duration::from_secs(st.expiry_interval as u64));
-                let due = if st.pending_will.as_ref().is_some_and(|(_, at)| *at <= now) {
-                    st.pending_will.take().map(|(w, _)| w)
+                let due = st.attachment.is_none()
+                    && st.pending_will.as_ref().is_some_and(|pw| pw.due <= now);
+                if due {
+                    st.pending_will.take()
                 } else {
                     None
-                };
-                (expired, due)
+                }
             };
-            if let Some(w) = due_will {
-                self.publish_will(&s, w);
+            if let Some(pw) = due_will {
+                self.publish_will(&s.client_id, &pw.owner, pw.message);
             }
-            if expired {
+            if self.discard_if_expired(&s, now) {
                 info!("Session '{}' expired", s.client_id);
-                self.discard_session(&s);
             }
         }
         lock(&self.retained).purge_expired(now);
