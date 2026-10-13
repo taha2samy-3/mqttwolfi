@@ -899,4 +899,3 @@ async fn test_mqtt_sn_qos2_retransmission_deduplication() {
     let pubcomp = recv_sn_packet(&pub_sock).await;
     assert_eq!(pubcomp, SnPacket::PubComp { msg_id: 555 });
 }
-

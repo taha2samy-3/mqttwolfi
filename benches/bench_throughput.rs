@@ -5,11 +5,11 @@ use std::thread;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use wolf_mqtt::protocol::sn::{SnPacket, TopicIdType};
 use wolf_mqtt::protocol::{
     decode_variable_byte_integer, encode_variable_byte_integer, ConnectPacket, MqttPacket,
     ProtocolVersion, PublishPacket, QoS,
 };
-use wolf_mqtt::protocol::sn::{SnPacket, TopicIdType};
 use wolf_mqtt::routing::retained::RetainedStore;
 use wolf_mqtt::routing::TopicTrie;
 use wolf_mqtt::server::BrokerServer;

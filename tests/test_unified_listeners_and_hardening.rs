@@ -668,18 +668,17 @@ async fn test_tcp_subscriber_qos2_full_handshake() {
     let (sub_pid, sub_payload) = match sub_pub {
         MqttPacket::Publish(p) => {
             assert_eq!(p.qos, QoS::ExactlyOnce);
-            (p.packet_id.expect("QoS 2 publish must have packet_id"), p.payload)
+            (
+                p.packet_id.expect("QoS 2 publish must have packet_id"),
+                p.payload,
+            )
         }
         other => panic!("Expected Publish, got: {:?}", other),
     };
     assert_eq!(&sub_payload[..], b"WIRE_TRANSFER_$50000");
 
     // 4. Subscriber responds with PUBREC (Step 2 of outbound delivery)
-    send_packet(
-        &mut sub_stream,
-        MqttPacket::PubRec { packet_id: sub_pid },
-    )
-    .await;
+    send_packet(&mut sub_stream, MqttPacket::PubRec { packet_id: sub_pid }).await;
 
     // 5. Broker replies with PUBREL (Step 3 of outbound delivery)
     assert_eq!(
@@ -688,10 +687,5 @@ async fn test_tcp_subscriber_qos2_full_handshake() {
     );
 
     // 6. Subscriber concludes with PUBCOMP (Step 4 of outbound delivery)
-    send_packet(
-        &mut sub_stream,
-        MqttPacket::PubComp { packet_id: sub_pid },
-    )
-    .await;
+    send_packet(&mut sub_stream, MqttPacket::PubComp { packet_id: sub_pid }).await;
 }
-
