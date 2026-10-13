@@ -554,7 +554,6 @@ impl SnPacket {
                     payload,
                 }
             }
-            _ => return Err(SnError::UnknownMsgType(msg_type_raw)),
         };
 
         src.advance(total_len);
