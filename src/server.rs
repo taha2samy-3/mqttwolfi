@@ -216,10 +216,15 @@ impl BrokerServer {
         let (mut read_half, mut write_half) = tokio::io::split(stream);
         let (tx, mut rx) = mpsc::channel::<Bytes>(CLIENT_CHANNEL_CAPACITY);
 
-        // Register client sender in the active clients map
+        // Register client sender and disconnect signal in the active context
+        let (disconnect_tx, mut disconnect_rx) = oneshot::channel::<()>();
         {
             let mut clients_guard = context.clients.write().await;
             clients_guard.insert(client_id, tx.clone());
+        }
+        {
+            let mut dc_guard = context.client_disconnect_tx.write().await;
+            dc_guard.insert(client_id, disconnect_tx);
         }
 
         // Background task to flush outbound messages from channel to TCP stream
@@ -240,32 +245,55 @@ impl BrokerServer {
         let mut connected_client_id: String = String::new();
         let mut is_connected = false;
         let mut client_keep_alive: u16 = 60;
+        let mut client_protocol_version = ProtocolVersion::V4;
         let mut inflight_qos2_pids: std::collections::HashSet<u16> =
             std::collections::HashSet::new();
         let next_outbound_pid = Arc::new(AtomicU16::new(1));
 
         'connection: loop {
-            let keep_alive_duration = if is_connected && client_keep_alive > 0 {
-                std::time::Duration::from_millis((client_keep_alive as u64) * 1500)
+            let keep_alive_duration = if !is_connected {
+                Some(std::time::Duration::from_secs(60)) // initial connect timeout
+            } else if client_keep_alive > 0 {
+                Some(std::time::Duration::from_millis((client_keep_alive as u64) * 1500))
             } else {
-                std::time::Duration::from_secs(60) // initial connect timeout
+                // OASIS MQTT v3.1.1 §3.1.2.10: Keep Alive of 0 disables inactivity timeout
+                None
             };
 
-            let read_result =
-                tokio::time::timeout(keep_alive_duration, read_half.read_buf(&mut read_buf)).await;
+            let read_future = async {
+                if let Some(duration) = keep_alive_duration {
+                    match tokio::time::timeout(duration, read_half.read_buf(&mut read_buf)).await {
+                        Ok(res) => res,
+                        Err(_) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "keep-alive timeout exceeded",
+                        )),
+                    }
+                } else {
+                    read_half.read_buf(&mut read_buf).await
+                }
+            };
 
-            let bytes_read = match read_result {
-                Ok(Ok(0)) => break 'connection, // EOF
-                Ok(Ok(n)) => n,
-                Ok(Err(e)) => {
-                    warn!("Client #{} I/O error: {}", client_id, e);
+            let read_result = tokio::select! {
+                _ = &mut disconnect_rx => {
+                    debug!("Client #{} disconnected due to newer session takeover", client_id);
                     break 'connection;
                 }
-                Err(_) => {
+                res = read_future => res,
+            };
+
+            let bytes_read = match read_result {
+                Ok(0) => break 'connection, // EOF
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     warn!(
                         "Client #{} keep-alive timeout exceeded ({}s)",
                         client_id, client_keep_alive
                     );
+                    break 'connection;
+                }
+                Err(e) => {
+                    warn!("Client #{} I/O error: {}", client_id, e);
                     break 'connection;
                 }
             };
@@ -275,13 +303,14 @@ impl BrokerServer {
             // Process all complete MQTT packets in buffer
             while !read_buf.is_empty() {
                 let mut slice = &read_buf[..];
-                match MqttPacket::decode(&mut slice) {
+                match MqttPacket::decode_with_version(&mut slice, client_protocol_version) {
                     Ok(packet) => {
                         let consumed = read_buf.len() - slice.len();
                         read_buf.advance(consumed);
 
                         match packet {
                             MqttPacket::Connect(conn) => {
+                                client_protocol_version = conn.version;
                                 if is_connected {
                                     warn!(
                                         "Client #{} sent second CONNECT; disconnecting (protocol violation)",
@@ -298,7 +327,7 @@ impl BrokerServer {
                                     };
                                     let mut ack_buf = BytesMut::new();
                                     if connack
-                                        .encode_for_version(&mut ack_buf, conn.version)
+                                        .encode_for_version(&mut ack_buf, client_protocol_version)
                                         .is_ok()
                                     {
                                         let _ = tx.send(ack_buf.freeze()).await;
@@ -323,24 +352,80 @@ impl BrokerServer {
                                         is_connected = true;
                                         connected_client_id = conn.client_id.clone();
                                         client_keep_alive = conn.keep_alive_sec;
-                                        current_user = Some(user);
+                                        current_user = Some(user.clone());
                                         client_will = conn.will;
 
-                                        // Duplicate Client ID handling (disconnect old session)
+                                        // Duplicate Client ID handling (prevent takeover by different user & actively close old socket)
                                         if !connected_client_id.is_empty() {
-                                            let mut sessions_guard =
-                                                context.client_sessions.write().await;
-                                            if let Some(old_id) = sessions_guard
-                                                .insert(connected_client_id.clone(), client_id)
-                                            {
-                                                if old_id != client_id {
-                                                    warn!(
-                                                        "Client ID '{}' reconnected; disconnecting old session #{}",
-                                                        connected_client_id, old_id
+                                            let (allowed, old_id_opt) = {
+                                                let mut sessions_guard =
+                                                    context.client_sessions.write().await;
+                                                if let Some((existing_id, existing_user)) =
+                                                    sessions_guard.get(&connected_client_id)
+                                                {
+                                                    if *existing_id != client_id {
+                                                        if *existing_user != user.username {
+                                                            warn!(
+                                                                "Client ID '{}' takeover rejected: owned by '{}', attempted by '{}'",
+                                                                connected_client_id, existing_user, user.username
+                                                            );
+                                                            (false, None)
+                                                        } else {
+                                                            let old_id = *existing_id;
+                                                            sessions_guard.insert(
+                                                                connected_client_id.clone(),
+                                                                (client_id, user.username.clone()),
+                                                            );
+                                                            (true, Some(old_id))
+                                                        }
+                                                    } else {
+                                                        (true, None)
+                                                    }
+                                                } else {
+                                                    sessions_guard.insert(
+                                                        connected_client_id.clone(),
+                                                        (client_id, user.username.clone()),
                                                     );
+                                                    (true, None)
+                                                }
+                                            };
+
+                                            if !allowed {
+                                                let reason_code = if client_protocol_version == ProtocolVersion::V500 {
+                                                    0x85 // Client Identifier not valid
+                                                } else {
+                                                    0x02
+                                                };
+                                                let connack = MqttPacket::ConnAck {
+                                                    session_present: false,
+                                                    reason_code,
+                                                };
+                                                let mut ack_buf = BytesMut::new();
+                                                if connack
+                                                    .encode_for_version(&mut ack_buf, client_protocol_version)
+                                                    .is_ok()
+                                                {
+                                                    let _ = tx.send(ack_buf.freeze()).await;
+                                                }
+                                                break 'connection;
+                                            }
+
+                                            if let Some(old_id) = old_id_opt {
+                                                warn!(
+                                                    "Client ID '{}' reconnected by owner '{}'; disconnecting old session #{}",
+                                                    connected_client_id, user.username, old_id
+                                                );
+                                                {
                                                     let mut clients_guard =
                                                         context.clients.write().await;
                                                     clients_guard.remove(&old_id);
+                                                }
+                                                {
+                                                    let mut dc_guard =
+                                                        context.client_disconnect_tx.write().await;
+                                                    if let Some(dc_tx) = dc_guard.remove(&old_id) {
+                                                        let _ = dc_tx.send(());
+                                                    }
                                                 }
                                             }
                                         }
@@ -351,7 +436,7 @@ impl BrokerServer {
                                         };
                                         let mut ack_buf = BytesMut::new();
                                         if connack
-                                            .encode_for_version(&mut ack_buf, conn.version)
+                                            .encode_for_version(&mut ack_buf, client_protocol_version)
                                             .is_ok()
                                         {
                                             let _ = tx.send(ack_buf.freeze()).await;
@@ -375,7 +460,7 @@ impl BrokerServer {
                                         };
                                         let mut ack_buf = BytesMut::new();
                                         if connack
-                                            .encode_for_version(&mut ack_buf, conn.version)
+                                            .encode_for_version(&mut ack_buf, client_protocol_version)
                                             .is_ok()
                                         {
                                             let _ = tx.send(ack_buf.freeze()).await;
