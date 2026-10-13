@@ -1426,4 +1426,119 @@ mod tests {
             MqttPacket::decode(&mut slice2).expect("MQTT 5 PUBACK decode must succeed");
         assert_eq!(decoded_puback, MqttPacket::PubAck { packet_id: 42 });
     }
+
+    #[test]
+    fn test_mqtt5_subscribe_and_suback_with_properties() {
+        // Raw MQTT 5 SUBSCRIBE frame:
+        // Fixed header: 0x82, Remaining length = 18
+        // Packet ID: 0x00, 0x05 (5)
+        // Property Length: 0x03 (User Property: 0x26, string key/val etc., or simple prop)
+        // Properties: 3 dummy bytes
+        // Topic: "sensors/data" (len 12)
+        // Subscription options byte: 0x01 (QoS 1)
+        let mut raw = BytesMut::new();
+        raw.put_u8(0x82);
+
+        let mut payload = BytesMut::new();
+        payload.put_u16(5); // Packet ID = 5
+        payload.put_u8(2); // Property length = 2
+        payload.put_slice(&[0x11, 0x00]); // Dummy property bytes
+        payload.put_u16(12);
+        payload.put_slice(b"sensors/data");
+        payload.put_u8(0x01); // QoS 1
+
+        encode_variable_byte_integer(payload.len() as u32, &mut raw).unwrap();
+        raw.put(payload);
+
+        let mut slice = &raw[..];
+        let decoded = MqttPacket::decode_with_version(&mut slice, ProtocolVersion::V500)
+            .expect("MQTT 5 SUBSCRIBE with properties must decode");
+        assert_eq!(
+            decoded,
+            MqttPacket::Subscribe {
+                packet_id: 5,
+                topics: vec![("sensors/data".into(), QoS::AtLeastOnce)],
+            }
+        );
+
+        // Test MQTT 5 SUBACK encoding
+        let suback = MqttPacket::SubAck {
+            packet_id: 5,
+            return_codes: vec![0x01], // Granted QoS 1
+        };
+        let mut suback_buf = BytesMut::new();
+        suback
+            .encode_for_version(&mut suback_buf, ProtocolVersion::V500)
+            .unwrap();
+        // Fixed header: 0x90, Remaining length: 4 (packet_id 2 + props_len 1 + return_code 1)
+        assert_eq!(&suback_buf[..], &[0x90, 0x04, 0x00, 0x05, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn test_mqtt5_publish_with_properties_preserves_payload() {
+        // Raw MQTT 5 PUBLISH:
+        // Topic: "device/status" (13 bytes)
+        // Packet ID: 12 (2 bytes)
+        // Properties: length 5 (0x05 + 5 bytes)
+        // Payload: "ONLINE_V5" (9 bytes)
+        let mut raw = BytesMut::new();
+        raw.put_u8(0x32); // Publish QoS 1
+
+        let mut var_header = BytesMut::new();
+        var_header.put_u16(13);
+        var_header.put_slice(b"device/status");
+        var_header.put_u16(12); // Packet ID
+        var_header.put_u8(5); // Property length = 5
+        var_header.put_slice(&[0x02, 0x00, 0x00, 0x00, 0x3C]); // Message expiry interval prop
+        var_header.put_slice(b"ONLINE_V5"); // Actual payload
+
+        encode_variable_byte_integer(var_header.len() as u32, &mut raw).unwrap();
+        raw.put(var_header);
+
+        let mut slice = &raw[..];
+        let decoded = MqttPacket::decode_with_version(&mut slice, ProtocolVersion::V500)
+            .expect("MQTT 5 PUBLISH decode must succeed");
+        if let MqttPacket::Publish(p) = decoded {
+            assert_eq!(p.topic, "device/status");
+            assert_eq!(p.qos, QoS::AtLeastOnce);
+            assert_eq!(p.packet_id, Some(12));
+            assert_eq!(&p.payload[..], b"ONLINE_V5"); // Crucial: payload MUST NOT be polluted by properties!
+        } else {
+            panic!("Expected Publish packet");
+        }
+    }
+
+    #[test]
+    fn test_mqtt5_unsubscribe_and_unsuback() {
+        let mut raw = BytesMut::new();
+        raw.put_u8(0xA2); // Unsubscribe fixed header
+
+        let mut payload = BytesMut::new();
+        payload.put_u16(77); // Packet ID = 77
+        payload.put_u8(0); // 0 Properties
+        payload.put_u16(4);
+        payload.put_slice(b"test");
+
+        encode_variable_byte_integer(payload.len() as u32, &mut raw).unwrap();
+        raw.put(payload);
+
+        let mut slice = &raw[..];
+        let decoded = MqttPacket::decode_with_version(&mut slice, ProtocolVersion::V500)
+            .expect("MQTT 5 UNSUBSCRIBE decode must succeed");
+        assert_eq!(
+            decoded,
+            MqttPacket::Unsubscribe {
+                packet_id: 77,
+                topics: vec!["test".into()],
+            }
+        );
+
+        let unsuback = MqttPacket::UnsubAck { packet_id: 77 };
+        let mut ack_buf = BytesMut::new();
+        unsuback
+            .encode_for_version(&mut ack_buf, ProtocolVersion::V500)
+            .unwrap();
+        // Fixed header: 0xB0, Remaining length: 4 (packet_id 2 + props_len 1 + reason_code 1)
+        assert_eq!(&ack_buf[..], &[0xB0, 0x04, 0x00, 0x4D, 0x00, 0x00]);
+    }
 }
