@@ -70,8 +70,10 @@ impl AclRule {
     /// Evaluates if an MQTT topic matches this rule pattern.
     /// Supports `%u` (username), `%c` (client_id), `%r` (room_id), and MQTT wildcards (`+`, `#`).
     pub fn matches_topic(&self, user: &UserAccount, client_id: &str, topic: &str) -> bool {
-        // Sanitize client_id to prevent wildcard injection (e.g., client_id = "+" or "#" or contains "/")
-        if client_id.contains('+') || client_id.contains('#') || client_id.contains('/') {
+        // Sanitize client_id to prevent wildcard or path injection when %c is used in pattern
+        if self.pattern.contains("%c")
+            && (client_id.contains('+') || client_id.contains('#') || client_id.contains('/'))
+        {
             return false;
         }
 
