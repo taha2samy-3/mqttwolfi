@@ -83,13 +83,17 @@ jobs:
         run: cargo test --test test_e2e_network -- --nocapture
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # Job 3: FIPS-Ready Tests (only when FIPS bundle secret is available)
+  # Job 3: FIPS-Ready Tests (disabled by default - requires FIPS bundle)
+  # To enable: remove the `if: false` line below and ensure
+  # external/wolfssl-fips-bundle/ is present in the repository or
+  # restored from the WOLFSSL_FIPS_BUNDLE_B64 secret.
   # ─────────────────────────────────────────────────────────────────────────────
   test-fips:
     name: Tests - wolfSSL FIPS-Ready
     runs-on: ubuntu-latest
-    # Only run when the FIPS bundle secret is configured
-    if: ${{ secrets.WOLFSSL_FIPS_BUNDLE_B64 != '' }}
+    # Disabled: FIPS bundle (external/wolfssl-fips-bundle/) not included in repo.
+    # Remove this line once you have the FIPS bundle configured.
+    if: false
     steps:
       - name: Checkout Repository (with submodules)
         uses: actions/checkout@v4
