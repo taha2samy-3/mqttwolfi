@@ -9,9 +9,13 @@ certs/*.pem
 .mise.local.toml
 
 # Dependencies and external sources
-# Track external/wolfssl as a git submodule; ignore only its build output
+# external/wolfssl        → tracked as git submodule (standard open-source build)
+# external/wolfssl-fips-bundle/ → NOT tracked; user must download from wolfssl.com
+#   Download: https://www.wolfssl.com/products/wolfcrypt-fips/
+#   Install : extract into external/wolfssl-fips-bundle/
 external/wolfssl/build/
 external/wolfssl/build_fips/
+external/wolfssl-fips-bundle/build/
 external/wolfMQTT/
 
 # IDE files
