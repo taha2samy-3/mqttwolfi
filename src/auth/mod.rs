@@ -279,11 +279,7 @@ impl AclEngine {
         Self {
             users: Arc::new(RwLock::new(HashMap::new())),
             allow_anonymous,
-            default_rules: if allow_anonymous {
-                vec![AclRule::new("#", Permission::ReadWrite)]
-            } else {
-                Vec::new()
-            },
+            default_rules: Vec::new(), // Secure default: deny by default
         }
     }
 
@@ -328,21 +324,20 @@ impl AclEngine {
                     let guard = self.users.read().await;
                     guard.get(u).cloned()
                 };
-                if let Some(user) = user_opt {
-                    let pass_bytes = match password {
-                        Some(p) if !p.is_empty() => p,
-                        _ => return Err(AuthError::BadCredentials),
-                    };
+                let pass_bytes = match password {
+                    Some(p) if !p.is_empty() => p.to_vec(),
+                    _ => return Err(AuthError::BadCredentials),
+                };
 
+                if let Some(user) = user_opt {
                     let user_clone = Arc::clone(&user);
-                    let pass_vec = pass_bytes.to_vec();
                     let verified =
-                        tokio::task::spawn_blocking(move || user_clone.verify_password(&pass_vec))
+                        tokio::task::spawn_blocking(move || user_clone.verify_password(&pass_bytes))
                             .await
                             .unwrap_or(false);
 
                     if !verified {
-                        warn!("Authentication failed for user '{}': invalid password", u);
+                        warn!("Authentication failed for user '{}': invalid credentials", u);
                         return Err(AuthError::BadCredentials);
                     }
 
@@ -360,20 +355,44 @@ impl AclEngine {
                     );
                     Ok(user)
                 } else {
-                    warn!("Authentication failed: user '{}' does not exist", u);
-                    Err(AuthError::UserNotFound(u.to_string()))
+                    // Timing attack mitigation: verify dummy hash to prevent username enumeration
+                    tokio::task::spawn_blocking(move || {
+                        let dummy_hash = "$argon2id$v=19$m=19456,t=2,p=1$eHh4eHh4eHh4eHh4eHh4$xxxx";
+                        let dummy_user = UserAccount {
+                            username: "dummy".into(),
+                            password_hash: dummy_hash.into(),
+                            role: UserRole::Member,
+                            allowed_rooms: Vec::new(),
+                            custom_rules: Vec::new(),
+                        };
+                        let _ = dummy_user.verify_password(&pass_bytes);
+                    })
+                    .await
+                    .unwrap_or(());
+
+                    warn!("Authentication failed for user '{}': invalid credentials", u);
+                    Err(AuthError::BadCredentials)
                 }
             }
             None => {
                 if self.allow_anonymous {
                     debug!("Anonymous connection accepted for client '{}'", client_id);
-                    Ok(Arc::new(UserAccount {
-                        username: "anonymous".into(),
-                        password_hash: String::new(),
-                        role: UserRole::Custom("anonymous".into()),
-                        allowed_rooms: Vec::new(),
-                        custom_rules: self.default_rules.clone(),
-                    }))
+                    // Check if explicit anonymous user was declared in acl.conf
+                    let anon_configured = {
+                        let guard = self.users.read().await;
+                        guard.get("anonymous").cloned()
+                    };
+                    if let Some(user) = anon_configured {
+                        Ok(user)
+                    } else {
+                        Ok(Arc::new(UserAccount {
+                            username: "anonymous".into(),
+                            password_hash: String::new(),
+                            role: UserRole::Custom("anonymous".into()),
+                            allowed_rooms: Vec::new(),
+                            custom_rules: self.default_rules.clone(),
+                        }))
+                    }
                 } else {
                     warn!("Anonymous connection rejected for client '{}'", client_id);
                     Err(AuthError::AnonymousNotAllowed)
