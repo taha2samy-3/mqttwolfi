@@ -106,7 +106,7 @@ tasks:
     deps: [build:release]
     vars:
       TRIPLE:
-        sh: rustc -vV | sed -n 's/^host: //p'
+        sh: "rustc -vV | sed -n 's/^host: //p'"
     cmds:
       - |
         set -euo pipefail
