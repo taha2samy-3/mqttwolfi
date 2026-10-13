@@ -599,7 +599,7 @@ impl MqttSnServer {
                     }
                     if let Some(id) = internal_id {
                         let mut router_guard = self.context.router.write().await;
-                        let _ = router_guard.unsubscribe(&topic, id);
+                        let _ = router_guard.unsubscribe(&topic, &id);
                     }
                 }
 
