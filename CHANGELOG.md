@@ -5,6 +5,88 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [0.5.0] - 2026-10-13
+
+This release reworks the protocol engine after a full review against the OASIS MQTT v3.1.1,
+MQTT v5.0 and MQTT-SN v1.2 specifications. It replaces 0.4.0, which only bumped the version.
+
+### Fixed — protocol correctness
+- **MQTT v5.0 subscribers received v3.1.1-framed PUBLISH packets** (no property length), so the
+  first payload byte could be swallowed; Will messages, `$SYS` topics and MQTT-SN traffic were
+  affected too. Every packet is now encoded for the receiving client's protocol version.
+- **v5.0 properties were guessed from payload bytes** in PUBLISH / SUBSCRIBE / SUBACK. The codec
+  now parses and validates property blocks strictly (allowed identifiers per packet,
+  duplicates, value ranges) and rejects trailing bytes and invalid fixed-header flags.
+- **Outbound packet identifiers came from the publisher's counter**, so two publishers could
+  reuse the same id towards one subscriber, and the counter wrapped to the invalid id 0. Ids
+  are now allocated per session, skipping ids that are still in flight.
+- `sport/#` did not match `sport`; `+` handling and `$`-topic isolation now follow §4.7 exactly.
+- Unauthorized QoS 1/2 publishes were silently dropped without PUBACK/PUBREC, leaving clients
+  hanging; v5.0 clients now get reason code 0x87, v3.1.1 clients an acknowledgement.
+- Unsupported protocol levels (e.g. MQTT 3.1) now receive CONNACK 0x01 before the close;
+  rejection CONNACKs are no longer lost when the connection closes.
+- MQTT-SN: binary payloads forwarded from MQTT clients were corrupted; reconnecting clients
+  leaked subscriptions (duplicate deliveries); sleeping clients were expired with the wrong
+  timer; ADVERTISE ignored the configured port; retained messages were never delivered.
+
+### Fixed — security
+- MQTT-SN Will messages bypassed the ACL; Will topics are now authorized for all transports
+  (at CONNECT for MQTT, during the Will handshake for MQTT-SN).
+- SUBSCRIBE authorization treated a filter like a topic (a `+` rule granted `#`
+  subscriptions); filters must now be fully covered by a rule, and overlapping deny rules win.
+- With `allow_anonymous = true` the `#` read/write fallback also applied to authenticated
+  users without rules; it now applies only to anonymous clients, and only when the ACL file does
+  not declare an `anonymous` account.
+- `%u` and `%r` substitutions were not sanitized (only `%c` was).
+- Role defaults were evaluated before the user's own ACL rules, so file rules could not refine
+  a role; user rules now come first.
+- The timing-attack dummy hash was not a valid Argon2 hash, so unknown users were rejected
+  faster than known ones; legacy SHA-256 hashes are now compared in constant time.
+- A TLS handshake that timed out leaked its `WOLFSSL` object; the readiness handling around
+  wolfSSL could lose wake-ups; the client connector did not verify the server host name and
+  could read out of bounds for an SNI name containing NUL.
+- `verify_client_identity`, `min_tls_version`, `ciphers` and `alpn_protocols` were accepted
+  but ignored; they are now enforced. Unimplemented TLS options (PSK, session tickets,
+  hardware engine) were removed instead of being silently ignored.
+- `accept()` errors (e.g. file descriptor exhaustion) stopped the listener; slow clients could
+  trickle bytes before CONNECT indefinitely; password verification had no concurrency limit.
+
+### Added
+- MQTT v5.0: topic aliases, subscription identifiers, No Local, Retain As Published, Retain
+  Handling, shared subscriptions (`$share/<group>/<filter>`), Receive Maximum flow control,
+  client Maximum Packet Size, Message Expiry, Will Delay, Session Expiry, Assigned Client
+  Identifier, Server Keep Alive, CONNACK capability properties, UNSUBACK reason codes and
+  server DISCONNECT reason codes (0x82, 0x8D, 0x8E, 0x93, 0x94, 0x95, 0x9A, 0x9B, ...).
+- Persistent sessions (MQTT v3.1.1 `CleanSession=0`, v5.0 Session Expiry): subscriptions and
+  queued messages survive reconnects, unacknowledged QoS 1/2 messages are resent with DUP.
+- Per-session outbound queues with working `drop_oldest` / `drop_newest` policies and byte
+  limits; enforced `max_connections`, `max_packet_size`, `maximum_qos`, `allow_v311`/`allow_v500`,
+  retained / wildcard / shared subscription switches and `max_keep_alive_sec`.
+- MQTT-SN: configurable ACL identity (`acl_user`), REGISTER/REGACK handshake before publishing
+  to a new topic, QoS 1/2 retransmission (Tretry/Nretry), forwarder encapsulation, session limit.
+- Configuration overrides from the environment (`WOLFIMQ_<SECTION>__<KEY>=value`,
+  `WOLFIMQ_CONFIG`) and warnings for unknown configuration keys.
+- CLI: `--check-config`, `--print-config`, `--hash-password`; graceful shutdown on SIGINT /
+  SIGTERM; ACL reload on SIGHUP (atomic, a broken file is rejected).
+- `wolf_mqtt::client::RawClient`, a small version-aware client used by the tools and tests.
+- Release binaries for Linux (x86_64, aarch64, armv7, riscv64; glibc and static musl),
+  Windows x86_64 and macOS (Apple silicon and Intel).
+
+### Changed
+- wolfSSL is built with the `cmake` crate inside Cargo's `OUT_DIR`, which makes
+  cross-compilation work; the FIPS-Ready variant uses wolfSSL's autotools build
+  (`--enable-fips=ready`), the only build wolfSSL supports for FIPS.
+- Plain TCP now defaults to `127.0.0.1`; the TLS listener is disabled unless configured.
+- Benchmark numbers are no longer hard-coded in the README; CI publishes them with each release.
+- The test-suite was rewritten: 158 tests exercise the real broker (TCP, TLS, MQTT-SN, CLI),
+  replacing tests that passed against mocks.
+
+### Removed
+- Docker support (`Dockerfile`).
+- The `reject_publisher` queue policy (it was never implemented).
+
+---
+
 ## [0.3.3] - 2026-10-13
 
 ### 🔧 CI Fixes
