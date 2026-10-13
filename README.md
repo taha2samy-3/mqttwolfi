@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Lightweight, Memory-Safe MQTT v3.1.1, v5.0 & MQTT-SN v1.2 Broker in Rust with wolfSSL TLS 1.3 & DTLS Support</strong>
+  <strong>Lightweight, Memory-Safe MQTT v3.1.1, v5.0 &amp; MQTT-SN v1.2 Broker in Rust — Native wolfSSL TLS 1.3 · Standard &amp; FIPS-Ready Builds</strong>
 </p>
 
 <p align="center">
@@ -73,21 +73,50 @@
 
 ## TLS & Cryptography Architecture
 
-WolfiMQ provides transport security designed for enterprise and defense-grade IoT deployments:
+WolfiMQ provides transport security designed for enterprise and defense-grade IoT deployments, available in two build variants:
 
-1. **Genuine wolfSSL C Cryptographic Engine:**
-   - Powered by native C **wolfSSL 5.9+** linked statically via `build.rs` with FFI bindings.
-   - Non-blocking asynchronous I/O integration via custom `WolfTlsStream` supporting Tokio's `AsyncRead + AsyncWrite`.
-   - Supports **TLS 1.3** (RFC 8446) and **TLS 1.2** with mandatory or optional Mutual TLS (mTLS).
-   - Enforces **Application-Layer Protocol Negotiation (ALPN)** for `"mqtt"` and Server Name Indication (SNI).
-   - Automated End-to-End integration test in [`tests/test_tls_e2e.rs`](tests/test_tls_e2e.rs) validates client and server certificate verification, handshake negotiation, and encrypted pub/sub exchange.
+### Build Variants
 
-2. **wolfSSL Feature Hooks, DTLS & FIPS Packaging:**
-   - Cargo feature flags `wolfssl` and `wolfssl-fips` provide integration targets for linking against the native C wolfSSL library and FIPS 140-2/3 validated cryptographic module.
-   - **DTLS Support:** Encrypted UDP datagram security for MQTT-SN client-to-broker wireless channels powered by wolfSSL DTLS 1.2 / 1.3 engine.
-   - Cross-compilation scripts and GitHub Actions workflows are provided in [`.github/workflows/release.yml`](.github/workflows/release.yml) for Linux AMD64 and ARM64.
+| Variant | Cargo Feature | wolfSSL Source | Cipher Suite | Release Artifact |
+|---------|--------------|----------------|--------------|------------------|
+| **Standard** | `wolfssl` (default) | Open-source GitHub submodule | Full: AES-GCM + ChaCha20-Poly1305 + all ECDH curves | `wolfimq-*-wolfssl.tar.gz` |
+| **FIPS-Ready** | `wolfssl-fips` | wolfSSL FIPS bundle (user-provided) | FIPS 140-2/3 approved only | `wolfimq-*-wolfssl-fips-ready.tar.gz` |
 
-> ⚖️ **wolfSSL Licensing Notice:** wolfSSL is dual-licensed under GPLv2 or a commercial license. When compiling or distributing binaries linked directly with native wolfSSL C libraries, ensure compliance with the appropriate wolfSSL licensing requirements. Consult [SECURITY.md](SECURITY.md) for details.
+```bash
+# Standard build (default)
+cargo build --release
+
+# FIPS-Ready build (requires external/wolfssl-fips-bundle/ — see below)
+cargo build --release --no-default-features --features wolfssl-fips
+```
+
+### Standard wolfSSL Build
+- Powered by native C **wolfSSL 5.9+** statically linked via CMake (`build.rs`).
+- Non-blocking async I/O via custom `WolfTlsStream` implementing Tokio's `AsyncRead + AsyncWrite`.
+- **TLS 1.3** (RFC 8446) + **TLS 1.2** with optional Mutual TLS (mTLS).
+- Full cipher suite: AES-128/256-GCM, ChaCha20-Poly1305, ECDH/ECDSA, ALPN, SNI, DTLS.
+- Automated E2E test: [`tests/test_tls_e2e.rs`](tests/test_tls_e2e.rs).
+
+### FIPS-Ready wolfSSL Build
+
+The FIPS-Ready variant uses `-DWOLFSSL_FIPS=ON` to enforce FIPS 140-2/3 approved algorithms:
+
+| | FIPS-Ready | Standard |
+|---|---|---|
+| AES-128/256 CBC + GCM | ✅ | ✅ |
+| SHA-224/256/384/512 | ✅ | ✅ |
+| SHA-3 | ✅ | ✅ |
+| RSA 2048/3072/4096 | ✅ | ✅ |
+| ECDSA/ECDH P-256/P-384/P-521 | ✅ | ✅ |
+| HMAC-SHA-2, Hash-DRBG | ✅ | ✅ |
+| ChaCha20-Poly1305 | ❌ removed | ✅ |
+| MD5, DES, RC4 | ❌ removed | ✅ |
+
+**Setup:** Download the wolfSSL FIPS-Ready bundle from [wolfssl.com](https://www.wolfssl.com/products/wolfcrypt-fips/) and extract into `external/wolfssl-fips-bundle/`.
+
+> **FIPS Certification Note:** "FIPS-Ready" = FIPS-approved algorithms only. It does **not** carry a formal CMVP certificate. For a formally validated build (CMVP Certificate #4718), use wolfSSL's commercially licensed FIPS validated bundle.
+
+> ⚖️ **wolfSSL Licensing:** wolfSSL is dual-licensed under GPLv2 or commercial. Consult [SECURITY.md](SECURITY.md).
 
 ---
 
