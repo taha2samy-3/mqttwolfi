@@ -3,7 +3,7 @@ use crate::protocol::sn::{SnPacket, TopicIdType};
 use crate::protocol::{MqttPacket, PublishPacket, QoS};
 use crate::server::BrokerContext;
 use bytes::{Bytes, BytesMut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -25,6 +25,7 @@ pub struct SnClientSession {
     pub name_to_topic_id: HashMap<String, u16>,
     pub subscribed_topics: Vec<String>,
     pub buffered_messages: Vec<BytesMut>,
+    pub inflight_qos2_msg_ids: HashSet<u16>,
 }
 
 impl SnClientSession {
@@ -42,6 +43,7 @@ impl SnClientSession {
             name_to_topic_id: HashMap::new(),
             subscribed_topics: Vec::new(),
             buffered_messages: Vec::new(),
+            inflight_qos2_msg_ids: HashSet::new(),
         }
     }
 
@@ -473,6 +475,30 @@ impl MqttSnServer {
                         _ => QoS::AtMostOnce,
                     };
 
+                    // OASIS MQTT-SN v1.2 §5.4.10: Deduplicate re-transmitted QoS 2 publishes
+                    if qos == 2 {
+                        let is_dup = {
+                            let mut lock = self.sessions.write().await;
+                            if let Some(session) = lock.get_mut(&peer) {
+                                !session.inflight_qos2_msg_ids.insert(msg_id)
+                            } else {
+                                false
+                            }
+                        };
+
+                        if is_dup {
+                            debug!(
+                                "Duplicate QoS 2 packet #{} from SN peer {}; acknowledging with PUBREC without re-dispatching",
+                                msg_id, peer
+                            );
+                            let pubrec = SnPacket::PubRec { msg_id };
+                            let mut buf = BytesMut::new();
+                            pubrec.encode(&mut buf);
+                            let _ = outbound.send((peer, buf)).await;
+                            return;
+                        }
+                    }
+
                     let pub_pkt = PublishPacket {
                         topic: topic.clone(),
                         qos: qos_mapped,
@@ -663,6 +689,12 @@ impl MqttSnServer {
 
             SnPacket::PubRel { msg_id } => {
                 // OASIS MQTT-SN v1.2 §5.4.12: QoS 2 Handshake step 2 - Gateway responds with PubComp
+                {
+                    let mut lock = self.sessions.write().await;
+                    if let Some(session) = lock.get_mut(&peer) {
+                        session.inflight_qos2_msg_ids.remove(&msg_id);
+                    }
+                }
                 let pubcomp = SnPacket::PubComp { msg_id };
                 let mut buf = BytesMut::new();
                 pubcomp.encode(&mut buf);

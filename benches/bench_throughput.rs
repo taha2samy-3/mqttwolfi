@@ -9,6 +9,7 @@ use wolf_mqtt::protocol::{
     decode_variable_byte_integer, encode_variable_byte_integer, ConnectPacket, MqttPacket,
     ProtocolVersion, PublishPacket, QoS,
 };
+use wolf_mqtt::protocol::sn::{SnPacket, TopicIdType};
 use wolf_mqtt::routing::retained::RetainedStore;
 use wolf_mqtt::routing::TopicTrie;
 use wolf_mqtt::server::BrokerServer;
@@ -30,6 +31,8 @@ fn main() {
     bench_concurrent_multithreaded_routing();
     bench_live_tcp_loopback_throughput();
     bench_latency_percentiles();
+    bench_qos2_state_machine_throughput();
+    bench_mqtt_sn_telemetry_throughput();
 
     println!("================================================================================");
     println!("All multi-dimensional benchmarks completed successfully in release mode.");
@@ -761,4 +764,128 @@ fn bench_latency_percentiles() {
         max,
         (max as f64) / 1_000.0
     );
+}
+
+/// 13. QoS 2 Full 4-Step State Machine Benchmark
+fn bench_qos2_state_machine_throughput() {
+    println!("--- 13. QoS 2 Full 4-Step State Machine Handshake ---");
+    let iterations = 1_000_000;
+    let payload = Bytes::from_static(b"MISSION_CRITICAL_TELEMETRY_DATA");
+
+    let mut pub_buf = BytesMut::with_capacity(128);
+    let mut rec_buf = BytesMut::with_capacity(16);
+    let mut rel_buf = BytesMut::with_capacity(16);
+    let mut comp_buf = BytesMut::with_capacity(16);
+
+    let mut inflight_set = std::collections::HashSet::with_capacity(1024);
+
+    let start = Instant::now();
+    for i in 0..iterations {
+        let pid = ((i % 65534) + 1) as u16;
+
+        // Step 1: Publisher sends PUBLISH (QoS 2)
+        pub_buf.clear();
+        let pub_pkt = MqttPacket::Publish(PublishPacket {
+            topic: "robotics/actuator/cmd".into(),
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(pid),
+            payload: payload.clone(),
+        });
+        pub_pkt.encode(&mut pub_buf).unwrap();
+
+        // Broker receives and decodes
+        let mut slice = &pub_buf[..];
+        let decoded_pub = MqttPacket::decode(&mut slice).unwrap();
+        if let MqttPacket::Publish(p) = decoded_pub {
+            let p_id = p.packet_id.unwrap();
+            let _is_dup = !inflight_set.insert(p_id);
+        }
+
+        // Step 2: Broker replies PUBREC
+        rec_buf.clear();
+        let pubrec = MqttPacket::PubRec { packet_id: pid };
+        pubrec.encode(&mut rec_buf).unwrap();
+
+        // Step 3: Publisher replies PUBREL
+        rel_buf.clear();
+        let pubrel = MqttPacket::PubRel { packet_id: pid };
+        pubrel.encode(&mut rel_buf).unwrap();
+
+        // Broker receives PUBREL and clears inflight
+        let mut rel_slice = &rel_buf[..];
+        let decoded_rel = MqttPacket::decode(&mut rel_slice).unwrap();
+        if let MqttPacket::PubRel { packet_id } = decoded_rel {
+            inflight_set.remove(&packet_id);
+        }
+
+        // Step 4: Broker replies PUBCOMP
+        comp_buf.clear();
+        let pubcomp = MqttPacket::PubComp { packet_id: pid };
+        pubcomp.encode(&mut comp_buf).unwrap();
+
+        let mut comp_slice = &comp_buf[..];
+        let _ = std::hint::black_box(MqttPacket::decode(&mut comp_slice).unwrap());
+    }
+    let duration = start.elapsed();
+    let handshakes_sec = (iterations as f64) / duration.as_secs_f64();
+    let ns_per_handshake = (duration.as_nanos() as f64) / (iterations as f64);
+
+    println!(
+        "  Completed {} full 4-step QoS 2 handshakes in {:.3} ms",
+        iterations,
+        duration.as_secs_f64() * 1_000.0
+    );
+    println!(
+        "  Throughput      : {:.2} handshakes/sec  ({:.2} million/sec)",
+        handshakes_sec,
+        handshakes_sec / 1_000_000.0
+    );
+    println!(
+        "  Latency/Step    : {:.2} ns/handshake (4 wire packets + deduplication)\n",
+        ns_per_handshake
+    );
+}
+
+/// 14. MQTT-SN v1.2 Wire Packet Codec & Predefined Topic Benchmark
+fn bench_mqtt_sn_telemetry_throughput() {
+    println!("--- 14. MQTT-SN v1.2 Wire Codec & Predefined Topic Telemetry ---");
+    let iterations = 1_000_000;
+    let data = Bytes::from_static(b"GPS:37.7749,-122.4194,ALT:120m");
+
+    let mut enc_buf = BytesMut::with_capacity(64);
+    let start = Instant::now();
+    for _ in 0..iterations {
+        enc_buf.clear();
+        let pkt = SnPacket::Publish {
+            dup: false,
+            qos: -1, // QoS -1 Predefined Telemetry
+            retain: false,
+            topic_id_type: TopicIdType::Predefined,
+            topic_id: 1,
+            msg_id: 0,
+            data: data.clone(),
+        };
+        pkt.encode(&mut enc_buf);
+
+        let mut slice = &enc_buf[..];
+        let decoded = SnPacket::decode(&mut slice).unwrap();
+        let _ = std::hint::black_box(decoded);
+    }
+    let duration = start.elapsed();
+    let ops_sec = (iterations as f64) / duration.as_secs_f64();
+    let ns_op = (duration.as_nanos() as f64) / (iterations as f64);
+
+    println!(
+        "  Completed {} MQTT-SN QoS -1 frame roundtrips in {:.3} ms",
+        iterations,
+        duration.as_secs_f64() * 1_000.0
+    );
+    println!(
+        "  Throughput      : {:.2} pkts/sec  ({:.2} million/sec)",
+        ops_sec,
+        ops_sec / 1_000_000.0
+    );
+    println!("  Codec Latency   : {:.2} ns/op\n", ns_op);
 }

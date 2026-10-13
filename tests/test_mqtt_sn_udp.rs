@@ -784,3 +784,119 @@ async fn test_mqtt_sn_keepalive_timeout_and_lwt_broadcast() {
         other => panic!("Expected LWT Publish, got {:?}", other),
     }
 }
+
+#[tokio::test]
+async fn test_mqtt_sn_qos2_retransmission_deduplication() {
+    let (server_addr, _context) = spawn_test_sn_server().await;
+    let pub_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sub_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // 1. Subscriber connects and subscribes
+    let mut buf = BytesMut::new();
+    SnPacket::Connect {
+        will: false,
+        clean_session: true,
+        duration: 60,
+        client_id: "qos2-sub-node".into(),
+    }
+    .encode(&mut buf);
+    sub_sock.send_to(&buf, server_addr).await.unwrap();
+    let _ = recv_sn_packet(&sub_sock).await; // ConnAck
+
+    buf.clear();
+    SnPacket::Subscribe {
+        dup: false,
+        qos: 2,
+        topic_id_type: TopicIdType::Normal,
+        msg_id: 1,
+        topic_id: 0,
+        topic_name: Some("telemetry/qos2".into()),
+    }
+    .encode(&mut buf);
+    sub_sock.send_to(&buf, server_addr).await.unwrap();
+    let _ = recv_sn_packet(&sub_sock).await; // SubAck
+
+    // 2. Publisher connects and registers
+    buf.clear();
+    SnPacket::Connect {
+        will: false,
+        clean_session: true,
+        duration: 60,
+        client_id: "qos2-pub-node".into(),
+    }
+    .encode(&mut buf);
+    pub_sock.send_to(&buf, server_addr).await.unwrap();
+    let _ = recv_sn_packet(&pub_sock).await; // ConnAck
+
+    buf.clear();
+    SnPacket::Register {
+        topic_id: 0,
+        msg_id: 10,
+        topic_name: "telemetry/qos2".into(),
+    }
+    .encode(&mut buf);
+    pub_sock.send_to(&buf, server_addr).await.unwrap();
+    let regack = recv_sn_packet(&pub_sock).await;
+    let pub_tid = match regack {
+        SnPacket::RegAck { topic_id, .. } => topic_id,
+        other => panic!("Expected RegAck, got {:?}", other),
+    };
+
+    // 3. Publisher sends QoS 2 PUBLISH (msg_id: 555)
+    let qos2_pkt = SnPacket::Publish {
+        dup: false,
+        qos: 2,
+        retain: false,
+        topic_id_type: TopicIdType::Normal,
+        topic_id: pub_tid,
+        msg_id: 555,
+        data: Bytes::from_static(b"CRITICAL_PAYLOAD_555"),
+    };
+
+    buf.clear();
+    qos2_pkt.encode(&mut buf);
+    pub_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // Publisher receives PUBREC
+    let pubrec = recv_sn_packet(&pub_sock).await;
+    assert_eq!(pubrec, SnPacket::PubRec { msg_id: 555 });
+
+    // Subscriber receives message
+    let sub_received = recv_sn_packet(&sub_sock).await;
+    match sub_received {
+        SnPacket::Publish { data, .. } => {
+            assert_eq!(data, Bytes::from_static(b"CRITICAL_PAYLOAD_555"));
+        }
+        other => panic!("Expected Publish on subscriber, got {:?}", other),
+    }
+
+    // 4. Publisher re-sends identical QoS 2 PUBLISH (simulating network timeout)
+    buf.clear();
+    qos2_pkt.encode(&mut buf);
+    pub_sock.send_to(&buf, server_addr).await.unwrap();
+
+    // Publisher receives PUBREC again
+    let pubrec_dup = recv_sn_packet(&pub_sock).await;
+    assert_eq!(pubrec_dup, SnPacket::PubRec { msg_id: 555 });
+
+    // Subscriber MUST NOT receive duplicate packet
+    let mut check_buf = [0u8; 128];
+    let dup_check = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        sub_sock.recv_from(&mut check_buf),
+    )
+    .await;
+    assert!(
+        dup_check.is_err(),
+        "Subscriber must not receive duplicate delivery on retransmitted QoS 2 UDP publish"
+    );
+
+    // 5. Publisher concludes handshake with PUBREL -> PUBCOMP
+    buf.clear();
+    SnPacket::PubRel { msg_id: 555 }.encode(&mut buf);
+    pub_sock.send_to(&buf, server_addr).await.unwrap();
+
+    let pubcomp = recv_sn_packet(&pub_sock).await;
+    assert_eq!(pubcomp, SnPacket::PubComp { msg_id: 555 });
+}
+

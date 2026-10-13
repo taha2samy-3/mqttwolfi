@@ -572,3 +572,126 @@ async fn test_mqtt5_connack_raw_properties_field() {
     assert_eq!(buf[3], 0x00, "Success reason code");
     assert_eq!(buf[4], 0x00, "Property length must be present and 0");
 }
+
+#[tokio::test]
+async fn test_tcp_subscriber_qos2_full_handshake() {
+    let server = BrokerServer::bind("127.0.0.1:0").await.unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+
+    // 1. Subscriber connects and subscribes with QoS 2
+    let mut sub_stream = TcpStream::connect(addr).await.unwrap();
+    send_packet(
+        &mut sub_stream,
+        MqttPacket::Connect(ConnectPacket {
+            version: ProtocolVersion::V311,
+            client_id: "qos2_full_sub".into(),
+            clean_start: true,
+            keep_alive_sec: 60,
+            will: None,
+            username: None,
+            password: None,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        read_packet(&mut sub_stream).await,
+        MqttPacket::ConnAck { .. }
+    ));
+
+    send_packet(
+        &mut sub_stream,
+        MqttPacket::Subscribe {
+            packet_id: 1,
+            topics: vec![("banking/wire".into(), QoS::ExactlyOnce)],
+        },
+    )
+    .await;
+    assert!(matches!(
+        read_packet(&mut sub_stream).await,
+        MqttPacket::SubAck { .. }
+    ));
+
+    // 2. Publisher connects and publishes with QoS 2
+    let mut pub_stream = TcpStream::connect(addr).await.unwrap();
+    send_packet(
+        &mut pub_stream,
+        MqttPacket::Connect(ConnectPacket {
+            version: ProtocolVersion::V311,
+            client_id: "qos2_full_pub".into(),
+            clean_start: true,
+            keep_alive_sec: 60,
+            will: None,
+            username: None,
+            password: None,
+        }),
+    )
+    .await;
+    assert!(matches!(
+        read_packet(&mut pub_stream).await,
+        MqttPacket::ConnAck { .. }
+    ));
+
+    // Publisher sends QoS 2 PUBLISH
+    send_packet(
+        &mut pub_stream,
+        MqttPacket::Publish(PublishPacket {
+            topic: "banking/wire".into(),
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            dup: false,
+            packet_id: Some(888),
+            payload: Bytes::from_static(b"WIRE_TRANSFER_$50000"),
+        }),
+    )
+    .await;
+
+    // Publisher receives PUBREC from broker
+    assert_eq!(
+        read_packet(&mut pub_stream).await,
+        MqttPacket::PubRec { packet_id: 888 }
+    );
+
+    // Publisher sends PUBREL
+    send_packet(&mut pub_stream, MqttPacket::PubRel { packet_id: 888 }).await;
+
+    // Publisher receives PUBCOMP from broker (Publisher side 4-step handshake complete!)
+    assert_eq!(
+        read_packet(&mut pub_stream).await,
+        MqttPacket::PubComp { packet_id: 888 }
+    );
+
+    // 3. Subscriber receives the QoS 2 PUBLISH packet from broker
+    let sub_pub = read_packet(&mut sub_stream).await;
+    let (sub_pid, sub_payload) = match sub_pub {
+        MqttPacket::Publish(p) => {
+            assert_eq!(p.qos, QoS::ExactlyOnce);
+            (p.packet_id.expect("QoS 2 publish must have packet_id"), p.payload)
+        }
+        other => panic!("Expected Publish, got: {:?}", other),
+    };
+    assert_eq!(&sub_payload[..], b"WIRE_TRANSFER_$50000");
+
+    // 4. Subscriber responds with PUBREC (Step 2 of outbound delivery)
+    send_packet(
+        &mut sub_stream,
+        MqttPacket::PubRec { packet_id: sub_pid },
+    )
+    .await;
+
+    // 5. Broker replies with PUBREL (Step 3 of outbound delivery)
+    assert_eq!(
+        read_packet(&mut sub_stream).await,
+        MqttPacket::PubRel { packet_id: sub_pid }
+    );
+
+    // 6. Subscriber concludes with PUBCOMP (Step 4 of outbound delivery)
+    send_packet(
+        &mut sub_stream,
+        MqttPacket::PubComp { packet_id: sub_pid },
+    )
+    .await;
+}
+
