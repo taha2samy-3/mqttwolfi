@@ -653,18 +653,19 @@ impl MqttPacket {
                 // OASIS MQTT v5.0 §3.8.2.1: Properties in Subscribe variable header
                 if version == ProtocolVersion::V500 && payload.has_remaining() {
                     let mut check = payload.clone();
-                    let has_properties = if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
-                        let p_len = props_len as usize;
-                        if check.remaining() >= p_len + 3 {
-                            check.advance(p_len);
-                            let topic_len = check.get_u16() as usize;
-                            topic_len > 0 && check.remaining() >= topic_len + 1
+                    let has_properties =
+                        if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                            let p_len = props_len as usize;
+                            if check.remaining() >= p_len + 3 {
+                                check.advance(p_len);
+                                let topic_len = check.get_u16() as usize;
+                                topic_len > 0 && check.remaining() >= topic_len + 1
+                            } else {
+                                false
+                            }
                         } else {
                             false
-                        }
-                    } else {
-                        false
-                    };
+                        };
 
                     if has_properties {
                         let props_len = decode_variable_byte_integer(&mut payload)
@@ -711,23 +712,24 @@ impl MqttPacket {
                 // OASIS MQTT v5.0 §3.9.2.1: Properties in SubAck variable header
                 if payload.has_remaining() {
                     let mut check = payload.clone();
-                    let has_v5_props = if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
-                        let p_len = props_len as usize;
-                        if check.remaining() >= p_len {
-                            if p_len == 0 {
-                                // If props_len == 0, there must be at least one reason code following it
-                                check.remaining() >= 1
+                    let has_v5_props =
+                        if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                            let p_len = props_len as usize;
+                            if check.remaining() >= p_len {
+                                if p_len == 0 {
+                                    // If props_len == 0, there must be at least one reason code following it
+                                    check.remaining() >= 1
+                                } else {
+                                    // SubAck properties can only be 0x1F (Reason String) or 0x26 (User Property)
+                                    let first_prop = check.chunk()[0];
+                                    first_prop == 0x1F || first_prop == 0x26
+                                }
                             } else {
-                                // SubAck properties can only be 0x1F (Reason String) or 0x26 (User Property)
-                                let first_prop = check.chunk()[0];
-                                first_prop == 0x1F || first_prop == 0x26
+                                false
                             }
                         } else {
                             false
-                        }
-                    } else {
-                        false
-                    };
+                        };
 
                     if has_v5_props {
                         let props_len = decode_variable_byte_integer(&mut payload)
@@ -756,18 +758,19 @@ impl MqttPacket {
                 // OASIS MQTT v5.0 §3.10.2.1: Properties in Unsubscribe variable header
                 if version == ProtocolVersion::V500 && payload.has_remaining() {
                     let mut check = payload.clone();
-                    let has_properties = if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
-                        let p_len = props_len as usize;
-                        if check.remaining() >= p_len + 2 {
-                            check.advance(p_len);
-                            let topic_len = check.get_u16() as usize;
-                            topic_len > 0 && check.remaining() >= topic_len
+                    let has_properties =
+                        if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                            let p_len = props_len as usize;
+                            if check.remaining() >= p_len + 2 {
+                                check.advance(p_len);
+                                let topic_len = check.get_u16() as usize;
+                                topic_len > 0 && check.remaining() >= topic_len
+                            } else {
+                                false
+                            }
                         } else {
                             false
-                        }
-                    } else {
-                        false
-                    };
+                        };
 
                     if has_properties {
                         let props_len = decode_variable_byte_integer(&mut payload)
@@ -958,24 +961,25 @@ impl MqttPacket {
                 // OASIS MQTT v5.0 §3.3.2.3: Properties Length & Properties in Publish variable header
                 if version == ProtocolVersion::V500 && payload.has_remaining() {
                     let mut check = payload.clone();
-                    let has_valid_props = if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
-                        let p_len = props_len as usize;
-                        if check.remaining() >= p_len {
-                            if p_len == 0 {
-                                true
+                    let has_valid_props =
+                        if let Ok(props_len) = decode_variable_byte_integer(&mut check) {
+                            let p_len = props_len as usize;
+                            if check.remaining() >= p_len {
+                                if p_len == 0 {
+                                    true
+                                } else {
+                                    let first_prop = check.chunk()[0];
+                                    matches!(
+                                        first_prop,
+                                        0x01 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0B | 0x23 | 0x26
+                                    )
+                                }
                             } else {
-                                let first_prop = check.chunk()[0];
-                                matches!(
-                                    first_prop,
-                                    0x01 | 0x02 | 0x03 | 0x08 | 0x09 | 0x0B | 0x23 | 0x26
-                                )
+                                false
                             }
                         } else {
                             false
-                        }
-                    } else {
-                        false
-                    };
+                        };
 
                     if has_valid_props {
                         let props_len = decode_variable_byte_integer(&mut payload)
