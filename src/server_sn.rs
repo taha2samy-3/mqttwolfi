@@ -305,11 +305,38 @@ impl MqttSnServer {
                     peer, client_id, will, duration
                 );
 
+                // Authenticate: MQTT-SN has no built-in credentials.
+                // We use anonymous auth; if allow_anonymous=false, reject the connection.
+                let auth_result = self
+                    .context
+                    .acl
+                    .authenticate(None, None, &client_id)
+                    .await;
+
+                let user = match auth_result {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!(
+                            "MQTT-SN CONNECT rejected for client '{}' from {}: {:?}",
+                            client_id, peer, e
+                        );
+                        // OASIS MQTT-SN v1.2 rc=0x01: Rejected (Congestion) — closest code for auth failure
+                        let connack = SnPacket::ConnAck { return_code: 0x01 };
+                        let mut buf = BytesMut::new();
+                        connack.encode(&mut buf);
+                        let _ = outbound.send((peer, buf)).await;
+                        return;
+                    }
+                };
+
                 let internal_id = self.context.next_client_id();
                 {
                     let mut lock = self.sessions.write().await;
                     if clean_session || !lock.contains_key(&peer) {
-                        lock.insert(peer, SnClientSession::new(client_id, internal_id, duration));
+                        lock.insert(
+                            peer,
+                            SnClientSession::new(client_id, internal_id, duration, Some(user)),
+                        );
                     } else if let Some(session) = lock.get_mut(&peer) {
                         session.last_seen = Instant::now();
                         session.duration_sec = duration;
@@ -446,6 +473,33 @@ impl MqttSnServer {
             SnPacket::Register {
                 msg_id, topic_name, ..
             } => {
+                // Guard: must be authenticated (i.e., CONNECT received)
+                let is_auth = {
+                    let lock = self.sessions.read().await;
+                    lock.get(&peer).map(|s| s.is_authenticated).unwrap_or(false)
+                };
+                if !is_auth {
+                    warn!("MQTT-SN REGISTER from {} without CONNECT; ignoring", peer);
+                    return;
+                }
+
+                // MQTT topic names MUST NOT contain wildcards (+ or #)
+                if topic_name.contains('+') || topic_name.contains('#') {
+                    warn!(
+                        "MQTT-SN REGISTER rejected from {}: topic name '{}' contains wildcard",
+                        peer, topic_name
+                    );
+                    let regack = SnPacket::RegAck {
+                        topic_id: 0,
+                        msg_id,
+                        return_code: 0x02, // Rejected-Invalid-Topic-ID
+                    };
+                    let mut buf = BytesMut::new();
+                    regack.encode(&mut buf);
+                    let _ = outbound.send((peer, buf)).await;
+                    return;
+                }
+
                 let mut assigned_id = 0u16;
                 {
                     let mut lock = self.sessions.write().await;
@@ -473,12 +527,34 @@ impl MqttSnServer {
                 data,
                 dup,
             } => {
+                // Guard: must be authenticated (i.e., CONNECT received)
+                let session_info = {
+                    let lock = self.sessions.read().await;
+                    lock.get(&peer).map(|s| (s.is_authenticated, s.user.clone(), s.client_id_str.clone()))
+                };
+                let (is_auth, user_opt, client_id_str) = match session_info {
+                    Some(info) => info,
+                    None => {
+                        warn!("MQTT-SN PUBLISH from {} without session; ignoring", peer);
+                        return;
+                    }
+                };
+                if !is_auth {
+                    warn!("MQTT-SN PUBLISH from {} without CONNECT; ignoring", peer);
+                    return;
+                }
+
                 // Resolve Topic Name
                 let resolved_topic = match topic_id_type {
                     TopicIdType::Predefined => self.predefined_id_to_name.get(&topic_id).cloned(),
                     TopicIdType::Short => {
                         let bytes = topic_id.to_be_bytes();
-                        Some(String::from_utf8_lossy(&bytes).to_string())
+                        // Short topic names are 2 ASCII bytes; validate they contain no wildcards
+                        if bytes.iter().any(|&b| b == b'+' || b == b'#') {
+                            warn!("MQTT-SN PUBLISH rejected from {}: short topic ID contains wildcard byte", peer);
+                            return;
+                        }
+                        String::from_utf8(bytes.to_vec()).ok()
                     }
                     TopicIdType::Normal => {
                         let lock = self.sessions.read().await;
@@ -489,6 +565,30 @@ impl MqttSnServer {
                 };
 
                 if let Some(topic) = resolved_topic {
+                    // ACL: Check publish authorization
+                    let acl_allowed = if let Some(ref user) = user_opt {
+                        self.context.acl.check_publish(user.as_ref(), &client_id_str, &topic)
+                    } else {
+                        false
+                    };
+                    if !acl_allowed {
+                        warn!(
+                            "MQTT-SN PUBLISH denied for client '{}' ({}): topic '{}'",
+                            client_id_str, peer, topic
+                        );
+                        if qos == 1 {
+                            let puback = SnPacket::PubAck {
+                                topic_id,
+                                msg_id,
+                                return_code: 0x03, // Rejected: Not supported / unauthorized
+                            };
+                            let mut buf = BytesMut::new();
+                            puback.encode(&mut buf);
+                            let _ = outbound.send((peer, buf)).await;
+                        }
+                        return;
+                    }
+
                     debug!(
                         "MQTT-SN PUBLISH from {} on topic '{}' (qos: {}, len: {})",
                         peer,
