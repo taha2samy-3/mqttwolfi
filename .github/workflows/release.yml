@@ -93,7 +93,7 @@ jobs:
       - name: Install zig and cargo-zigbuild
         if: matrix.zig
         run: |
-          pip install ziglang==0.13.0
+          pip install ziglang==0.14.1
           cargo install cargo-zigbuild --locked
       - name: Build (zig cross toolchain)
         if: matrix.zig

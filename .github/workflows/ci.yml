@@ -82,7 +82,7 @@ jobs:
           key: cross-${{ matrix.target }}
       - name: Install zig and cargo-zigbuild
         run: |
-          pip install ziglang==0.13.0
+          pip install ziglang==0.14.1
           cargo install cargo-zigbuild --locked
       - run: cargo zigbuild --target ${{ matrix.target }} --bin wolf-broker
 
