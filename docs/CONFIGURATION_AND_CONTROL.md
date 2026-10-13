@@ -1,439 +1,367 @@
-# WolfiMQ Configuration & Operational Control Manual
+# WolfiMQ configuration and operations guide
 
-An exhaustive reference manual for configuring, tuning, securing, and operating **WolfiMQ**—the high-performance, memory-safe MQTT 3.1.1 & 5.0 broker powered by Rust and native wolfSSL TLS 1.3.
+Reference for configuring, securing and operating the `wolf-broker` binary.
 
----
+## Contents
 
-## Table of Contents
-1. [Architecture Overview](#1-architecture-overview)
-2. [Configuration Hierarchy & Loading](#2-configuration-hierarchy--loading)
-3. [Configuration Reference (`config/broker.toml`)](#3-configuration-reference-configbrokertoml)
-   - [Broker Instance Settings (`[broker]`)](#broker-instance-settings-broker)
-   - [Structured Logging & Observability (`[logging]`)](#structured-logging--observability-logging)
-   - [Network Listeners (`[listeners]`)](#network-listeners-listeners)
-   - [Cryptographic Security & wolfSSL TLS (`[security.tls]`)](#cryptographic-security--wolfssl-tls-securitytls)
-   - [Authentication & Access Control (`[security.auth]`)](#authentication--access-control-securityauth)
-   - [Advanced MQTT Protocol Engine (`[mqtt.protocol]`)](#advanced-mqtt-protocol-engine-mqttprotocol)
-   - [Queue Backpressure & Session Storage (`[mqtt.queues]`)](#queue-backpressure--session-storage-mqttqueues)
-   - [System Metrics & Telemetry (`[monitoring]`)](#system-metrics--telemetry-monitoring)
-4. [Operational Control & Process Management](#4-operational-control--process-management)
-   - [Command-Line Interface (CLI)](#command-line-interface-cli)
-   - [Signal Handling & Graceful Shutdown](#signal-handling--graceful-shutdown)
-   - [Access Control Lists (ACL) Format](#access-control-lists-acl-format)
-   - [PKI Certificate Lifecycle & SAN Verification](#pki-certificate-lifecycle--san-verification)
-   - [Linux Kernel & OS Production Tuning](#linux-kernel--os-production-tuning)
-   - [Systemd Service Unit Deployment](#systemd-service-unit-deployment)
-5. [High-Load TLS Benchmarking & Performance Tuning](#5-high-load-tls-benchmarking--performance-tuning)
+1. [Architecture](#1-architecture)
+2. [Configuration sources](#2-configuration-sources)
+3. [Configuration reference](#3-configuration-reference)
+4. [Command line, signals and shutdown](#4-command-line-signals-and-shutdown)
+5. [Access control (`acl.conf`)](#5-access-control-aclconf)
+6. [TLS and PKI](#6-tls-and-pki)
+7. [MQTT protocol behaviour](#7-mqtt-protocol-behaviour)
+8. [MQTT-SN gateway](#8-mqtt-sn-gateway)
+9. [Monitoring](#9-monitoring)
+10. [Deployment](#10-deployment)
+11. [Building, cross-compiling and FIPS](#11-building-cross-compiling-and-fips)
+12. [Benchmarks](#12-benchmarks)
 
 ---
 
-## 1. Architecture Overview
-
-WolfiMQ utilizes an asynchronous, non-blocking I/O event loop built on Tokio. Its concurrency model decouples network transport from packet processing and message dispatch:
+## 1. Architecture
 
 ```
-                      +-------------------------------------------------------+
-                      |       Multi-Transport IoT & Aerial Robotics Clients   |
-                      +---------------------------+---------------------------+
-                                                  |
-           +--------------------------------------+--------------------------------------+
-           |                                      |                                      |
-    [listeners.tcp]                        [listeners.tls]                       [listeners.mqtt_sn]
-  Plain TCP (Port 1883)               wolfSSL TLS 1.3 (Port 8883)             UDP (Port 1884, DTLS-Ready)
-  MQTT v3.1.1 / v5.0                     MQTT v3.1.1 / v5.0                      OASIS MQTT-SN v1.2
-           |                                      |                                      |
-           +--------------------------------------+--------------------------------------+
-                                                  |
-                                    +-------------v-------------+
-                                    |   Shared BrokerContext    |
-                                    +-------------+-------------+
-                                                  |
-        +-----------------------------------------+-----------------------------------------+
-        |                                         |                                         |
- +------v------+                           +------v------+                           +------v------+
- | Packet      |                           | Topic Trie  |                           | Retained &  |
- | Codecs      |                           | Routing     |                           | Session     |
- | (Zero-Copy) |                           | Radix Tree  |                           | Queues      |
- +-------------+                           +-------------+                           +-------------+
+  MQTT 3.1.1 / 5.0 over TCP     MQTT 3.1.1 / 5.0 over TLS     MQTT-SN 1.2 over UDP
+     [listeners.tcp]               [listeners.tls]             [listeners.mqtt_sn]
+            │                         wolfSSL                          │
+            └──────────────┬─────────────┴───────────────┬─────────────┘
+                           │       shared broker state     │
+                ┌──────────┴──────────┬──────────────┬────┴─────────────┐
+                │ sessions & queues   │ subscriptions│ retained store   │
+                │ (per client id)     │ (topic trie) │ (quotas, expiry) │
+                └─────────────────────┴──────────────┴──────────────────┘
 ```
 
-Key characteristics:
-- **Zero-Allocation Decoding:** High-frequency packets (such as `PINGREQ`, `CONNACK`, and small `PUBLISH` packets) avoid heap allocations on the critical dispatch path.
-- **Hardware-Accelerated TLS:** Native wolfSSL integration offloads symmetric cryptographic operations to hardware instructions (AES-NI, AVX-512, ARM NEON).
-- **Concurrent Radix Trie:** Topic filtering supports millions of wildcard subscribers with sub-microsecond lookup times.
+- Every connection has a reader task (decodes and handles client packets) and a writer task
+  (drains the session queue and encodes each packet for the client's protocol version).
+- A **session** belongs to a client id and may outlive its connection (persistent sessions).
+  It holds the subscriptions, a bounded outbound queue, the QoS 1/2 inflight window and the
+  inbound QoS 2 de-duplication state.
+- A background task runs once per second: session expiry, delayed Will messages, retained
+  message expiry and `$SYS` metrics.
+- All state lives in memory; a restart clears sessions and retained messages.
 
----
+## 2. Configuration sources
 
-## 2. Configuration Hierarchy & Loading
+Priority (highest first):
 
-WolfiMQ resolves configuration parameters according to the following precedence order:
-
-1. **CLI Arguments:** Parameters passed explicitly at runtime (e.g. `--config /etc/wolfimq/broker.toml`).
-2. **TOML Configuration File:** Read from the specified file or default path (`config/broker.toml`).
-3. **Compiled Defaults:** Hardcoded, production-safe fallback values.
+1. **Environment variables** `WOLFIMQ_<PATH>` — the TOML key path in upper case with `__`
+   between levels. Values are parsed as TOML literals; anything else is taken as a string.
+2. **The TOML file** — `--config <file>`, else `$WOLFIMQ_CONFIG`, else `config/broker.toml` if it
+   exists. A file named explicitly must exist.
+3. **Compiled defaults.**
 
 ```bash
-# Start with explicit configuration path
-wolf-mqtt-broker --config /etc/wolfimq/production.toml
-
-# Start with default path (config/broker.toml)
-wolf-mqtt-broker
+WOLFIMQ_LISTENERS__TCP__PORT=1884                       # integer
+WOLFIMQ_SECURITY__AUTH__ALLOW_ANONYMOUS=true            # boolean
+WOLFIMQ_BROKER__NODE_ID=edge-07                         # string (unquoted is fine)
+WOLFIMQ_SECURITY__TLS__ALPN_PROTOCOLS='["mqtt"]'        # array
+WOLFIMQ_LISTENERS__MQTT_SN__PREDEFINED_TOPICS__5=uav/x  # map entry
 ```
 
----
+`wolf-broker --print-config` shows the merged result. Unknown keys (typos, options removed in
+newer versions) are reported as warnings at startup.
 
-## 3. Configuration Reference (`config/broker.toml`)
+## 3. Configuration reference
 
-### Broker Instance Settings (`[broker]`)
+### `[broker]`
 
-Controls general instance identity and thread allocation:
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `node_id` | `"wolf-broker-node-01"` | Name of this broker instance (logs). |
+| `max_connections` | `100000` | Maximum simultaneous TCP + TLS connections; extra connections are closed immediately. `0` = unlimited. |
+| `worker_threads` | `0` | Tokio worker threads; `0` = one per CPU core. |
+| `connect_timeout_sec` | `10` | Time a new connection has to deliver its CONNECT packet (prevents slow-drip connections). |
+| `shutdown_grace_sec` | `5` | How long SIGINT / SIGTERM waits for connections to close. |
 
-```toml
-[broker]
-node_id = "wolf-broker-node-01"
-max_connections = 100000
-worker_threads = 0
+### `[logging]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `level` | `"info"` | `trace`, `debug`, `info`, `warn`, `error`. `RUST_LOG` overrides it when set. |
+| `format` | `"pretty"` | `pretty`, `compact` or `json`. |
+| `target` | `true` | Include the module path. |
+| `thread_ids` | `false` | Include thread ids. |
+| `line_numbers` | `false` | Include source line numbers. |
+
+### `[listeners.tcp]` — plain MQTT
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `enabled` | `true` | Plain TCP listener. The sample `broker.toml` disables it. |
+| `bind_address` | `"127.0.0.1"` | Credentials are not encrypted: keep this on loopback or a trusted network. |
+| `port` | `1883` | |
+
+### `[listeners.tls]` — MQTT over wolfSSL TLS
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `enabled` | `false` | TLS listener (settings in `[security.tls]`). The sample file enables it. |
+| `bind_address` | `"0.0.0.0"` | |
+| `port` | `8883` | |
+
+### `[listeners.mqtt_sn]` — MQTT-SN gateway (UDP)
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `enabled` | `false` | |
+| `bind_address` | `"0.0.0.0"` | |
+| `port` | `1884` | |
+| `gateway_id` | `1` | Sent in ADVERTISE / GWINFO. |
+| `advertise_interval_sec` | `900` | ADVERTISE broadcast period; `0` disables it. |
+| `advertise_address` | `"255.255.255.255"` | ADVERTISE destination (sent to `<address>:<port>`). |
+| `acl_user` | `""` | ACL account used by all MQTT-SN clients. Empty = anonymous identity (needs `allow_anonymous`). Must exist in the ACL file. |
+| `max_sessions` | `10000` | Maximum connected MQTT-SN clients. |
+| `allow_qos_minus1` | `true` | Accept connectionless QoS −1 publishes (predefined / short topic ids only). |
+| `retry_interval_sec` | `10` | Retransmission interval for unacknowledged QoS 1/2 messages and REGISTER (Tretry). |
+| `max_retries` | `3` | Retransmissions before the client is treated as lost (Nretry). |
+| `predefined_topics` | `{}` | Map of topic id (1–65534, as a string key) to topic name. |
+
+### `[security.tls]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `ca_cert_file` | `"certs/ca-cert.pem"` | CA used to verify client certificates. |
+| `server_cert_file` | `"certs/server-cert.pem"` | Server certificate chain (PEM). |
+| `server_key_file` | `"certs/server-key.pem"` | Server private key (PEM). |
+| `require_client_cert` | `true` | Mutual TLS: clients must present a certificate signed by `ca_cert_file`. |
+| `verify_client_identity` | `false` | Require the MQTT ClientID to equal the client certificate CN or one of its SANs (needs `require_client_cert`). |
+| `min_tls_version` | `"TLSv1.3"` | `"TLSv1.2"` or `"TLSv1.3"`. |
+| `ciphers` | `""` | wolfSSL cipher list, `:` or `,` separated (e.g. `TLS13-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256`). Empty = wolfSSL defaults. Invalid lists fail at startup. |
+| `alpn_protocols` | `["mqtt"]` | ALPN protocols; a client offering only other protocols is rejected. Empty = no ALPN. |
+| `handshake_timeout_sec` | `10` | Maximum TLS handshake duration. |
+
+### `[security.auth]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `allow_anonymous` | `false` | Accept clients without a user name; they use the `anonymous` ACL account, or full access if the ACL file declares none (a warning is logged). |
+| `password_hash_algorithm` | `"argon2id"` | Algorithm used by `--hash-password`: `argon2id` or `sha256` (legacy). Verification accepts both formats. |
+| `acl_file` | `"config/acl.conf"` | Accounts and rules. A missing or invalid file stops the broker at startup. Empty = no accounts. |
+| `max_concurrent_auth` | `0` | Concurrent Argon2 verifications; `0` = number of CPU cores. |
+| `client_id_takeover` | `"same_user"` | A new connection with a ClientID already in use replaces the old one only if it belongs to the same user (`same_user`), or always (`any`, the plain MQTT behaviour). |
+
+### `[mqtt.protocol]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `allow_v311` / `allow_v500` | `true` / `true` | Accepted protocol versions (others get CONNACK 0x01 / 0x84). |
+| `max_packet_size` | `4194304` | Largest packet accepted, fixed header included; announced to v5.0 clients. Larger packets close the connection (v5.0: DISCONNECT 0x95). Must not exceed `max_queued_bytes`. |
+| `receive_maximum` | `65535` | Inbound QoS 2 messages a v5.0 client may have unacknowledged (announced in CONNACK). |
+| `topic_alias_maximum` | `20` | Topic aliases a v5.0 client may use; `0` disables them. |
+| `max_keep_alive_sec` | `3600` | v5.0 clients asking for more (or for 0) are told this value via Server Keep Alive. `0` = no limit. |
+| `maximum_qos` | `2` | Highest QoS granted; subscriptions are downgraded, v5.0 publishes above it are rejected (0x9B). |
+| `allow_wildcard_subscriptions` | `true` | |
+| `allow_retained_messages` | `true` | When `false`, v5.0 retained publishes are rejected (0x9A) and v3.1.1 ones are delivered as non-retained. |
+| `allow_shared_subscriptions` | `true` | `$share/<group>/<filter>` subscriptions. |
+
+### `[mqtt.queues]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `max_queued_messages` | `5000` | Messages buffered per session (slow subscriber or offline persistent session). |
+| `max_queued_bytes` | `8388608` | Payload + topic bytes buffered per session. |
+| `queue_full_policy` | `"drop_oldest"` | `drop_oldest` keeps the newest messages, `drop_newest` keeps the oldest. Dropped messages are counted in `$SYS/broker/messages/dropped`. |
+| `default_message_expiry_sec` | `0` | Drop queued messages without a Message Expiry Interval after waiting this long. `0` = never. |
+| `max_session_expiry_sec` | `86400` | Cap for the v5.0 Session Expiry Interval, and lifetime of v3.1.1 `CleanSession=0` sessions after disconnect. `0` disables persistent sessions. |
+
+### `[mqtt.retained]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `max_messages` | `100000` | Maximum retained topics; new topics beyond it are not stored. |
+| `max_bytes` | `67108864` | Maximum total retained payload + topic bytes. |
+
+### `[monitoring]`
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `sys_topics_enabled` | `true` | Publish metrics under `$SYS/broker/...` (retained). |
+| `sys_update_interval_sec` | `30` | Publication period. |
+
+## 4. Command line, signals and shutdown
+
+```text
+wolf-broker [OPTIONS]
+  -c, --config <FILE>          Configuration file [env: WOLFIMQ_CONFIG]
+      --check-config           Validate configuration, ACL file and TLS files, then exit
+      --print-config           Print the effective configuration as TOML
+      --hash-password [PASS]   Print an acl.conf password_hash entry (stdin when PASS is omitted)
+  -h, --help                   Help
+  -V, --version                Version
 ```
 
-| Directive | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `node_id` | String | `"wolf-broker-node-01"` | Unique identifier for cluster node or individual broker. |
-| `max_connections` | Integer | `100000` | Maximum simultaneous open client connections allowed (`0` = unlimited). |
-| `worker_threads` | Integer | `0` | Tokio multi-threaded runtime worker threads (`0` = auto-detect available CPU cores). |
+Exit codes: `0` success, `1` runtime or configuration error, `2` invalid arguments.
 
----
-
-### Structured Logging & Observability (`[logging]`)
-
-Controls log verbosity, output format, and tracing metadata:
-
-```toml
-[logging]
-level = "info"
-format = "pretty"
-target = true
-thread_ids = false
-line_numbers = false
-```
-
-| Directive | Type | Values | Description |
-| :--- | :--- | :--- | :--- |
-| `level` | String | `trace`, `debug`, `info`, `warn`, `error` | Minimum logging threshold. |
-| `format` | String | `pretty`, `compact`, `json` | Log presentation: `pretty` for local terminal, `compact` for single-line, `json` for Datadog / ELK ingest. |
-| `target` | Boolean | `true` / `false` | Include Rust module name in each log entry. |
-| `thread_ids` | Boolean | `true` / `false` | Include OS thread ID for diagnosing lock contention. |
-| `line_numbers` | Boolean | `true` / `false` | Include source code file name and line number. |
-
----
-
-### Network Listeners (`[listeners]`)
-
-Configures multi-protocol listeners across unencrypted TCP, encrypted TLS 1.3 / mTLS, and UDP MQTT-SN (with DTLS):
-
-```toml
-[listeners.tcp]
-enabled = true
-bind_address = "0.0.0.0"
-port = 1883
-
-[listeners.tls]
-enabled = true
-bind_address = "0.0.0.0"
-port = 8883
-
-[listeners.mqtt_sn]
-enabled = true
-bind_address = "0.0.0.0"
-port = 1884
-gateway_id = 1
-advertise_interval_sec = 900 # Send ADVERTISE frames every 15 mins (0 to disable)
-
-[listeners.mqtt_sn.predefined_topics]
-"1" = "uav/drone_01/telemetry/gps"
-"2" = "uav/drone_01/commands"
-```
-
-| Directive | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `listeners.tcp.enabled` | Boolean | `true` | Enables standard unencrypted TCP listener for MQTT 3.1.1 & 5.0 (port 1883). |
-| `listeners.tls.enabled` | Boolean | `true` | Enables encrypted TLS 1.3 / 1.2 mTLS listener for MQTT 3.1.1 & 5.0 (port 8883). |
-| `listeners.mqtt_sn.enabled` | Boolean | `true` | Enables native OASIS MQTT-SN v1.2 listener over UDP (port 1884). |
-| `listeners.mqtt_sn.gateway_id` | Integer | `1` | Unique Gateway Identifier (1..255) advertised in `GWINFO` and `ADVERTISE` frames. |
-| `listeners.mqtt_sn.advertise_interval_sec`| Integer | `900` | Periodic `ADVERTISE` broadcast interval (seconds). Set to `0` to disable broadcast. |
-| `listeners.mqtt_sn.predefined_topics` | Table | `{}` | Key-value map of 16-bit Topic IDs (`"1"`, `"2"`) to full topic paths for bandwidth-constrained links. |
-
-#### Low-Bandwidth Optimizations for Drones & Sensor Networks
-1. **Predefined Topic IDs:** Eliminates the overhead of transmitting ASCII topic paths over RF links. Drones publish with a 2-byte numeric ID (`0x0001`), and WolfiMQ automatically resolves and fans out the message to standard MQTT subscribers (e.g. `uav/drone_01/telemetry/gps`).
-2. **QoS -1 (Ultra-Fast Fire-and-Forget):** Constrained edge nodes and UAVs can transmit datagrams directly without prior `CONNECT` handshakes or session initialization.
-3. **Sleeping Client Message Buffering:** Battery-saving edge devices can enter an asleep state (`DISCONNECT { duration: T }`). WolfiMQ automatically buffers downstream messages and transfers them sequentially upon receiving a wake-up `PINGREQ { client_id }`, concluding with `PINGRESP`.
-4. **Session Keepalive Reaper & LWT Timeout:** Background reaper monitors client heartbeats. If a client fails to transmit within `1.5 * duration`, WolfiMQ automatically cleans the dead session and publishes its registered Last Will & Testament to all subscribers.
-5. **Transport Security & DTLS Roadmap:** wolfSSL is compiled with `-DWOLFSSL_DTLS=ON` in preparation for DTLS 1.2 / 1.3 encapsulation, providing datagram encryption and mutual certificate authentication across UDP channels.
-6. **Cross-Protocol Hybrid Delivery:** UDP datagrams published by MQTT-SN clients are immediately dispatched into the central `TopicTrie` and delivered to TCP/TLS subscribers in real-time, and vice versa.
-
-#### Exactly-Once Delivery (QoS 2) State Machine & Deduplication
-WolfiMQ implements the complete 4-step state machine specified in OASIS MQTT v3.1.1/v5.0 §4.3.3 and OASIS MQTT-SN v1.2 §5.4.10 - §5.4.12 across all transports:
-- **Inbound Publisher Handshake:**
-  1. Client sends `PUBLISH` with `QoS = 2` and `PacketId = N`.
-  2. Broker checks inflight packet ID set. If a duplicate packet ID is detected (e.g. from network retry), the broker acknowledges with `PUBREC` without duplicate subscriber fan-out.
-  3. Broker fans out message to matching subscribers and replies with `PUBREC`.
-  4. Publisher sends `PUBREL`.
-  5. Broker releases inflight lock and replies with `PUBCOMP`.
-- **Outbound Subscriber Handshake:**
-  1. Broker forwards `PUBLISH` (`QoS = 2`, `PacketId = M`) to subscriber.
-  2. Subscriber responds with `PUBREC`.
-  3. Broker responds with `PUBREL`.
-  4. Subscriber concludes transaction with `PUBCOMP`.
-- **Benchmarked Performance:** Processes over **2.19 Million complete 4-step handshakes/sec** with mean latency under `457 ns` in release mode.
-
-> [!TIP]
-> In production environments with public internet exposure, set `listeners.tcp.enabled = false` and exclusively expose `listeners.tls` on port 8883 and `listeners.mqtt_sn` on port 1884.
-
----
-
-### Cryptographic Security & wolfSSL TLS (`[security.tls]`)
-
-Controls the native TLS 1.3 / mTLS cryptographic subsystem:
-
-```toml
-[security.tls]
-ca_cert_file = "certs/ca-cert.pem"
-server_cert_file = "certs/server-cert.pem"
-server_key_file = "certs/server-key.pem"
-require_client_cert = true
-verify_client_identity = false
-min_tls_version = "TLSv1.3"
-ciphers = "TLS13-AES128-GCM-SHA256,TLS13-AES256-GCM-SHA384,TLS13-CHACHA20-POLY1305-SHA256"
-alpn_protocols = ["mqtt"]
-psk_enabled = false
-psk_identity_hint = "wolf-broker-psk"
-session_tickets_enabled = true
-session_ticket_lifetime_sec = 7200
-hardware_crypto_engine = "none"
-```
-
-| Directive | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `ca_cert_file` | Path | `"certs/ca-cert.pem"` | Path to Root CA certificate file (PEM format) used to verify client certificates. |
-| `server_cert_file` | Path | `"certs/server-cert.pem"` | Path to broker server X.509 certificate (PEM format). Must contain SAN entries. |
-| `server_key_file` | Path | `"certs/server-key.pem"` | Path to broker private key (PKCS#8 or RSA PEM format). |
-| `require_client_cert` | Boolean | `true` | **Mutual TLS (mTLS):** Rejects any client that does not present a valid certificate signed by the CA. |
-| `verify_client_identity`| Boolean | `false` | Verifies that client certificate Common Name (CN) or SAN matches the connecting MQTT `ClientID`. |
-| `min_tls_version` | String | `"TLSv1.3"` | Minimum protocol version: `"TLSv1.2"` or `"TLSv1.3"`. |
-| `ciphers` | String | `"TLS13-AES128..."` | Preferred cipher suites. |
-| `alpn_protocols` | List | `["mqtt"]` | Application-Layer Protocol Negotiation (ALPN) protocol IDs negotiated during handshake. |
-| `psk_enabled` | Boolean | `false` | Enable Pre-Shared Key (PSK) authentication for microcontrollers lacking PKI support. |
-| `session_tickets_enabled` | Boolean | `true` | Enable TLS 1.3 0-RTT / session ticket resumption for fast reconnects. |
-| `hardware_crypto_engine`| String | `"none"` | Hardware acceleration engine (e.g. `"intel_qat"`, `"cavium"`). |
-
----
-
-### Authentication & Access Control (`[security.auth]`)
-
-```toml
-[security.auth]
-allow_anonymous = false
-password_hash_algorithm = "argon2id"
-acl_file = "config/acl.conf"
-```
-
-| Directive | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `allow_anonymous` | Boolean | `false` | Allow clients without username/password to connect. Set to `false` in production. |
-| `password_hash_algorithm`| String | `"argon2id"` | Password hash algorithm: `"argon2id"` (recommended, memory-hard) or `"sha256"`. |
-| `acl_file` | Path | `"config/acl.conf"` | Path to Access Control List rules file. |
-
----
-
-### Advanced MQTT Protocol Engine (`[mqtt.protocol]`)
-
-Fine-tunes MQTT 3.1.1 and MQTT 5.0 specifications and capabilities:
-
-```toml
-[mqtt.protocol]
-allow_v311 = true
-allow_v500 = true
-max_packet_size = 4194304
-receive_maximum = 65535
-topic_alias_maximum = 20
-max_keep_alive_sec = 3600
-allow_wildcard_subscriptions = true
-allow_retained_messages = true
-allow_shared_subscriptions = true
-```
-
-| Directive | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `allow_v311` | Boolean | `true` | Enable support for legacy MQTT 3.1.1 clients. |
-| `allow_v500` | Boolean | `true` | Enable support for modern MQTT 5.0 clients. |
-| `max_packet_size` | Integer | `4194304` (4 MB) | Maximum allowable single packet size. Must not exceed `max_queued_bytes`. Larger packets are rejected. |
-| `receive_maximum` | Integer | `65535` | Flow control quota for unacknowledged QoS 1/2 messages per client. |
-| `topic_alias_maximum` | Integer | `20` | Maximum topic aliases a client can register to compress packet headers. |
-| `max_keep_alive_sec` | Integer | `3600` (1 hr) | Maximum allowable client keep-alive interval. |
-| `allow_wildcard_subscriptions` | Boolean | `true` | Permits topic subscriptions containing `+` and `#`. |
-| `allow_retained_messages` | Boolean | `true` | Permits publishers to set the `RETAIN` flag. |
-| `allow_shared_subscriptions` | Boolean | `true` | Permits load-balanced subscriptions via `$share/<group>/<topic>`. |
-
----
-
-### Queue Backpressure & Session Storage (`[mqtt.queues]`)
-
-Governs slow consumer isolation and memory protection:
-
-```toml
-[mqtt.queues]
-max_queued_messages = 5000
-max_queued_bytes = 8388608
-queue_full_policy = "drop_oldest"
-default_message_expiry_sec = 86400
-max_session_expiry_sec = 604800
-```
-
-| Directive | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `max_queued_messages` | Integer | `5000` | Maximum messages buffered per disconnected or slow subscriber. |
-| `max_queued_bytes` | Integer | `8388608` (8 MB) | Maximum RAM byte quota buffered per subscriber queue. Always $\ge$ `max_packet_size`. |
-| `queue_full_policy` | String | `"drop_oldest"` | Action when buffer exceeds limits: `"drop_oldest"` or `"drop_newest"`. |
-| `default_message_expiry_sec` | Integer | `86400` (24 hr) | Default Message Expiry Interval TTL for buffered messages (0 = no expiry). |
-| `max_session_expiry_sec` | Integer | `604800` (7 days) | Maximum allowable Session Expiry Interval for persistent sessions. |
-
----
-
-### System Metrics & Telemetry (`[monitoring]`)
-
-Governs periodic reporting under the `$SYS/` internal topic tree:
-
-```toml
-[monitoring]
-sys_topics_enabled = true
-sys_update_interval_sec = 30
-```
-
-Topics emitted every `sys_update_interval_sec`:
-- `$SYS/broker/version`: `"WolfiMQ v0.2.1 (TLS 1.3)"`
-- `$SYS/broker/uptime`: Uptime in seconds.
-- `$SYS/broker/clients/connected`: Current number of active TCP & TLS sessions.
-- `$SYS/broker/messages/received`: Total messages ingested.
-- `$SYS/broker/messages/sent`: Total messages delivered.
-
----
-
-## 4. Operational Control & Process Management
-
-### Command-Line Interface (CLI)
-
-```bash
-# Print help and flags
-wolf-mqtt-broker --help
-
-# Start with customized configuration
-wolf-mqtt-broker --config /path/to/custom_broker.toml
-
-# Start with shorthand flag
-wolf-mqtt-broker -c /etc/wolfimq/broker.toml
-
-# Print broker version
-wolf-mqtt-broker --version
-```
-
-### Signal Handling & Graceful Shutdown
-
-WolfiMQ listens for operating system signals to perform clean session drainage:
-
-| Signal | Action |
+| Signal | Effect |
 | :--- | :--- |
-| `SIGINT` (Ctrl+C) | Stops accepting new connections; flushes active queues; sends `DISCONNECT` packets; cleanly terminates. |
-| `SIGTERM` (Kubernetes/Systemd) | Initiates graceful connection shutdown within 5-second grace period before exit. |
+| `SIGINT`, `SIGTERM` | Stop accepting connections, send DISCONNECT 0x8B (Server shutting down) to v5.0 clients, close connections, wait up to `shutdown_grace_sec`. |
+| `SIGHUP` | Reload `acl_file`. The new file replaces all accounts atomically; if it does not parse, the old rules stay active and an error is logged. Existing connections keep the permissions they authenticated with. |
 
----
+Prefer reading the password from stdin so it does not end up in the shell history:
 
-### Access Control Lists (ACL) Format
+```bash
+wolf-broker --hash-password            # type the password, press Enter
+# password_hash:$argon2id$v=19$m=19456,t=2,p=1$...
+```
 
-Configured in `config/acl.conf`:
+## 5. Access control (`acl.conf`)
 
 ```ini
-# Anonymous access definition
-user anonymous
+# user <name> [password:<pass>] [password_hash:<hash>] [role:<role>] [rooms:<r1,r2>|rooms:*]
+user superadmin password_hash:$argon2id$... role:admin rooms:*
+
+user dev_sarah password_hash:$argon2id$... role:member rooms:engineering
+topic readwrite users/%u/notes          # rules listed under a user apply to that user
+
+user sensor_node password_hash:$argon2id$... role:device
+
+user sn_gateway                          # no password: cannot log in, used as acl_user
+topic readwrite uav/#
+
+user anonymous                           # used when allow_anonymous = true
 topic read public/#
-topic write public/telemetry/+
-
-# Specific authenticated client
-user sensor_node_01
-topic write sensors/%c/data
-topic read sensors/%c/commands
-
-# Operations administrator
-user admin
-topic readwrite #
-topic read $SYS/#
+topic deny #
 ```
 
-Substitutions:
-- `%u`: Substituted with the authenticated username.
-- `%c`: Substituted with the connecting MQTT Client ID.
+- `topic <read|write|readwrite|deny> <pattern>` (`pattern` is a synonym of `topic`).
+- Macros: `%u` user name, `%c` ClientID, `%r` each of the user's rooms (`rooms:*` = any room).
+  A substitution value containing `+`, `#`, `/` or NUL never matches, so ClientIDs or user
+  names cannot widen a rule.
+- Syntax errors (unknown directives, attributes or permissions, invalid patterns, rules before
+  any `user`) are reported with their line number and stop the broker / reject a reload.
 
----
+**Evaluation (first match wins).** For each user the rules are, in order: the rules listed
+under the user, then the role defaults below.
 
-### PKI Certificate Lifecycle & SAN Verification
+- *Publish* to a topic: the first rule whose pattern matches the topic decides. `deny` refuses;
+  a rule granting write allows; a rule without write permission is skipped.
+- *Subscribe* to a filter: the first allow rule that **covers** the entire filter (every topic
+  the filter can match) with read permission grants it; any earlier `deny` rule that merely
+  **overlaps** the filter refuses it. Example: a member cannot subscribe to
+  `rooms/engineering/#` because it overlaps the denied `rooms/%r/admin/#`.
+- Nothing matched: denied. `admin` users bypass all checks.
 
-Modern TLS 1.3 clients strictly validate **Subject Alternative Names (SAN)** according to RFC 5280. To regenerate valid local development / testing PKI certificates:
+| Role | Default rules (after the user's own rules) |
+| :--- | :--- |
+| `admin` | unrestricted |
+| `moderator` | readwrite `rooms/%r/#`, readwrite `users/%u/#` |
+| `member` | deny `rooms/%r/admin/#`; readwrite `rooms/%r/chat`, `rooms/%r/presence`, `users/%u/private`; read `rooms/%r/announcements` |
+| `viewer` | read `rooms/%r/chat`, `rooms/%r/announcements`; deny `rooms/%r/#` |
+| `device` | write `devices/%c/telemetry`; read `devices/%c/commands`; deny `#`. The user name must equal the ClientID. |
+| none | only the listed rules |
+
+Wildcards in the first level never match topics starting with `$` (MQTT §4.7.2), so `#` does
+not grant `$SYS/#`; list it explicitly when needed.
+
+Denied operations: v5.0 clients get reason code 0x87 (Not authorized) in PUBACK / PUBREC /
+SUBACK / CONNACK; v3.1.1 clients get SUBACK 0x80, CONNACK 0x04 / 0x05, and denied publishes are
+acknowledged and dropped (v3.1.1 has no negative acknowledgement).
+
+## 6. TLS and PKI
+
+wolfSSL is linked statically. TLS 1.3 is the default; set `min_tls_version = "TLSv1.2"` to also
+accept TLS 1.2 clients. TLS 1.0 / 1.1 are not compiled in.
+
+Development PKI:
 
 ```bash
-# Generate CA, Server, and Client certificates with SAN extensions
-task certs:gen
+bash scripts/generate_certs.sh certs            # CA, server (CN=localhost, SAN localhost/127.0.0.1), client (CN=client01)
+CLIENT_CN=sensor-17 bash scripts/generate_certs.sh certs-sensor17
+openssl x509 -in certs/server-cert.pem -noout -ext subjectAltName
 ```
 
-Verification command:
-```bash
-openssl x509 -in certs/server-cert.pem -text -noout | grep -A 1 "Subject Alternative Name"
-# Output must include:
-# DNS:localhost, IP:127.0.0.1
-```
+With `verify_client_identity = true` a client presenting a certificate for `sensor-17` must
+connect with ClientID `sensor-17` (CN or any SAN DNS name); otherwise CONNACK 0x87 / 0x05.
 
----
-
-### Linux Kernel & OS Production Tuning
-
-To sustain **over 100,000 concurrent TLS connections** with ultra-low latency, apply the following sysctl parameters:
+Test a TLS listener with the bundled simulator:
 
 ```bash
-# Append to /etc/sysctl.d/99-wolfimq.conf
-sudo tee /etc/sysctl.d/99-wolfimq.conf << 'EOF'
-# Increase max open connections backlog
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-
-# Optimize TCP socket memory buffers
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-
-# Accelerate socket recycling
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_tw_reuse = 1
-
-# Max memory map count for high concurrency
-vm.max_map_count = 262144
-EOF
-
-sudo sysctl --system
+wolf-simulate --tls --port 8883 --ca certs/ca-cert.pem --cert certs/client-cert.pem --key certs/client-key.pem
 ```
 
-Increase file descriptor limits:
-```bash
-# /etc/security/limits.d/wolfimq.conf
-wolfimq soft nofile 1000000
-wolfimq hard nofile 1000000
-```
+## 7. MQTT protocol behaviour
 
----
+- **Versions:** MQTT v3.1.1 (level 4) and v5.0 (level 5). MQTT 3.1 (`MQIsdp`, level 3) gets
+  CONNACK 0x01. The first packet must be CONNECT; a second CONNECT is a protocol error.
+- **Client identifiers:** empty ClientIDs get a generated id (`wolfimq-<hex>`, returned to v5.0
+  clients as Assigned Client Identifier); v3.1.1 requires `CleanSession = 1` for that.
+- **Keep alive:** the connection is closed after 1.5 × keep alive without a complete packet
+  (v5.0: DISCONNECT 0x8D), and the Will is published.
+- **Sessions:** v3.1.1 `CleanSession = 0` and v5.0 Session Expiry Interval > 0 keep the session
+  after disconnect (capped by `max_session_expiry_sec`; v5.0 clients are told the effective
+  value). Reconnecting with `clean_start = 0` resumes it: CONNACK session present = 1, queued
+  messages are delivered, unacknowledged QoS 1/2 messages are resent with DUP and their
+  original packet ids.
+- **Takeover:** a new connection with a ClientID in use closes the old connection (v5.0:
+  DISCONNECT 0x8E), subject to `client_id_takeover`.
+- **Will:** published on abnormal close, keep-alive timeout, takeover, or DISCONNECT 0x04. A
+  v5.0 Will Delay Interval postpones it; resuming the session before then cancels it.
+- **QoS:** each subscriber receives `min(publish QoS, granted QoS)`. Outbound packet ids are
+  allocated per session and never reused while in flight. Inbound QoS 2 duplicates (same
+  packet id before PUBREL) are acknowledged but not delivered twice.
+- **Flow control:** a v5.0 client's Receive Maximum limits unacknowledged QoS 1/2 deliveries;
+  its Maximum Packet Size causes larger messages to be skipped for it.
+- **Message expiry:** expired messages are not delivered; forwarded messages carry the remaining
+  lifetime.
+- **Retained messages:** zero-length payload clears; delivered with RETAIN = 1 on subscribe
+  (subject to Retain Handling), never to shared subscriptions.
+- **Shared subscriptions:** `$share/<group>/<filter>`; each message goes to one member,
+  round-robin, preferring connected members.
+- **Errors:** malformed packets close the connection (v5.0: DISCONNECT 0x81 / 0x82 / 0x95 / …
+  before closing).
 
-### Systemd Service Unit Deployment
+## 8. MQTT-SN gateway
 
-Create `/etc/systemd/system/wolfimq.service`:
+The gateway implements MQTT-SN v1.2 over UDP as an aggregating gateway: SN clients get broker
+sessions like MQTT clients, so subscriptions, retained messages and Will messages are shared.
+
+- **Identity:** set `acl_user` to an account (usually without a password) whose rules describe
+  what SN devices may do. MQTT-SN has no credentials and UDP source addresses can be spoofed;
+  run the gateway only on trusted networks.
+- **Connect:** `CONNECT` (optionally with the Will handshake `WILLTOPICREQ` → `WILLTOPIC` →
+  `WILLMSGREQ` → `WILLMSG`) → `CONNACK`. Reconnecting from the same address replaces the link.
+- **Topics:** predefined ids from `predefined_topics`, two-character short names, and
+  `REGISTER`. When a message arrives for a topic the client has no id for, the gateway sends
+  `REGISTER` and publishes only after `REGACK`. Wildcard subscriptions return topic id 0.
+- **QoS:** −1 (no connection, predefined / short ids only, still authorized against
+  `acl_user`), 0, 1 and 2. One QoS 1/2 message is in flight per client and retransmitted every
+  `retry_interval_sec` with DUP set, up to `max_retries`, after which the client is lost and its
+  Will is published.
+- **Sleeping clients:** `DISCONNECT` with a duration puts the client to sleep; messages are queued
+  in its session (subject to the queue limits). `PINGREQ` with the ClientID wakes it: queued
+  messages are sent, then `PINGRESP`, and the client sleeps again. No message within 1.5 × the
+  sleep duration ends the session.
+- **Forwarders:** encapsulated frames (`0xFE`) are answered encapsulated for the same wireless
+  node id.
+
+## 9. Monitoring
+
+Retained topics published every `sys_update_interval_sec`:
+
+| Topic | Value |
+| :--- | :--- |
+| `$SYS/broker/version` | `WolfiMQ <version>` |
+| `$SYS/broker/uptime` | seconds |
+| `$SYS/broker/clients/connected` | connected sessions (MQTT + MQTT-SN) |
+| `$SYS/broker/clients/total` | sessions including disconnected persistent ones |
+| `$SYS/broker/messages/received` / `sent` / `dropped` | counters |
+| `$SYS/broker/bytes/received` / `sent` | payload bytes |
+| `$SYS/broker/retained/count` | retained topics |
+| `$SYS/broker/subscriptions/count` | subscriptions |
+
+Subscribe with an account allowed to read `$SYS/#` (admins are).
+
+## 10. Deployment
+
+### systemd
 
 ```ini
+# /etc/systemd/system/wolfimq.service
 [Unit]
-Description=WolfiMQ - High-Performance MQTT Broker with Native TLS 1.3
-After=network.target network-online.target
+Description=WolfiMQ MQTT broker
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -441,257 +369,77 @@ Type=simple
 User=wolfimq
 Group=wolfimq
 WorkingDirectory=/opt/wolfimq
-ExecStart=/opt/wolfimq/bin/wolf-mqtt-broker --config /opt/wolfimq/config/broker.toml
-Restart=always
+ExecStart=/opt/wolfimq/bin/wolf-broker --config /opt/wolfimq/config/broker.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
 RestartSec=3s
-LimitNOFILE=1000000
-LimitNPROC=500000
-StandardOutput=journal
-StandardError=journal
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/opt/wolfimq
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Enable and start the service:
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now wolfimq
-sudo systemctl status wolfimq
+sudo systemctl daemon-reload && sudo systemctl enable --now wolfimq
+sudo systemctl reload wolfimq        # reload acl.conf
 ```
 
----
+Binding ports below 1024 requires `AmbientCapabilities=CAP_NET_BIND_SERVICE`.
 
-## 5. High-Load TLS Benchmarking & Performance Tuning
+### Operating system limits
 
-### Standardized Methodology ("توحيد الشروط")
-
-To guarantee scientific reproducibility when comparing WolfiMQ against other brokers (e.g. Eclipse Mosquitto, EMQX, NanoMQ), all benchmarks enforce strictly identical parameters:
-
-| Parameter | Standardized Setting | Rationale |
-| :--- | :--- | :--- |
-| **TLS Protocol** | RFC 8446 TLS 1.3 | Modern secure transport standard. |
-| **Cipher Suite** | `TLS_AES_256_GCM_SHA384` / `TLS_AES_128_GCM_SHA256` | Identical symmetric encryption work. |
-| **Authentication**| Mutual TLS (mTLS) with 2048-bit RSA / ECC PKI | Symmetrical cryptographic handshake burden. |
-| **Network Interface**| Loopback TCP Socket (`127.0.0.1`) | Eliminates external network jitter. |
-| **Concurrency Load**| 8 to 16 Concurrent Parallel TLS Client Sessions | Realistic multi-device connection pressure. |
-| **Payload Size** | 128 Bytes & 1 KB | Standard industrial telemetry packets. |
-| **Timestamping** | 8-byte Monotonic Clock in Payload | Nanosecond-resolution RTT latency calculation. |
-
-### Running High-Load Benchmarks
-
-Using Go-Task (`task`):
+Each connection uses one file descriptor; raise `LimitNOFILE` (systemd) or `nofile`
+(`/etc/security/limits.d/`) to at least `max_connections` plus a margin. For many concurrent
+connections also consider:
 
 ```bash
-# 1. Run Standard 8-Client Concurrent TLS 1.3 Benchmark (10,000 msgs)
-task bench:tls
-
-# 2. Run Extreme 16-Client Concurrent TLS 1.3 Stress Benchmark (16,000 msgs)
-task bench:tls:stress
-
-# 3. Run Automated Side-by-Side Comparison against local Mosquitto
-task bench:tls:compare
-
-# 4. Custom invocation with arbitrary concurrency & message volumes
-cargo run --release --bin wolf-bench-tls -- \
-  --concurrency 32 \
-  --count 50000 \
-  --payload-size 256 \
-  --markdown-output custom_results.md
+# /etc/sysctl.d/99-wolfimq.conf
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
 ```
 
-### Empirical High-Load Benchmark Metrics
-
-| Metric | Single Client Baseline | 8 Concurrent Clients | 16 Concurrent Clients |
-| :--- | :--- | :--- | :--- |
-| **Throughput (msgs/sec)** | **75,767 msgs/sec** | **157,583 msgs/sec** | **211,883 msgs/sec** |
-| **Wire Bandwidth** | 9.25 MB/s | 19.24 MB/s | 25.86 MB/s |
-| **Total Handshake Time** | 64.08 ms | 64.97 ms | 69.38 ms |
-| **Mean Handshake per Client**| 64.08 ms | **8.12 ms** | **4.34 ms** |
-| **Mean RTT Latency** | 13.20 µs | 14.06 ms (pipeline) | 22.91 ms (pipeline) |
-| **p50 Latency** | 12.14 µs | 11.54 ms | 19.67 ms |
-| **p99 Tail Latency** | 23.76 µs | 52.78 ms | 61.67 ms |
-| **Packet Delivery Rate** | 100.0% (Zero Drops) | 100.0% (Zero Drops) | 100.0% (Zero Drops) |
-
-> [!NOTE]
-> As concurrency increases from 1 to 16 clients, WolfiMQ scales near-linearly from **75.7K msgs/sec** to **211.8K msgs/sec** over TLS 1.3, demonstrating exceptional multi-threaded event-loop efficiency with zero dropped packets.
-
----
-
-## 6. Multi-Architecture Release Builds & FIPS Variants
-
-WolfiMQ provides automated continuous delivery via `.github/workflows/release.yml` targeting both 64-bit x86 and ARM platforms, available in standard and FIPS-Ready cryptographic flavors:
-
-### Distribution Matrix
-
-| Package Name | Architecture | Platform ABI | Cryptographic Engine | FIPS 140-2/3 |
-| :--- | :--- | :--- | :--- | :---: |
-| `wolfimq-*-linux-amd64-wolfssl.tar.gz` | `x86_64` (AMD64) | GNU / Linux | Native wolfSSL TLS 1.3 | Standard |
-| `wolfimq-*-linux-amd64-wolfssl-fips.tar.gz` | `x86_64` (AMD64) | GNU / Linux | wolfSSL FIPS 140-2/3 Module | FIPS-Ready |
-| `wolfimq-*-linux-arm64-wolfssl.tar.gz` | `aarch64` (ARM64) | GNU / Linux | Native wolfSSL TLS 1.3 | Standard |
-| `wolfimq-*-linux-arm64-wolfssl-fips.tar.gz` | `aarch64` (ARM64) | GNU / Linux | wolfSSL FIPS 140-2/3 Module | FIPS-Ready |
-
-### Building Locally
+## 11. Building, cross-compiling and FIPS
 
 ```bash
-# Compile standard release binary (AMD64)
-task build:release
-
-# Compile FIPS 140-2/3 Ready release binary
-task build:release:fips
-
-# Package complete release distribution archive locally
-task package:release
+cargo build --release                                         # native build
+task build:cross TARGET=aarch64-unknown-linux-gnu             # needs cargo-zigbuild + zig
+cargo zigbuild --release --target x86_64-unknown-linux-musl   # static Linux binary
 ```
 
-### Verifying Binary Cryptography
+`build.rs` compiles the wolfSSL submodule with CMake (via the `cmake` crate) into Cargo's
+`OUT_DIR` for the selected target, with TLS 1.3 / 1.2, ALPN, SNI, Curve25519 and hardening
+enabled and old TLS versions, DTLS and examples disabled.
 
-Run `--version` on any deployed binary:
+**FIPS-Ready:** download the wolfSSL FIPS-Ready bundle, extract it to
+`external/wolfssl-fips-bundle/` (or set `WOLFSSL_FIPS_BUNDLE_DIR`), then:
+
 ```bash
-./bin/wolf-broker --version
-```
-- **Standard variant:** `wolf-mqtt-broker v0.3.3 (wolfSSL TLS 1.3 / mTLS)`
-- **FIPS variant:** `wolf-mqtt-broker v0.3.3 (wolfSSL FIPS-Ready build - FIPS-approved algorithms, TLS 1.3 / mTLS)`
-
----
-
-## 7. Dynamic Topic Patterns, Virtual Rooms & Credentials RBAC
-
-WolfiMQ includes an enterprise-grade **Credentials & Role-Based Access Control (RBAC) Engine** with native support for **dynamic topic pattern substitution** and **virtual room isolation**.
-
-### Architecture Overview
-
-```
-                      ┌──────────────────────────────────────┐
-                      │         Incoming MQTT Client         │
-                      │  (CONNECT: Username, Password, CID)  │
-                      └──────────────────┬───────────────────┘
-                                         │
-                                         ▼
-                      ┌──────────────────────────────────────┐
-                      │              AclEngine               │
-                      │   - Verifies SHA-256 Credentials     │
-                      │   - Assigns Role & Allowed Rooms     │
-                      └──────────────────┬───────────────────┘
-                                         │
-                 ┌───────────────────────┼───────────────────────┐
-                 │                       │                       │
-                 ▼                       ▼                       ▼
-      ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
-      │   Admin / Super     │ │   Room Moderator    │ │    Room Member      │
-      │   (#, $SYS/#)       │ │ (rooms/%r/# write)  │ │ (chat/presence pub) │
-      │   Full Access       │ │ (admin/control pub) │ │ (announcements sub) │
-      └─────────────────────┘ └─────────────────────┘ └─────────────────────┘
-                 │                       │                       │
-                 ▼                       ▼                       ▼
-      ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
-      │     Room Viewer     │ │     IoT Device      │ │   Custom / Anon     │
-      │ (chat/announc read) │ │ (devices/%c/telem)  │ │   Explicit Rules    │
-      │ (publish = Denied)  │ │ (devices/%c/cmd)    │ │   (Fallback / Deny) │
-      └─────────────────────┘ └─────────────────────┘ └─────────────────────┘
+cargo build --release --no-default-features --features wolfssl-fips
+wolf-broker --version     # reports the FIPS-Ready build
 ```
 
-### Pattern Macro Specifications
+The bundle is built with wolfSSL's autotools (`--enable-fips=ready`) including the in-core
+integrity hash step. FIPS-Ready is not a CMVP-validated module.
 
-| Macro | Description | Example Expansion |
-| :--- | :--- | :--- |
-| `%u` | Authenticated client username | `users/%u/private` $\rightarrow$ `users/alice/private` |
-| `%c` | Connecting MQTT Client Identifier (`client_id`) | `devices/%c/telemetry` $\rightarrow$ `devices/sensor_01/telemetry` |
-| `%r` | Virtual Room identifier from user's `allowed_rooms` | `rooms/%r/chat` $\rightarrow$ `rooms/engineering/chat` |
-| `+` | MQTT single-level topic wildcard | `rooms/+/announcements` |
-| `#` | MQTT multi-level topic wildcard (terminal segment) | `rooms/engineering/#` |
+## 12. Benchmarks
 
-> [!TIP]
-> When a user has access to multiple rooms (e.g. `rooms: ["alpha", "beta"]`), the `%r` macro automatically evaluates against all assigned rooms. Users cannot access or eavesdrop on unassigned rooms.
+Benchmark results are generated by CI (see the release notes and `BENCHMARKS.md` of each
+release). Locally:
 
-### Role Hierarchy & Default Permission Profiles
-
-1. **`Admin` (`UserRole::Admin`)**:
-   - Universal Read/Write permission across all topics (`#`) and broker telemetry (`$SYS/#`).
-   - Unrestricted access to all rooms (`rooms:*`).
-
-2. **`Moderator` (`UserRole::Moderator`)**:
-   - Full management (`rooms/%r/#`) and administrative command execution (`rooms/%r/admin/control`) over assigned rooms.
-   - Can publish announcements to all room members and manage room topics.
-
-3. **`Member` (`UserRole::Member`)**:
-   - Interactive messaging on `rooms/%r/chat` (Read/Write) and `rooms/%r/presence` (Read/Write).
-   - Read-only subscription to `rooms/%r/announcements`.
-   - Explicitly denied from publishing to announcements or accessing `rooms/%r/admin/#`.
-
-4. **`Viewer` (`UserRole::Viewer`)**:
-   - Read-only observer on `rooms/%r/chat` and `rooms/%r/announcements`.
-   - Publish attempts are rejected/dropped by the broker.
-
-5. **`Device` (`UserRole::Device`)**:
-   - Strictly scoped to hardware telemetry `devices/%c/telemetry` (Write-only) and command receiver `devices/%c/commands` (Read-only).
-   - Universal wildcards and room topics are strictly forbidden.
-
-6. **`Custom(String)` (`UserRole::Custom`)**:
-   - Granular permissions configured directly via `topic [read|write|readwrite|deny]` directives.
-
-### Permission Precedence & Deny Semantics
-
-Rules are evaluated in order of specificity:
-1. **Explicit `Deny` rules take immediate precedence**: If a topic matches a `Deny` rule (e.g., `rooms/%r/admin/#`), access is blocked even if a broader wildcard like `rooms/%r/#` exists.
-2. **User custom rules** override role defaults.
-3. **Fallback default rules** apply to unauthenticated or guest clients if `allow_anonymous = true`.
-4. Any unmatched subscription receives **SubAck return code `0x80` (Failure / Not Authorized)**.
-5. Any unmatched publish is dropped without forwarding.
-
-### Declarative ACL File Configuration (`config/acl.conf`)
-
-```ini
-# Administrator
-user superadmin password:admin_secret_pass role:admin rooms:*
-topic readwrite #
-topic read $SYS/#
-
-# Operations Moderator
-user ops_lead password:moderator_password role:moderator rooms:engineering,operations
-topic readwrite rooms/%r/#
-topic readwrite rooms/%r/admin/control
-
-# Engineering Room Member
-user dev_sarah password:sarah_dev_pass role:member rooms:engineering
-topic readwrite rooms/%r/chat
-topic readwrite rooms/%r/presence
-topic read rooms/%r/announcements
-topic deny rooms/%r/admin/#
-
-# Hardware IoT Device
-user sensor_node password:sensor_token_77 role:device
-topic write devices/%c/telemetry
-topic read devices/%c/commands
-topic deny #
+```bash
+task bench                 # codec, trie, retained store and loopback micro-benchmarks
+task bench:tls             # MQTT over TLS 1.3 throughput with 8 clients
+task bench:tls:compare     # the same, side by side with a local Mosquitto if installed
+task bench:report          # everything, written to BENCHMARKS.md
 ```
 
-### Programmatic Rust API Example
-
-```rust
-use wolf_mqtt::auth::{AclEngine, UserAccount, UserRole, AclRule, Permission};
-use wolf_mqtt::server::BrokerServer;
-use std::sync::Arc;
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let acl = Arc::new(AclEngine::new(false)); // Disallow anonymous
-
-    // Register an authenticated moderator
-    acl.add_user(UserAccount::new_moderator(
-        "lead_architect",
-        "super_secret_key",
-        vec!["architecture_room".into()],
-    )).await;
-
-    // Attach to broker and start
-    let server = BrokerServer::bind("0.0.0.0:1883")
-        .await?
-        .with_acl(acl);
-
-    server.run().await?;
-    Ok(())
-}
-```
-
-
+`wolf-bench-tls` options: `--concurrency <n>`, `--count <messages>`, `--payload-size <bytes>`,
+`--external-port <port>` / `--external-name <name>` (benchmark another broker),
+`--markdown-output <file>`. Numbers depend heavily on the machine; compare runs from the same
+hardware only.
