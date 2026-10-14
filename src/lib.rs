@@ -1,6 +1,7 @@
 //! WolfiMQ: MQTT v3.1.1 / v5.0 and MQTT-SN v1.2 broker with wolfSSL TLS.
 
 pub mod auth;
+pub mod bridge;
 pub mod broker;
 pub mod client;
 pub mod config;

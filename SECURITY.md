@@ -4,7 +4,8 @@
 
 | Version | Supported |
 | :--- | :---: |
-| 0.6.x | ✅ |
+| 0.8.x | ✅ |
+| 0.6.x, 0.7.x | ✅ (security fixes) |
 | 0.5.x | ❌ (a crafted SUBSCRIBE can crash the broker, ACL macro injection; upgrade) |
 | < 0.5 | ❌ (contains known protocol and authorization defects, see `CHANGELOG.md`) |
 
@@ -27,6 +28,11 @@ disclosure date with you once a fix is available.
   request size and time are bounded, no compression extension is negotiated, and
   `X-Forwarded-For` is only trusted from configured proxies. The handshake digest and client
   mask keys use wolfCrypt; no other crypto library is linked.
+- **Bridges** connect out over wolfSSL TLS with the remote certificate chain and host name
+  always verified (there is no option to skip verification), optionally with a client
+  certificate. Each bridge acts locally under its own ACL account, so a compromised remote
+  broker can only publish where that account may write. Keep remote passwords in
+  `password_file` (not readable by other users) or the environment.
 - **MQTT-SN** runs over plain UDP with no authentication and no encryption; clients are
   identified by a source address that can be spoofed, and every SN client acts with the
   rights of the configured `acl_user`. It is disabled in the sample configuration; only expose

@@ -818,6 +818,48 @@ pub fn create_tls_connector(
     })
 }
 
+/// Client-side TLS settings (bridges to other brokers).
+#[derive(Debug, Clone)]
+pub struct TlsClientConfig {
+    /// CA certificate(s) that signed the server certificate.
+    pub ca_file: String,
+    /// Client certificate and key for mutual TLS.
+    pub client_cert: Option<(String, String)>,
+    pub min_version: TlsVersion,
+    /// ALPN protocols to offer (none when empty).
+    pub alpn_protocols: Vec<String>,
+}
+
+/// Creates a connector from client settings. The server certificate chain and host name are
+/// always verified.
+pub fn create_tls_client(cfg: &TlsClientConfig) -> Result<WolfTlsConnector, TlsError> {
+    ensure_wolfssl_initialized();
+    // SAFETY: static method tables.
+    let method = unsafe {
+        match cfg.min_version {
+            TlsVersion::Tls13 => wolfTLSv1_3_client_method(),
+            TlsVersion::Tls12 => wolfSSLv23_client_method(),
+        }
+    };
+    let ctx = WolfContext::new(method)?;
+    if cfg.min_version == TlsVersion::Tls12 {
+        // SAFETY: ctx is valid.
+        if unsafe { wolfSSL_CTX_SetMinVersion(ctx.ptr(), WOLFSSL_TLSV1_2) } != WOLFSSL_SUCCESS {
+            return Err(TlsError::Library("wolfSSL_CTX_SetMinVersion failed"));
+        }
+    }
+    ctx.load_ca(&cfg.ca_file)?;
+    ctx.set_verify(SSL_VERIFY_PEER);
+    if let Some((cert, key)) = &cfg.client_cert {
+        ctx.use_cert_chain(cert, "client certificate")?;
+        ctx.use_private_key(key, "client private key")?;
+    }
+    Ok(WolfTlsConnector {
+        ctx: Arc::new(ctx),
+        alpn: alpn_list(&cfg.alpn_protocols)?.map(Arc::new),
+    })
+}
+
 /// Creates a connector that accepts TLS 1.2 or 1.3 servers.
 pub fn create_tls12_connector(ca_cert_path: &str) -> Result<WolfTlsConnector, TlsError> {
     ensure_wolfssl_initialized();

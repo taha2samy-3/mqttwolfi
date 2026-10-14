@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 use wolf_mqtt::auth::{AclEngine, UserAccount, ANONYMOUS_USER};
+use wolf_mqtt::bridge;
 use wolf_mqtt::broker::BrokerContext;
 use wolf_mqtt::config::{AppConfig, ENV_CONFIG_PATH};
 use wolf_mqtt::logging;
@@ -318,6 +319,10 @@ async fn run_broker(config: AppConfig) -> Result<(), String> {
             }
         }));
     }
+    let mut bridges = Vec::new();
+    for (name, bridge) in config.bridges.iter().filter(|(_, b)| b.enabled) {
+        bridges.push(bridge::start(name, bridge.clone(), ctx.clone()).await?);
+    }
 
     info!(
         "{} started (node '{}')",
@@ -328,6 +333,10 @@ async fn run_broker(config: AppConfig) -> Result<(), String> {
 
     info!("Shutting down: closing listeners and connections");
     ctx.shutdown();
+    // Bridges send DISCONNECT (and their offline notification) to the remote broker.
+    for b in bridges {
+        let _ = tokio::time::timeout(Duration::from_secs(2), b).await;
+    }
     let grace = Duration::from_secs(config.broker.shutdown_grace_sec);
     let deadline = tokio::time::Instant::now() + grace;
     while ctx
@@ -452,7 +461,11 @@ fn main() -> ExitCode {
     let check_only = matches!(cli.command, Command::CheckConfig);
     let result = runtime.block_on(async {
         if check_only {
-            build_acl(&config).await?;
+            let acl = build_acl(&config).await?;
+            let ctx = BrokerContext::from_config(&config, acl);
+            for (name, b) in config.bridges.iter().filter(|(_, b)| b.enabled) {
+                bridge::check(name, b.clone(), ctx.clone()).await?;
+            }
             if config.listeners.tls.enabled {
                 create_tls_acceptor(&TlsServerConfig::from_config(&config.security.tls))
                     .map_err(|e| format!("TLS setup failed: {e}"))?;

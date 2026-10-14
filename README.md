@@ -35,10 +35,11 @@ optional FIPS-Ready build), and ships as a single binary for Linux, Windows and 
 | Retained / Will | Retained store with quotas and expiry; Last Will on abnormal close, keep-alive timeout or takeover |
 | Security | Argon2id passwords, ACL with roles and `%u` / `%c` / `%r` macros, ClientID ↔ certificate binding, client certificate revocation (CRL), limits on connections, sessions, subscriptions, packets, queues and topic depth |
 | Operations | TOML config + `WOLFIMQ_*` environment overrides, `$SYS/broker/...` metrics, SIGHUP ACL reload, graceful SIGTERM |
+| Bridges | Edge → cloud forwarding to other MQTT brokers over wolfSSL TLS: topic rules with prefixes, in / out / both, buffering through outages, loop prevention, reconnect with backoff |
 | MQTT-SN | Predefined and short topic ids, REGISTER, QoS −1, Will, sleeping clients, retransmission, forwarder encapsulation |
 
-Not implemented: clustering, disk persistence, bridging, MQTT v5.0 enhanced authentication
-(AUTH), DTLS for MQTT-SN.
+Not implemented: clustering, disk persistence, MQTT v5.0 enhanced authentication (AUTH), DTLS
+for MQTT-SN.
 
 wolfSSL is the only cryptographic code in the broker: TLS, and also the WebSocket handshake
 digest (wolfCrypt SHA-1) and random numbers (wolfCrypt DRBG). The WebSocket layer is
@@ -176,6 +177,40 @@ For browsers and web dashboards (MQTT.js, Paho JavaScript):
 // MQTT.js in the browser
 mqtt.connect("wss://broker.example.com:8084/mqtt", { username, password });
 ```
+
+## Bridges
+
+A bridge connects WolfiMQ as a client to another broker and forwards topics in either
+direction, for example from an edge site to a cloud broker:
+
+```toml
+[bridges.cloud]
+addresses = ["iot.example.com:8883"]
+client_id = "edge-07"
+acl_user = "bridge_cloud"            # local identity of the bridge (acl.conf)
+
+[bridges.cloud.tls]
+enabled = true
+ca_file = "/etc/wolfimq/cloud-ca.pem"
+cert_file = "/etc/wolfimq/edge-07.crt"
+key_file = "/etc/wolfimq/edge-07.key"
+
+[[bridges.cloud.topics]]
+pattern = "telemetry/#"
+direction = "out"                    # local site/telemetry/... -> remote edge-07/telemetry/...
+local_prefix = "site/"
+remote_prefix = "edge-07/"
+
+[[bridges.cloud.topics]]
+pattern = "commands/#"
+direction = "in"
+local_prefix = "site/"
+remote_prefix = "edge-07/"
+```
+
+Messages for the remote broker are buffered while it is unreachable and delivered in order
+when it is back. TLS always verifies the remote broker. See
+[docs/CONFIGURATION_AND_CONTROL.md](docs/CONFIGURATION_AND_CONTROL.md#8a-bridges).
 
 ## Benchmarks
 

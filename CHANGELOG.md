@@ -5,7 +5,36 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
-## [Unreleased]
+## [0.8.0] - 2026-10-14
+
+### Added
+- **MQTT bridges** (issue #2): `[bridges.<name>]` connects WolfiMQ as a client to other MQTT
+  brokers (edge → cloud: AWS IoT Core, HiveMQ, Mosquitto, another WolfiMQ…).
+  - Mosquitto-style topic rules: `pattern`, `direction` (`out`, `in`, `both`), `qos`,
+    `local_prefix`, `remote_prefix`, `retain`.
+  - Buffering: outgoing messages wait in the bridge's own queue (`max_queued_messages`,
+    `max_queued_bytes`, `queue_full_policy`) while the remote broker is unreachable, and leave
+    it only when the remote broker acknowledges them (QoS 1/2, in order). Memory only for now;
+    disk buffering will come with persistence (issue #3).
+  - Loop prevention: No Local on both sides, a hop count in the user property
+    `wolfimq-bridge-hops` (`max_hops`, default 1), and for MQTT v3.1.1 remotes the
+    configuration refuses `both` and overlapping in / out topics.
+  - Security: wolfSSL TLS 1.2 / 1.3 towards the remote broker with server certificate and
+    host name always verified (no "insecure" option), optional client certificate and ALPN
+    (e.g. `x-amzn-mqtt-ca`), `password_file` (warning when world-readable) or environment
+    variables for secrets, and a local ACL identity (`acl_user`) that limits what the bridge
+    may read and publish.
+  - Respects the remote broker's CONNACK limits (Maximum QoS, Retain Available, Maximum Packet
+    Size, Receive Maximum, Server Keep Alive); keep-alive pings; reconnect with exponential
+    backoff and jitter, fallback addresses; persistent remote sessions resend unacknowledged
+    messages with their original packet ids.
+  - State: retained `$SYS/broker/bridges/<name>/state` locally, optional remote
+    `notification_topic` ("1" while connected, "0" as the Will).
+  - `--check-config` checks bridges (ACL identity, permissions, TLS files, password file).
+
+---
+
+## [0.7.0] - 2026-10-14
 
 ### Added
 - **MQTT over WebSockets** (issue #1): `[listeners.ws]` (plain, loopback by default, for use

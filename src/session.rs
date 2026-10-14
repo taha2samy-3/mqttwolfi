@@ -17,6 +17,8 @@ use tokio::sync::oneshot;
 pub enum Transport {
     Mqtt,
     MqttSn,
+    /// The local side of a bridge to another broker.
+    Bridge,
 }
 
 /// Outbound QoS 1/2 message waiting for acknowledgement.

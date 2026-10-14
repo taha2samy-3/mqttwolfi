@@ -317,6 +317,29 @@ impl BrokerContext {
         expiry_interval: u32,
         transport: Transport,
     ) -> Result<OpenedSession, OpenError> {
+        let limits = self.options.queue_limits;
+        self.open_session_with_limits(
+            client_id,
+            user,
+            clean_start,
+            expiry_interval,
+            transport,
+            limits,
+        )
+        .await
+    }
+
+    /// Like [`Broker::open_session`], with queue limits of its own for a new session (used by
+    /// bridges, whose queue buffers messages while the remote broker is unreachable).
+    pub async fn open_session_with_limits(
+        &self,
+        client_id: &str,
+        user: Arc<UserAccount>,
+        clean_start: bool,
+        expiry_interval: u32,
+        transport: Transport,
+        limits: QueueLimits,
+    ) -> Result<OpenedSession, OpenError> {
         for _ in 0..5 {
             // 1. Disconnect whoever currently holds a session with this ClientID.
             if let Some(old) = self.session_by_client_id(client_id) {
@@ -416,7 +439,7 @@ impl BrokerContext {
                             transport,
                             Arc::clone(&user),
                             expiry_interval,
-                            self.options.queue_limits,
+                            limits,
                         ));
                         write(&self.sessions).insert(id, Arc::clone(&s));
                         ids.insert(client_id.to_owned(), id);

@@ -15,7 +15,7 @@
 //! that does not parse is used as a plain string.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
@@ -50,6 +50,8 @@ pub struct AppConfig {
     pub security: SecurityConfig,
     pub mqtt: MqttSettings,
     pub monitoring: MonitoringConfig,
+    /// Outbound connections to other brokers, by name.
+    pub bridges: BTreeMap<String, BridgeConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -441,6 +443,283 @@ impl Default for RetainedSettings {
     }
 }
 
+// ── Bridges ───────────────────────────────────────────────────────────────────────────────
+
+/// Direction of a bridged topic.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeDirection {
+    /// Local messages are published to the remote broker.
+    Out,
+    /// Remote messages are published locally.
+    In,
+    /// Both (requires MQTT v5.0 for loop prevention).
+    Both,
+}
+
+/// One bridged topic pattern, Mosquitto style:
+/// local topic `local_prefix + pattern` <-> remote topic `remote_prefix + pattern`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeTopicConfig {
+    pub pattern: String,
+    pub direction: BridgeDirection,
+    #[serde(default = "default_bridge_qos")]
+    pub qos: u8,
+    #[serde(default)]
+    pub local_prefix: String,
+    #[serde(default)]
+    pub remote_prefix: String,
+    /// Keep the retain flag of forwarded messages (subject to the remote's Retain Available).
+    #[serde(default = "default_true")]
+    pub retain: bool,
+}
+
+fn default_bridge_qos() -> u8 {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// TLS towards the remote broker (wolfSSL). The server certificate and host name are always
+/// verified.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BridgeTlsConfig {
+    pub enabled: bool,
+    /// CA certificate(s) that signed the remote broker's certificate.
+    pub ca_file: String,
+    /// Client certificate and key, when the remote broker requires mutual TLS.
+    pub cert_file: String,
+    pub key_file: String,
+    /// Name checked against the server certificate and sent as SNI (default: the host of the
+    /// address being connected).
+    pub server_name: String,
+    /// ALPN protocols, e.g. `["x-amzn-mqtt-ca"]` for AWS IoT Core on port 443.
+    pub alpn_protocols: Vec<String>,
+    /// "TLSv1.2" (accepts 1.2 and 1.3) or "TLSv1.3".
+    pub min_tls_version: String,
+    pub handshake_timeout_sec: u64,
+}
+
+impl Default for BridgeTlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ca_file: String::new(),
+            cert_file: String::new(),
+            key_file: String::new(),
+            server_name: String::new(),
+            alpn_protocols: Vec::new(),
+            min_tls_version: "TLSv1.2".into(),
+            handshake_timeout_sec: 10,
+        }
+    }
+}
+
+/// An outbound connection to another MQTT broker (`[bridges.<name>]`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct BridgeConfig {
+    pub enabled: bool,
+    /// `host:port` of the remote broker; further entries are fallbacks tried in turn.
+    pub addresses: Vec<String>,
+    /// 5 (MQTT v5.0, default) or 4 (MQTT v3.1.1).
+    pub protocol_version: u8,
+    /// ClientID at the remote broker (default: `wolfimq-bridge-<name>`).
+    pub client_id: String,
+    pub username: String,
+    pub password: String,
+    /// File holding the remote password (keeps it out of broker.toml).
+    pub password_file: String,
+    /// Local ACL account of the bridge: what it may read (out topics) and publish (in topics).
+    pub acl_user: String,
+    pub clean_start: bool,
+    /// MQTT v5.0 Session Expiry Interval at the remote broker.
+    pub session_expiry_sec: u32,
+    pub keep_alive_sec: u16,
+    /// Bridges a message may cross; more are dropped (loop prevention, MQTT v5.0).
+    pub max_hops: u8,
+    /// Unacknowledged QoS 1/2 messages towards the remote broker (also capped by its Receive
+    /// Maximum).
+    pub max_inflight: u16,
+    /// Reconnect delay: exponential backoff with jitter between these bounds.
+    pub reconnect_min_sec: u64,
+    pub reconnect_max_sec: u64,
+    /// A connection that lasted this long resets the backoff.
+    pub reconnect_stable_sec: u64,
+    /// Buffer for messages waiting for the remote broker (memory).
+    pub max_queued_messages: usize,
+    pub max_queued_bytes: usize,
+    /// "drop_oldest" or "drop_newest".
+    pub queue_full_policy: String,
+    /// Remote topic receiving the bridge state: retained "1" when connected, "0" (as the Will)
+    /// when the connection is lost. Empty = none.
+    pub notification_topic: String,
+    pub tls: BridgeTlsConfig,
+    pub topics: Vec<BridgeTopicConfig>,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            addresses: Vec::new(),
+            protocol_version: 5,
+            client_id: String::new(),
+            username: String::new(),
+            password: String::new(),
+            password_file: String::new(),
+            acl_user: String::new(),
+            clean_start: false,
+            session_expiry_sec: 3600,
+            keep_alive_sec: 60,
+            max_hops: 1,
+            max_inflight: 32,
+            reconnect_min_sec: 1,
+            reconnect_max_sec: 120,
+            reconnect_stable_sec: 60,
+            max_queued_messages: 100_000,
+            max_queued_bytes: 64 * 1024 * 1024,
+            queue_full_policy: "drop_oldest".into(),
+            notification_topic: String::new(),
+            tls: BridgeTlsConfig::default(),
+            topics: Vec::new(),
+        }
+    }
+}
+
+impl BridgeConfig {
+    /// Validates one bridge; `name` is its key in `[bridges]`.
+    pub fn validate(&self, name: &str) -> Result<(), String> {
+        use crate::routing::topic::{filters_intersect, validate_topic_filter};
+        let err = |m: String| Err(format!("bridges.{name}: {m}"));
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(format!(
+                "bridge name '{name}' may only contain letters, digits, '-' and '_'"
+            ));
+        }
+        if self.addresses.is_empty() {
+            return err("addresses is empty".into());
+        }
+        for a in &self.addresses {
+            if split_host_port(a).is_none() {
+                return err(format!("address '{a}' must be host:port"));
+            }
+        }
+        if !matches!(self.protocol_version, 4 | 5) {
+            return err("protocol_version must be 4 (MQTT v3.1.1) or 5 (MQTT v5.0)".into());
+        }
+        if self.acl_user.is_empty() {
+            return err("acl_user is required (the local identity of the bridge)".into());
+        }
+        if !self.password.is_empty() && !self.password_file.is_empty() {
+            return err("set password or password_file, not both".into());
+        }
+        if (!self.password.is_empty() || !self.password_file.is_empty()) && self.username.is_empty()
+        {
+            return err("a password requires a username".into());
+        }
+        if self.max_inflight == 0 || self.max_queued_messages == 0 {
+            return err("max_inflight and max_queued_messages must be at least 1".into());
+        }
+        if self.reconnect_min_sec == 0 || self.reconnect_min_sec > self.reconnect_max_sec {
+            return err(
+                "reconnect_min_sec must be at least 1 and not above reconnect_max_sec".into(),
+            );
+        }
+        if !matches!(
+            self.queue_full_policy.as_str(),
+            "drop_oldest" | "drop_newest"
+        ) {
+            return err("queue_full_policy must be drop_oldest or drop_newest".into());
+        }
+        if !self.notification_topic.is_empty()
+            && !crate::routing::is_valid_topic_name(&self.notification_topic)
+        {
+            return err("notification_topic is not a valid topic name".into());
+        }
+        let tls = &self.tls;
+        if tls.enabled {
+            if tls.ca_file.is_empty() {
+                return err("tls.ca_file is required".into());
+            }
+            if tls.cert_file.is_empty() != tls.key_file.is_empty() {
+                return err("tls.cert_file and tls.key_file go together".into());
+            }
+            if !matches!(tls.min_tls_version.as_str(), "TLSv1.2" | "TLSv1.3") {
+                return err("tls.min_tls_version must be TLSv1.2 or TLSv1.3".into());
+            }
+        }
+        if self.topics.is_empty() {
+            return err("no topics configured".into());
+        }
+        for t in &self.topics {
+            if validate_topic_filter(&t.pattern).is_err() {
+                return err(format!("invalid topic pattern '{}'", t.pattern));
+            }
+            for prefix in [&t.local_prefix, &t.remote_prefix] {
+                if prefix.contains(['+', '#', '\0']) {
+                    return err(format!("prefix '{prefix}' must not contain wildcards"));
+                }
+            }
+            for full in [
+                format!("{}{}", t.local_prefix, t.pattern),
+                format!("{}{}", t.remote_prefix, t.pattern),
+            ] {
+                if validate_topic_filter(&full).is_err() {
+                    return err(format!("prefixed topic '{full}' is not a valid filter"));
+                }
+            }
+            if t.qos > 2 {
+                return err("topic qos must be 0, 1 or 2".into());
+            }
+            if t.direction == BridgeDirection::Both && self.protocol_version == 4 {
+                return err(format!(
+                    "'both' needs MQTT v5.0 (No Local) to avoid loops; split '{}' into in and out \
+                     topics that do not overlap",
+                    t.pattern
+                ));
+            }
+        }
+        // Without MQTT v5.0 (No Local, hop count), a message sent out and subscribed back in
+        // would loop: refuse overlapping in / out topics on the remote side.
+        if self.protocol_version == 4 {
+            let remote = |d: BridgeDirection| {
+                self.topics
+                    .iter()
+                    .filter(move |t| t.direction == d)
+                    .map(|t| format!("{}{}", t.remote_prefix, t.pattern))
+            };
+            for out in remote(BridgeDirection::Out) {
+                for inn in remote(BridgeDirection::In) {
+                    if filters_intersect(&out, &inn) {
+                        return err(format!(
+                            "remote topics '{out}' (out) and '{inn}' (in) overlap: with MQTT v3.1.1 \
+                             messages would loop"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Splits `host:port` (IPv6 as `[addr]:port`).
+pub fn split_host_port(address: &str) -> Option<(String, u16)> {
+    let (host, port) = address.rsplit_once(':')?;
+    let port: u16 = port.parse().ok().filter(|p| *p != 0)?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then(|| (host.to_owned(), port))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct MonitoringConfig {
@@ -550,6 +829,15 @@ impl AppConfig {
             &toml::Value::try_from(AppConfig::default()).expect("serializable"),
             &mut known,
         );
+        // Bridges are named by the user: each one is checked against the bridge settings.
+        if let Some(toml::Value::Table(bridges)) = root.get("bridges") {
+            let template = toml::Value::try_from(BridgeConfig::default()).expect("serializable");
+            for name in bridges.keys() {
+                let prefix = format!("bridges.{name}");
+                known.insert(prefix.clone());
+                collect_paths(&prefix, &template, &mut known);
+            }
+        }
         let mut present = BTreeSet::new();
         collect_paths("", &toml::Value::Table(root.clone()), &mut present);
         for key in present.difference(&known) {
@@ -757,6 +1045,10 @@ impl AppConfig {
             }
         }
 
+        for (name, bridge) in &self.bridges {
+            bridge.validate(name).map_err(ConfigError::Validation)?;
+        }
+
         if !self.listeners.tcp.enabled
             && !self.listeners.tls.enabled
             && !ws.enabled
@@ -832,6 +1124,59 @@ mod tests {
             AppConfig::load_layered(Some(file), vars),
             Err(ConfigError::Env { .. })
         ));
+    }
+
+    #[test]
+    fn bridges_are_parsed_validated_and_checked_for_unknown_keys() {
+        let toml = r#"
+            [bridges.cloud]
+            addresses = ["iot.example.com:8883"]
+            acl_user = "bridge_cloud"
+            protocol_version = 5
+            colour = "blue"
+
+            [bridges.cloud.tls]
+            enabled = true
+            ca_file = "ca.pem"
+
+            [[bridges.cloud.topics]]
+            pattern = "telemetry/#"
+            direction = "out"
+            remote_prefix = "edge-07/"
+        "#;
+        let (config, warnings) = AppConfig::load_layered(Some(toml), std::iter::empty()).unwrap();
+        let b = &config.bridges["cloud"];
+        assert_eq!(b.topics[0].direction, BridgeDirection::Out);
+        assert_eq!(b.topics[0].qos, 1);
+        assert!(b.tls.enabled && b.enabled);
+        assert_eq!(
+            warnings,
+            vec!["unknown configuration key 'bridges.cloud.colour' is ignored"]
+        );
+        // Environment overrides reach bridges too.
+        let (config, _) = AppConfig::load_layered(
+            Some(toml),
+            [
+                (
+                    "WOLFIMQ_BRIDGES__CLOUD__PASSWORD".to_string(),
+                    "s3cret".to_string(),
+                ),
+                (
+                    "WOLFIMQ_BRIDGES__CLOUD__USERNAME".to_string(),
+                    "edge".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.bridges["cloud"].password, "s3cret");
+        // A typo inside a topic entry is an error, not a silent default.
+        let typo = toml.replace(
+            "direction = \"out\"",
+            "direction = \"out\"\n            qso = 2",
+        );
+        assert!(AppConfig::load_layered(Some(&typo), std::iter::empty()).is_err());
+        let invalid = toml.replace("bridge_cloud", "");
+        assert!(AppConfig::load_layered(Some(&invalid), std::iter::empty()).is_err());
     }
 
     #[test]

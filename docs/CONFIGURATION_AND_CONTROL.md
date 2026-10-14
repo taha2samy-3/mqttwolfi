@@ -13,6 +13,7 @@ Reference for configuring, securing and operating the `wolf-broker` binary.
 7. [MQTT protocol behaviour](#7-mqtt-protocol-behaviour)
    - [MQTT over WebSockets](#7a-mqtt-over-websockets)
 8. [MQTT-SN gateway](#8-mqtt-sn-gateway)
+   - [Bridges](#8a-bridges)
 9. [Monitoring](#9-monitoring)
 10. [Deployment](#10-deployment)
 11. [Building, cross-compiling and FIPS](#11-building-cross-compiling-and-fips)
@@ -474,6 +475,85 @@ sessions like MQTT clients, so subscriptions, retained messages and Will message
 - **Forwarders:** encapsulated frames (`0xFE`) are answered encapsulated for the same wireless
   node id.
 
+## 8a. Bridges
+
+A bridge (`[bridges.<name>]`, name of letters, digits, `-`, `_`) connects WolfiMQ as an MQTT
+client to another broker. Each bridge has an internal session in WolfiMQ: it subscribes locally
+to the outgoing topics and publishes the incoming ones.
+
+### Settings
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `enabled` | `true` | |
+| `addresses` | — | `host:port` of the remote broker (IPv6: `[addr]:port`); further entries are fallbacks, tried in turn after a failed attempt. Required. |
+| `protocol_version` | `5` | `5` (MQTT v5.0) or `4` (MQTT v3.1.1). |
+| `client_id` | `wolfimq-bridge-<name>` | ClientID at the remote broker. |
+| `username`, `password` | `""` | Credentials at the remote broker. Prefer `password_file` or `WOLFIMQ_BRIDGES__<NAME>__PASSWORD`. |
+| `password_file` | `""` | File holding the password (trailing newline ignored); a warning is logged if every user can read it. |
+| `acl_user` | — | Local ACL account of the bridge. It must exist in `acl.conf`, should have no password, and needs read access to every outgoing topic (checked at startup) and write access to the incoming ones (checked per message; others are dropped). Required. |
+| `clean_start` | `false` | Start a new remote session on every connect. With `false`, the remote session keeps the bridge's subscriptions and unacknowledged messages across reconnects. |
+| `session_expiry_sec` | `3600` | MQTT v5.0 Session Expiry Interval at the remote broker. |
+| `keep_alive_sec` | `60` | Keep alive towards the remote broker (a Server Keep Alive from it wins). The connection is considered lost when a PINGREQ gets no answer within one interval. |
+| `max_hops` | `1` | Bridges a message may cross (MQTT v5.0 user property `wolfimq-bridge-hops`); more are dropped. Raise it for chains such as edge → regional → cloud. |
+| `max_inflight` | `32` | Unacknowledged QoS 1/2 messages towards the remote broker (also capped by its Receive Maximum). |
+| `reconnect_min_sec`, `reconnect_max_sec` | `1`, `120` | Reconnect delay: exponential backoff with random jitter between these bounds. |
+| `reconnect_stable_sec` | `60` | A connection that lasted this long resets the backoff. |
+| `max_queued_messages`, `max_queued_bytes` | `100000`, `67108864` | Buffer for outgoing messages while the remote broker is unreachable (memory; topic + payload + properties). |
+| `queue_full_policy` | `"drop_oldest"` | `drop_oldest` or `drop_newest` when the buffer is full. |
+| `notification_topic` | `""` | Remote topic receiving the bridge state: retained `1` while connected, `0` as the Will when the connection is lost and on shutdown. |
+
+`[bridges.<name>.tls]` — wolfSSL TLS towards the remote broker:
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `enabled` | `false` | |
+| `ca_file` | — | CA that signed the remote broker's certificate. Required with TLS. The certificate chain and host name are **always** verified; there is no option to skip that. |
+| `cert_file`, `key_file` | `""` | Client certificate and key, when the remote broker requires mutual TLS (e.g. AWS IoT Core). |
+| `server_name` | host of the address | Name checked against the server certificate and sent as SNI. |
+| `alpn_protocols` | `[]` | ALPN protocols, e.g. `["x-amzn-mqtt-ca"]` for AWS IoT Core on port 443. |
+| `min_tls_version` | `"TLSv1.2"` | `"TLSv1.2"` (accepts 1.2 and 1.3) or `"TLSv1.3"`. |
+| `handshake_timeout_sec` | `10` | |
+
+`[[bridges.<name>.topics]]` — one entry per topic rule:
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `pattern` | — | Topic filter, e.g. `telemetry/#`. |
+| `direction` | — | `out` (local → remote), `in` (remote → local) or `both` (MQTT v5.0 only). |
+| `qos` | `1` | Highest QoS used for this rule (also lowered to the remote's Maximum QoS). |
+| `local_prefix`, `remote_prefix` | `""` | The local topic is `local_prefix + topic`, the remote one `remote_prefix + topic`; no wildcards. |
+| `retain` | `true` | Keep the retain flag of forwarded messages (if the remote broker supports retained messages). |
+
+Unknown keys in a topic entry are an error, unknown bridge keys a warning.
+
+### Behaviour
+
+- **Outgoing:** local messages matching an `out` / `both` rule are queued in the bridge session
+  and sent to the remote broker as soon as it is connected and its Receive Maximum allows. A
+  QoS 1/2 message leaves the queue only when the remote broker acknowledges it; if the remote
+  session is lost (`session present = 0`), unacknowledged messages go back to the front of the
+  queue and are sent again. Order is kept. Delivery is at-least-once: after a reconnect the
+  remote broker may see a message twice, and QoS 2 is not exactly-once end to end.
+- **Incoming:** the bridge subscribes at the remote broker to every `in` / `both` rule after
+  each connect and publishes what it receives locally under `acl_user`.
+- **Loops:** subscriptions on both sides use No Local (MQTT v5.0), so a bridged message is never
+  sent back over the same bridge; messages above `max_hops` are dropped. MQTT v3.1.1 has
+  neither, so the configuration refuses `both` and `in` / `out` rules whose remote topics
+  overlap.
+- **Remote limits:** Maximum QoS (messages are downgraded), Retain Available, Maximum Packet
+  Size (larger messages are dropped with a warning), Receive Maximum and Server Keep Alive from
+  the remote CONNACK are respected.
+- **State:** retained `$SYS/broker/bridges/<name>/state` is `1` while connected, `0` otherwise.
+- **Shutdown:** the bridge publishes `0` to `notification_topic` and sends DISCONNECT.
+- **Bridging into WolfiMQ from Mosquitto:** set `try_private false` in Mosquitto. Mosquitto's
+  non-standard bridge flag in the protocol level is answered with CONNACK 0x01 (unsupported
+  protocol version). With `bridge_protocol_version mqttv50` Mosquitto uses No Local itself.
+- **Cloud notes:** AWS IoT Core needs mutual TLS (`cert_file` / `key_file`), a `client_id`
+  allowed by its policy, and supports QoS 0 and 1 only (QoS 2 is lowered automatically); on
+  port 443 add `alpn_protocols = ["x-amzn-mqtt-ca"]`. HiveMQ Cloud uses TLS plus
+  `username` / `password`.
+
 ## 9. Monitoring
 
 Retained topics published every `sys_update_interval_sec`:
@@ -488,6 +568,7 @@ Retained topics published every `sys_update_interval_sec`:
 | `$SYS/broker/bytes/received` / `sent` | payload bytes |
 | `$SYS/broker/retained/count` | retained topics |
 | `$SYS/broker/subscriptions/count` | subscriptions |
+| `$SYS/broker/bridges/<name>/state` | `1` while the bridge is connected, `0` otherwise |
 
 Subscribe with an account allowed to read `$SYS/#` (admins are).
 
