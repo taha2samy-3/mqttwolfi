@@ -1,4 +1,4 @@
-//! Robustness: the MQTT and MQTT-SN decoders must never panic, whatever the input. Mutates
+//! Robustness: the MQTT, MQTT-SN and WebSocket decoders must never panic, whatever the input. Mutates
 //! valid packets (bit flips, truncation, insertions) and random bytes; the full 3M-iteration
 //! run is `WOLFIMQ_FUZZ_ITERATIONS=3000000 cargo test --release --test decoder_robustness`.
 use bytes::{Bytes, BytesMut};
@@ -7,6 +7,7 @@ use wolf_mqtt::protocol::{
     ConnectPacket, MqttPacket, Properties, Property, ProtocolVersion, PublishPacket, QoS,
     SubscriptionOptions,
 };
+use wolf_mqtt::ws::FrameDecoder;
 
 struct Rng(u64);
 impl Rng {
@@ -109,6 +110,20 @@ fn seeds() -> Vec<Vec<u8>> {
     for p in sn {
         out.push(p.to_bytes().unwrap().to_vec());
     }
+    // A masked binary WebSocket frame, a fragmented one with a ping in between, a 16-bit
+    // length frame, and an HTTP upgrade request.
+    out.push(vec![0x82, 0x83, 1, 2, 3, 4, 0x11, 0x02, 0x03]);
+    out.push(vec![
+        0x02, 0x81, 0, 0, 0, 0, 0x10, 0x89, 0x80, 1, 1, 1, 1, 0x80, 0x81, 0, 0, 0, 0, 0x20,
+    ]);
+    let mut long = vec![0x82, 0xFE, 0x00, 0xC8, 5, 6, 7, 8];
+    long.extend(std::iter::repeat_n(0xAB, 200));
+    out.push(long);
+    out.push(
+        b"GET /mqtt HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+          Sec-WebSocket-Protocol: mqtt\r\n\r\n"
+            .to_vec(),
+    );
     out
 }
 
@@ -146,6 +161,11 @@ fn decoders_never_panic() {
             let mut bm = BytesMut::from(&buf[..]);
             while let Ok(Some(_)) = MqttPacket::decode_from(&mut bm, v, 1 << 20) {}
         }
+        let mut frames = BytesMut::from(&buf[..]);
+        let mut ws = FrameDecoder::new(4096);
+        while let Ok(Some(_)) = ws.decode(&mut frames) {}
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let _ = httparse::Request::new(&mut headers).parse(&buf);
         let mut slice = &buf[..];
         while !slice.is_empty() {
             if SnPacket::decode(&mut slice).is_err() {

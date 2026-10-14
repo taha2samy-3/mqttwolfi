@@ -1,11 +1,14 @@
-//! TCP and wolfSSL TLS listeners for MQTT v3.1.1 / v5.0.
+//! TCP, wolfSSL TLS and WebSocket listeners for MQTT v3.1.1 / v5.0.
 
 use crate::broker::BrokerContext;
 use crate::connection::{serve, PeerInfo};
 use crate::tls::WolfTlsAcceptor;
+use crate::ws::{self, WsSettings};
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
@@ -43,11 +46,13 @@ impl Drop for ConnectionSlot {
     }
 }
 
-/// An MQTT listener on one socket address, plain TCP or TLS.
+/// An MQTT listener on one socket address: plain TCP or TLS, optionally carrying MQTT over
+/// WebSockets.
 pub struct BrokerServer {
     listener: TcpListener,
     context: BrokerContext,
     tls: Option<WolfTlsAcceptor>,
+    ws: Option<Arc<WsSettings>>,
 }
 
 impl BrokerServer {
@@ -58,6 +63,7 @@ impl BrokerServer {
             listener,
             context,
             tls: None,
+            ws: None,
         })
     }
 
@@ -65,6 +71,21 @@ impl BrokerServer {
     pub fn with_tls(mut self, acceptor: WolfTlsAcceptor) -> Self {
         self.tls = Some(acceptor);
         self
+    }
+
+    /// Carries MQTT inside WebSocket frames (after the TLS handshake, if any).
+    pub fn with_websocket(mut self, settings: WsSettings) -> Self {
+        self.ws = Some(Arc::new(settings));
+        self
+    }
+
+    fn kind(&self) -> &'static str {
+        match (self.tls.is_some(), self.ws.is_some()) {
+            (false, false) => "TCP",
+            (true, false) => "TLS",
+            (false, true) => "WebSocket",
+            (true, true) => "WebSocket TLS",
+        }
     }
 
     pub fn context(&self) -> &BrokerContext {
@@ -77,7 +98,7 @@ impl BrokerServer {
 
     /// Accepts connections until the broker shuts down.
     pub async fn run(self) -> Result<(), std::io::Error> {
-        let kind = if self.tls.is_some() { "TLS" } else { "TCP" };
+        let kind = self.kind();
         info!(
             "MQTT {} listener running on {}",
             kind,
@@ -109,9 +130,10 @@ impl BrokerServer {
             let _ = stream.set_nodelay(true);
             let ctx = self.context.clone();
             let tls = self.tls.clone();
+            let ws = self.ws.clone();
             tokio::spawn(async move {
                 let _slot = slot;
-                handle_socket(stream, peer, tls, ctx).await;
+                handle_socket(stream, peer, tls, ws, ctx).await;
             });
         }
     }
@@ -121,6 +143,7 @@ async fn handle_socket(
     stream: TcpStream,
     peer: SocketAddr,
     tls: Option<WolfTlsAcceptor>,
+    ws: Option<Arc<WsSettings>>,
     ctx: BrokerContext,
 ) {
     let Some(acceptor) = tls else {
@@ -129,7 +152,7 @@ async fn handle_socket(
             addr: Some(peer),
             tls_identities: None,
         };
-        serve(stream, info, ctx).await;
+        serve_transport(stream, info, ws, ctx).await;
         return;
     };
     match acceptor.accept(stream).await {
@@ -145,8 +168,36 @@ async fn handle_socket(
                 addr: Some(peer),
                 tls_identities: identities,
             };
-            serve(tls_stream, info, ctx).await;
+            serve_transport(tls_stream, info, ws, ctx).await;
         }
         Err(e) => warn!("TLS handshake with {} failed: {}", peer, e),
+    }
+}
+
+/// Runs the MQTT connection directly on the stream, or inside WebSocket frames.
+async fn serve_transport<S>(
+    mut stream: S,
+    mut info: PeerInfo,
+    ws: Option<Arc<WsSettings>>,
+    ctx: BrokerContext,
+) where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let Some(settings) = ws else {
+        serve(stream, info, ctx).await;
+        return;
+    };
+    // The upgrade counts against the CONNECT deadline: slow or idle HTTP clients are dropped.
+    let deadline = tokio::time::Instant::now() + ctx.options.connect_timeout;
+    match ws::accept(&mut stream, info.addr, &settings, deadline).await {
+        Ok((leftover, forwarded_for)) => {
+            if let Some(ip) = forwarded_for {
+                debug!("WebSocket client {} via proxy {:?}", ip, info.addr);
+                info.addr = Some(SocketAddr::new(ip, 0));
+            }
+            let pipe = ws::spawn_pump(stream, leftover, settings.max_frame_size);
+            serve(pipe, info, ctx).await;
+        }
+        Err(e) => debug!("WebSocket upgrade from {:?} failed: {}", info.addr, e),
     }
 }

@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::net::IpAddr;
 use std::path::Path;
 use thiserror::Error;
 
@@ -108,6 +109,8 @@ impl Default for LoggingConfig {
 pub struct ListenersConfig {
     pub tcp: TcpListenerConfig,
     pub tls: TlsListenerConfig,
+    pub ws: WsListenerConfig,
+    pub wss: WssListenerConfig,
     pub mqtt_sn: MqttSnListenerConfig,
 }
 
@@ -143,6 +146,69 @@ impl Default for TlsListenerConfig {
             enabled: false,
             bind_address: "0.0.0.0".into(),
             port: 8883,
+        }
+    }
+}
+
+/// MQTT over plain WebSockets. Meant for loopback behind a TLS-terminating reverse proxy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WsListenerConfig {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub port: u16,
+    /// HTTP path accepting MQTT connections.
+    pub path: String,
+    /// Browser origins allowed to connect (`"*"` = any). Clients that send no Origin header
+    /// (non-browser clients) are always accepted.
+    pub allowed_origins: Vec<String>,
+    /// Reverse proxy addresses whose `X-Forwarded-For` header gives the client address.
+    pub trusted_proxies: Vec<String>,
+    /// Largest HTTP upgrade request (request line and headers) in bytes.
+    pub max_header_bytes: usize,
+}
+
+impl Default for WsListenerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "127.0.0.1".into(),
+            port: 8083,
+            path: "/mqtt".into(),
+            allowed_origins: Vec::new(),
+            trusted_proxies: Vec::new(),
+            max_header_bytes: 8192,
+        }
+    }
+}
+
+/// MQTT over WebSockets with wolfSSL TLS. Certificates and TLS settings come from
+/// `[security.tls]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct WssListenerConfig {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub port: u16,
+    pub path: String,
+    pub allowed_origins: Vec<String>,
+    pub trusted_proxies: Vec<String>,
+    pub max_header_bytes: usize,
+    /// Require client certificates on this listener (browsers usually have none).
+    pub require_client_cert: bool,
+}
+
+impl Default for WssListenerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "0.0.0.0".into(),
+            port: 8084,
+            path: "/mqtt".into(),
+            allowed_origins: Vec::new(),
+            trusted_proxies: Vec::new(),
+            max_header_bytes: 8192,
+            require_client_cert: false,
         }
     }
 }
@@ -593,6 +659,63 @@ impl AppConfig {
             }
         }
 
+        let (ws, wss) = (&self.listeners.ws, &self.listeners.wss);
+        for (name, enabled, path, origins, proxies, max_header_bytes) in [
+            (
+                "ws",
+                ws.enabled,
+                &ws.path,
+                &ws.allowed_origins,
+                &ws.trusted_proxies,
+                ws.max_header_bytes,
+            ),
+            (
+                "wss",
+                wss.enabled,
+                &wss.path,
+                &wss.allowed_origins,
+                &wss.trusted_proxies,
+                wss.max_header_bytes,
+            ),
+        ] {
+            if !enabled {
+                continue;
+            }
+            if !path.starts_with('/') || path.contains(|c: char| c.is_whitespace() || c == '?') {
+                return invalid(format!(
+                    "listeners.{name}.path must start with '/' and contain no spaces or '?'"
+                ));
+            }
+            if origins.iter().any(|o| o.trim().is_empty()) {
+                return invalid(format!(
+                    "listeners.{name}.allowed_origins has an empty entry"
+                ));
+            }
+            if let Some(bad) = proxies.iter().find(|p| p.parse::<IpAddr>().is_err()) {
+                return invalid(format!(
+                    "listeners.{name}.trusted_proxies: '{bad}' is not an IP address"
+                ));
+            }
+            if !(1024..=65_536).contains(&max_header_bytes) {
+                return invalid(format!(
+                    "listeners.{name}.max_header_bytes must be between 1024 and 65536"
+                ));
+            }
+        }
+        if wss.enabled {
+            if tls.server_cert_file.is_empty() || tls.server_key_file.is_empty() {
+                return invalid(
+                    "WSS listener is enabled but server_cert_file / server_key_file is empty"
+                        .into(),
+                );
+            }
+            if wss.require_client_cert && tls.ca_cert_file.is_empty() {
+                return invalid(
+                    "listeners.wss.require_client_cert is enabled but ca_cert_file is empty".into(),
+                );
+            }
+        }
+
         let auth = &self.security.auth;
         match auth.password_hash_algorithm.to_lowercase().as_str() {
             "argon2" | "argon2id" | "sha256" => {}
@@ -634,8 +757,13 @@ impl AppConfig {
             }
         }
 
-        if !self.listeners.tcp.enabled && !self.listeners.tls.enabled && !sn.enabled {
-            return invalid("no listener is enabled (tcp, tls or mqtt_sn)".into());
+        if !self.listeners.tcp.enabled
+            && !self.listeners.tls.enabled
+            && !ws.enabled
+            && !wss.enabled
+            && !sn.enabled
+        {
+            return invalid("no listener is enabled (tcp, tls, ws, wss or mqtt_sn)".into());
         }
         Ok(())
     }

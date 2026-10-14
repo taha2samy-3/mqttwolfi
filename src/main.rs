@@ -10,6 +10,7 @@ use wolf_mqtt::logging;
 use wolf_mqtt::server::BrokerServer;
 use wolf_mqtt::server_sn::MqttSnServer;
 use wolf_mqtt::tls::{create_tls_acceptor, TlsServerConfig};
+use wolf_mqtt::ws::WsSettings;
 
 const DEFAULT_CONFIG: &str = "config/broker.toml";
 
@@ -169,6 +170,38 @@ async fn build_acl(config: &AppConfig) -> Result<Arc<AclEngine>, String> {
     Ok(acl)
 }
 
+/// TLS settings of the WSS listener: the shared `[security.tls]` material, with client
+/// certificates required only when `listeners.wss.require_client_cert` says so.
+fn wss_tls_config(config: &AppConfig) -> TlsServerConfig {
+    let tls = &config.security.tls;
+    let wss = &config.listeners.wss;
+    let mut cfg = TlsServerConfig::from_config(tls);
+    cfg.client_ca_file = wss.require_client_cert.then(|| tls.ca_cert_file.clone());
+    cfg.crl_file =
+        (wss.require_client_cert && !tls.crl_file.is_empty()).then(|| tls.crl_file.clone());
+    cfg
+}
+
+fn ws_settings(
+    path: &str,
+    allowed_origins: &[String],
+    trusted_proxies: &[String],
+    max_header_bytes: usize,
+    config: &AppConfig,
+) -> WsSettings {
+    WsSettings {
+        path: path.to_owned(),
+        allowed_origins: allowed_origins.to_vec(),
+        // Validated by AppConfig::validate.
+        trusted_proxies: trusted_proxies
+            .iter()
+            .filter_map(|p| p.parse().ok())
+            .collect(),
+        max_header_bytes,
+        max_frame_size: config.mqtt.protocol.max_packet_size as usize,
+    }
+}
+
 async fn run_broker(config: AppConfig) -> Result<(), String> {
     let acl = build_acl(&config).await?;
     let ctx = BrokerContext::from_config(&config, Arc::clone(&acl));
@@ -215,6 +248,63 @@ async fn run_broker(config: AppConfig) -> Result<(), String> {
         tasks.push(tokio::spawn(async move {
             if let Err(e) = server.run().await {
                 error!("TLS listener failed: {e}");
+            }
+        }));
+    }
+    if config.listeners.ws.enabled {
+        let ws = &config.listeners.ws;
+        let addr = format!("{}:{}", ws.bind_address, ws.port);
+        let server = BrokerServer::bind(&addr, ctx.clone())
+            .await
+            .map_err(|e| format!("cannot bind WebSocket listener on {addr}: {e}"))?
+            .with_websocket(ws_settings(
+                &ws.path,
+                &ws.allowed_origins,
+                &ws.trusted_proxies,
+                ws.max_header_bytes,
+                &config,
+            ));
+        if ws.bind_address != "127.0.0.1" && ws.bind_address != "::1" {
+            warn!(
+                "Plain WebSocket listener exposed on {addr}: credentials travel unencrypted \
+                 (use listeners.wss, or a TLS-terminating proxy on loopback)"
+            );
+        }
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = server.run().await {
+                error!("WebSocket listener failed: {e}");
+            }
+        }));
+    }
+    if config.listeners.wss.enabled {
+        let wss = &config.listeners.wss;
+        let addr = format!("{}:{}", wss.bind_address, wss.port);
+        let acceptor = create_tls_acceptor(&wss_tls_config(&config))
+            .map_err(|e| format!("WSS TLS setup failed: {e}"))?;
+        let server = BrokerServer::bind(&addr, ctx.clone())
+            .await
+            .map_err(|e| format!("cannot bind WSS listener on {addr}: {e}"))?
+            .with_tls(acceptor)
+            .with_websocket(ws_settings(
+                &wss.path,
+                &wss.allowed_origins,
+                &wss.trusted_proxies,
+                wss.max_header_bytes,
+                &config,
+            ));
+        if config.security.tls.verify_client_identity && !wss.require_client_cert {
+            warn!(
+                "verify_client_identity is on but listeners.wss.require_client_cert is off: \
+                 WSS clients without a certificate will be refused"
+            );
+        }
+        info!(
+            "WSS listener on {addr} (path {}, client certificates: {}, allowed origins: {:?})",
+            wss.path, wss.require_client_cert, wss.allowed_origins
+        );
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = server.run().await {
+                error!("WSS listener failed: {e}");
             }
         }));
     }
@@ -366,6 +456,10 @@ fn main() -> ExitCode {
             if config.listeners.tls.enabled {
                 create_tls_acceptor(&TlsServerConfig::from_config(&config.security.tls))
                     .map_err(|e| format!("TLS setup failed: {e}"))?;
+            }
+            if config.listeners.wss.enabled {
+                create_tls_acceptor(&wss_tls_config(&config))
+                    .map_err(|e| format!("WSS TLS setup failed: {e}"))?;
             }
             println!("Configuration OK");
             Ok(())

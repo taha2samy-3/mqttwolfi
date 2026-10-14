@@ -17,10 +17,11 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 
-/// Plain TCP or wolfSSL TLS stream.
+/// Plain TCP or wolfSSL TLS stream, or an in-memory pipe (e.g. to a WebSocket adapter).
 pub enum ClientStream {
     Tcp(TcpStream),
     Tls(Box<WolfTlsStream>),
+    Pipe(tokio::io::DuplexStream),
 }
 
 impl AsyncRead for ClientStream {
@@ -32,6 +33,7 @@ impl AsyncRead for ClientStream {
         match self.get_mut() {
             ClientStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             ClientStream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            ClientStream::Pipe(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -45,6 +47,7 @@ impl AsyncWrite for ClientStream {
         match self.get_mut() {
             ClientStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             ClientStream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            ClientStream::Pipe(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -52,6 +55,7 @@ impl AsyncWrite for ClientStream {
         match self.get_mut() {
             ClientStream::Tcp(s) => Pin::new(s).poll_flush(cx),
             ClientStream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            ClientStream::Pipe(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -59,6 +63,7 @@ impl AsyncWrite for ClientStream {
         match self.get_mut() {
             ClientStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             ClientStream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            ClientStream::Pipe(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -120,7 +125,8 @@ impl RawClient {
         Self::handshake(ClientStream::Tls(Box::new(tls)), connect).await
     }
 
-    async fn handshake(
+    /// Performs the CONNECT / CONNACK exchange on an already open stream.
+    pub async fn handshake(
         stream: ClientStream,
         connect: ConnectPacket,
     ) -> io::Result<(Self, ConnAckInfo)> {

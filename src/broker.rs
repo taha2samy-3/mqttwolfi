@@ -87,7 +87,7 @@ impl From<&AppConfig> for BrokerOptions {
                 .then(|| Duration::from_secs(q.default_message_expiry_sec as u64)),
             max_session_expiry_sec: q.max_session_expiry_sec,
             client_id_takeover_any: c.security.auth.client_id_takeover == "any",
-            verify_client_identity: c.listeners.tls.enabled
+            verify_client_identity: (c.listeners.tls.enabled || c.listeners.wss.enabled)
                 && c.security.tls.verify_client_identity,
             retained_max_messages: c.mqtt.retained.max_messages,
             retained_max_bytes: c.mqtt.retained.max_bytes,
