@@ -44,6 +44,35 @@ enabled = true
 bind_address = "0.0.0.0"
 port = 8883
 
+[listeners.ws]
+# MQTT over plain WebSockets (RFC 6455). Unencrypted: keep it on loopback behind a reverse proxy
+# that terminates TLS, or use [listeners.wss].
+enabled = false
+bind_address = "127.0.0.1"
+port = 8083
+path = "/mqtt"
+# Browser origins allowed to connect ("*" = any). Clients without an Origin header and
+# same-origin requests (Origin = the Host connected to) are always accepted; other origins are
+# refused (HTTP 403).
+allowed_origins = []
+# Proxies whose X-Forwarded-For header gives the real client address (IP addresses).
+trusted_proxies = []
+max_header_bytes = 8192
+
+[listeners.wss]
+# MQTT over WebSockets inside wolfSSL TLS, for browsers and web dashboards. Certificates and
+# TLS settings come from [security.tls].
+enabled = false
+bind_address = "0.0.0.0"
+port = 8084
+path = "/mqtt"
+allowed_origins = ["https://dashboard.example.com"]
+trusted_proxies = []
+max_header_bytes = 8192
+# Browsers rarely have client certificates: user name + password over TLS instead. Note that
+# with security.tls.verify_client_identity = true, clients without a certificate are refused.
+require_client_cert = false
+
 [listeners.mqtt_sn]
 # MQTT-SN v1.2 over UDP for sensor networks and constrained radios.
 # SECURITY: MQTT-SN has no authentication or encryption and UDP source addresses can be

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 echo "================================================================================"
-echo "    Automated TLS Broker Benchmark Runner: WolfiMQ vs. Eclipse Mosquitto        "
+echo "  Automated TLS / WebSocket Benchmark Runner: WolfiMQ vs. Eclipse Mosquitto     "
 echo "================================================================================"
 
 # 1. Ensure test certificates exist
@@ -12,9 +12,12 @@ if [ ! -f "certs/server-cert.pem" ] || [ ! -f "certs/ca-cert.pem" ]; then
 fi
 
 MOSQUITTO_PORT=18883
+MOSQUITTO_WSS_PORT=18884
 MOSQUITTO_CONF_DIR="$(mktemp -d)"
 MOSQUITTO_CONF="${MOSQUITTO_CONF_DIR}/mosquitto_tls.conf"
+MOSQUITTO_WSS_CONF="${MOSQUITTO_CONF_DIR}/mosquitto_wss.conf"
 MOSQUITTO_PID=""
+MOSQUITTO_WSS_PID=""
 
 cleanup() {
     EXIT_CODE=$?
@@ -22,10 +25,12 @@ cleanup() {
         echo "==> Mosquitto log output on failure:"
         cat "${MOSQUITTO_CONF_DIR}/mosquitto.log"
     fi
-    if [ -n "${MOSQUITTO_PID}" ]; then
-        echo "==> Stopping Mosquitto background process (PID ${MOSQUITTO_PID})..."
-        kill -9 "${MOSQUITTO_PID}" 2>/dev/null || true
-    fi
+    for pid in "${MOSQUITTO_PID}" "${MOSQUITTO_WSS_PID}"; do
+        if [ -n "${pid}" ]; then
+            echo "==> Stopping Mosquitto background process (PID ${pid})..."
+            kill -9 "${pid}" 2>/dev/null || true
+        fi
+    done
     rm -rf "${MOSQUITTO_CONF_DIR}"
 }
 trap cleanup EXIT
@@ -64,8 +69,34 @@ EOF
         MOSQUITTO_PID=""
         HAS_MOSQUITTO=false
     fi
+
+    # A second instance for MQTT over WebSocket + TLS, so a Mosquitto build without WebSocket
+    # support does not affect the TLS comparison. Browsers present no client certificate, so
+    # both brokers use server authentication only in this workload.
+    cat <<EOF > "${MOSQUITTO_WSS_CONF}"
+per_listener_settings false
+listener ${MOSQUITTO_WSS_PORT} 127.0.0.1
+protocol websockets
+cafile $(pwd)/certs/ca-cert.pem
+certfile $(pwd)/certs/server-cert.pem
+keyfile $(pwd)/certs/server-key.pem
+allow_anonymous true
+log_type error
+log_type warning
+log_dest file ${MOSQUITTO_CONF_DIR}/mosquitto_wss.log
+max_queued_messages 0
+EOF
+    echo "==> Starting Mosquitto with WebSocket + TLS on 127.0.0.1:${MOSQUITTO_WSS_PORT}..."
+    mosquitto -c "${MOSQUITTO_WSS_CONF}" > "${MOSQUITTO_CONF_DIR}/mosquitto_wss.log" 2>&1 &
+    MOSQUITTO_WSS_PID=$!
+    sleep 1
+    if ! kill -0 "${MOSQUITTO_WSS_PID}" 2>/dev/null; then
+        echo "Warning: Mosquitto WebSocket listener failed to start (built without websockets?):"
+        cat "${MOSQUITTO_CONF_DIR}/mosquitto_wss.log"
+        MOSQUITTO_WSS_PID=""
+    fi
 else
-    echo "==> Mosquitto binary not installed locally. Running WolfiMQ TLS benchmark alone."
+    echo "==> Mosquitto binary not installed locally. Running WolfiMQ benchmarks alone."
     echo "    (In CI, Mosquitto will be installed via apt-get for side-by-side comparison)."
 fi
 
@@ -75,21 +106,30 @@ CONCURRENCY="${CONCURRENCY:-8}"
 MSG_COUNT="${MSG_COUNT:-10000}"
 PAYLOAD_SIZE="${PAYLOAD_SIZE:-128}"
 
-if [ "${HAS_MOSQUITTO}" = true ]; then
-    cargo run --release --bin wolf-bench-tls -- \
+cargo build --release --bin wolf-bench-tls
+run_bench() { # <transport> <mosquitto port or empty> <markdown file>
+    local external=()
+    if [ -n "$2" ]; then
+        external=(--external-port "$2" --external-name "Eclipse Mosquitto (OpenSSL)")
+    fi
+    ./target/release/wolf-bench-tls --transport "$1" \
         --concurrency "${CONCURRENCY}" \
         --count "${MSG_COUNT}" \
         --payload-size "${PAYLOAD_SIZE}" \
-        --external-port "${MOSQUITTO_PORT}" \
-        --external-name "Eclipse Mosquitto (OpenSSL)" \
-        --markdown-output "${SUMMARY_FILE}"
-else
-    cargo run --release --bin wolf-bench-tls -- \
-        --concurrency "${CONCURRENCY}" \
-        --count "${MSG_COUNT}" \
-        --payload-size "${PAYLOAD_SIZE}" \
-        --markdown-output "${SUMMARY_FILE}"
-fi
+        "${external[@]}" \
+        --markdown-output "$3"
+}
+TLS_PORT=""
+if [ "${HAS_MOSQUITTO}" = true ]; then TLS_PORT="${MOSQUITTO_PORT}"; fi
+WSS_PORT=""
+if [ -n "${MOSQUITTO_WSS_PID}" ]; then WSS_PORT="${MOSQUITTO_WSS_PORT}"; fi
+run_bench tls "${TLS_PORT}" "${MOSQUITTO_CONF_DIR}/tls.md"
+run_bench wss "${WSS_PORT}" "${MOSQUITTO_CONF_DIR}/wss.md"
+{
+    cat "${MOSQUITTO_CONF_DIR}/tls.md"
+    echo
+    cat "${MOSQUITTO_CONF_DIR}/wss.md"
+} > "${SUMMARY_FILE}"
 
 # 4. If running in GitHub Actions, attach to step summary
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "${SUMMARY_FILE}" ]; then
@@ -98,5 +138,5 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -f "${SUMMARY_FILE}" ]; then
 fi
 
 echo "================================================================================"
-echo "TLS Benchmark completed successfully."
+echo "TLS and WebSocket benchmarks completed successfully."
 echo "================================================================================"

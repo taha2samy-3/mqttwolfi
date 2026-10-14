@@ -8,11 +8,34 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use wolf_mqtt::auth::AclEngine;
 use wolf_mqtt::broker::{BrokerContext, BrokerOptions};
+use wolf_mqtt::client::ClientStream;
 use wolf_mqtt::protocol::{
     ConnectPacket, MqttPacket, ProtocolVersion, PublishPacket, QoS, SubscriptionOptions,
 };
 use wolf_mqtt::server::BrokerServer;
-use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector, TlsServerConfig, WolfTlsStream};
+use wolf_mqtt::tls::{create_tls_acceptor, create_tls_connector, TlsServerConfig};
+use wolf_mqtt::ws::{self, WsSettings};
+
+/// How the benchmark clients reach the broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    /// MQTT over TLS 1.3 with client certificates (mutual TLS).
+    Tls,
+    /// MQTT over WebSocket inside TLS 1.3, server authentication only (browser style).
+    Wss,
+}
+
+impl Transport {
+    fn label(self) -> &'static str {
+        match self {
+            Transport::Tls => "TLS 1.3",
+            Transport::Wss => "WebSocket + TLS 1.3",
+        }
+    }
+}
+
+/// Largest frame the benchmark's WebSocket client accepts.
+const WS_MAX_FRAME: usize = 64 << 20;
 
 #[allow(dead_code)]
 #[derive(Default, Debug, Clone)]
@@ -46,6 +69,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut external_port: Option<u16> = None;
     let mut external_name = "Eclipse Mosquitto (OpenSSL)".to_string();
     let mut markdown_path: Option<String> = None;
+    let mut transport = Transport::Tls;
+    let mut ws_path = "/mqtt".to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -70,6 +95,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 external_name = args[i + 1].clone();
                 i += 1;
             }
+            "--transport" if i + 1 < args.len() => {
+                transport = match args[i + 1].as_str() {
+                    "wss" => Transport::Wss,
+                    "tls" => Transport::Tls,
+                    other => return Err(format!("unknown transport '{other}' (tls or wss)").into()),
+                };
+                i += 1;
+            }
+            "--ws-path" if i + 1 < args.len() => {
+                ws_path = args[i + 1].clone();
+                i += 1;
+            }
             "--markdown-output" if i + 1 < args.len() => {
                 markdown_path = Some(args[i + 1].clone());
                 i += 1;
@@ -82,16 +119,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Standardized Benchmark Configuration:");
     println!("  Total Messages   : {}", msg_count);
     println!(
-        "  Concurrency Load : {} concurrent TLS 1.3 clients",
-        concurrency
+        "  Concurrency Load : {} concurrent {} clients",
+        concurrency,
+        transport.label()
     );
     println!("  Msgs Per Client  : {}", msg_count / concurrency);
     println!("  Payload Size     : {} bytes", payload_size);
-    println!("  TLS Encryption   : Active (mTLS / TLS 1.3 - RFC 8446)\n");
+    match transport {
+        Transport::Tls => println!("  TLS Encryption   : Active (mTLS / TLS 1.3 - RFC 8446)\n"),
+        Transport::Wss => println!(
+            "  TLS Encryption   : Active (TLS 1.3, server authentication) + WebSocket (RFC 6455, path {ws_path})\n"
+        ),
+    }
 
     // 1. Benchmark WolfiMQ over TLS under High Concurrency
     println!("==> [1/2] Running WolfiMQ High-Load TLS Benchmark (Rust + wolfSSL / TLS 1.3)...");
-    let wolf_res = benchmark_wolfimq(msg_count, concurrency, payload_size).await?;
+    let wolf_res =
+        benchmark_wolfimq(msg_count, concurrency, payload_size, transport, &ws_path).await?;
     print_single_result(&wolf_res);
 
     // 2. If an external broker is configured, benchmark it under identical conditions
@@ -102,8 +146,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "\n==> [2/2] Running External Target: {} on port {}...",
             external_name, port
         );
-        match benchmark_external_broker(&external_name, port, msg_count, concurrency, payload_size)
-            .await
+        match benchmark_external_broker(
+            &external_name,
+            port,
+            msg_count,
+            concurrency,
+            payload_size,
+            transport,
+            &ws_path,
+        )
+        .await
         {
             Ok(ext_res) => {
                 print_single_result(&ext_res);
@@ -126,7 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // 4. If requested, write Markdown file for GitHub Actions Summary
     if let Some(path) = markdown_path {
-        write_markdown_summary(&path, &results)?;
+        write_markdown_summary(&path, &results, transport)?;
         println!("\n[+] Standardized Markdown report saved to: {}", path);
     }
 
@@ -137,9 +189,13 @@ async fn benchmark_wolfimq(
     msg_count: usize,
     concurrency: usize,
     payload_size: usize,
+    transport: Transport,
+    ws_path: &str,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut tls = TlsServerConfig::new("certs/server-cert.pem", "certs/server-key.pem");
-    tls.client_ca_file = Some("certs/ca-cert.pem".into());
+    if transport == Transport::Tls {
+        tls.client_ca_file = Some("certs/ca-cert.pem".into());
+    }
     let acceptor = create_tls_acceptor(&tls)?;
 
     // Size the per-session queue for the whole workload so the benchmark measures throughput,
@@ -148,22 +204,34 @@ async fn benchmark_wolfimq(
     options.queue_limits.max_messages = msg_count.max(5000);
     options.queue_limits.max_bytes = (msg_count * (payload_size + 64)).max(8 << 20);
     let ctx = BrokerContext::with_options(Arc::new(AclEngine::new(true)), options);
-    let server = BrokerServer::bind("127.0.0.1:0", ctx)
+    let mut server = BrokerServer::bind("127.0.0.1:0", ctx)
         .await?
         .with_tls(acceptor);
+    if transport == Transport::Wss {
+        server = server.with_websocket(WsSettings {
+            path: ws_path.to_owned(),
+            ..Default::default()
+        });
+    }
     let addr = server.local_addr()?;
 
     tokio::spawn(server.run());
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+    let engine = match transport {
+        Transport::Tls => "wolfSSL / TLS 1.3",
+        Transport::Wss => "wolfSSL / TLS 1.3 + WebSocket",
+    };
     run_tls_client_workload(
         "WolfiMQ",
-        "wolfSSL Native / TLS 1.3",
+        engine,
         addr.port(),
         msg_count,
         concurrency,
         payload_size,
+        transport,
+        ws_path,
     )
     .await
 }
@@ -174,18 +242,27 @@ async fn benchmark_external_broker(
     msg_count: usize,
     concurrency: usize,
     payload_size: usize,
+    transport: Transport,
+    ws_path: &str,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error + Send + Sync>> {
+    let engine = match transport {
+        Transport::Tls => "OpenSSL / TLS 1.3",
+        Transport::Wss => "OpenSSL / TLS 1.3 + WebSocket",
+    };
     run_tls_client_workload(
         name,
-        "OpenSSL / TLS 1.3",
+        engine,
         port,
         msg_count,
         concurrency,
         payload_size,
+        transport,
+        ws_path,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tls_client_workload(
     broker_name: &str,
     tls_engine: &str,
@@ -193,19 +270,24 @@ async fn run_tls_client_workload(
     total_msg_count: usize,
     concurrency: usize,
     payload_size: usize,
+    transport: Transport,
+    ws_path: &str,
 ) -> Result<BenchmarkResult, Box<dyn std::error::Error + Send + Sync>> {
-    let connector = create_tls_connector(
-        "certs/ca-cert.pem",
-        Some(("certs/client-cert.pem", "certs/client-key.pem")),
-    )?;
+    // Client certificates only for the mutual-TLS workload (browsers have none).
+    let client_cert = match transport {
+        Transport::Tls => Some(("certs/client-cert.pem", "certs/client-key.pem")),
+        Transport::Wss => None,
+    };
+    let connector = create_tls_connector("certs/ca-cert.pem", client_cert)?;
 
     let msgs_per_worker = total_msg_count / concurrency;
     let actual_total = msgs_per_worker * concurrency;
     let payload_len = payload_size.max(8);
 
     println!(
-        "  -> Establishing {} concurrent TLS 1.3 / mTLS client sessions...",
-        concurrency
+        "  -> Establishing {} concurrent {} client sessions...",
+        concurrency,
+        transport.label()
     );
     let hs_start = Instant::now();
 
@@ -214,10 +296,18 @@ async fn run_tls_client_workload(
     for worker_id in 0..concurrency {
         let connector_clone = connector.clone();
         let bname = broker_name.to_string();
+        let path = ws_path.to_owned();
 
         let handle = tokio::spawn(async move {
             let tcp = TcpStream::connect(("127.0.0.1", port)).await?;
-            let mut tls = connector_clone.connect("localhost", tcp).await?;
+            tcp.set_nodelay(true)?;
+            let tls_stream = connector_clone.connect("localhost", tcp).await?;
+            let mut tls = match transport {
+                Transport::Tls => ClientStream::Tls(Box::new(tls_stream)),
+                Transport::Wss => ClientStream::Pipe(
+                    ws::connect_client(tls_stream, "localhost", &path, WS_MAX_FRAME).await?,
+                ),
+            };
             let mut buf = BytesMut::with_capacity(8192);
 
             let client_id = format!(
@@ -254,7 +344,7 @@ async fn run_tls_client_workload(
             .await?;
             let _ = read_next_packet(&mut tls, &mut buf).await?;
 
-            Ok::<(WolfTlsStream, BytesMut, String), Box<dyn std::error::Error + Send + Sync>>((
+            Ok::<(ClientStream, BytesMut, String), Box<dyn std::error::Error + Send + Sync>>((
                 tls, buf, topic,
             ))
         });
@@ -474,9 +564,19 @@ fn print_comparison_table(results: &[BenchmarkResult]) {
     }
 }
 
-fn write_markdown_summary(path: &str, results: &[BenchmarkResult]) -> std::io::Result<()> {
+fn write_markdown_summary(
+    path: &str,
+    results: &[BenchmarkResult],
+    transport: Transport,
+) -> std::io::Result<()> {
     let mut file = File::create(path)?;
-    writeln!(file, "### MQTT over TLS 1.3 (mutual TLS) throughput\n")?;
+    match transport {
+        Transport::Tls => writeln!(file, "### MQTT over TLS 1.3 (mutual TLS) throughput\n")?,
+        Transport::Wss => writeln!(
+            file,
+            "### MQTT over WebSocket + TLS 1.3 (server authentication) throughput\n"
+        )?,
+    }
     writeln!(
         file,
         "| Broker | TLS engine | Clients | Handshakes (total) | Delivered | Throughput | Bandwidth | Mean RTT | p90 RTT | p99 RTT | Max RTT |"

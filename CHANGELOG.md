@@ -5,6 +5,26 @@ The project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ---
 
+## [Unreleased]
+
+### Added
+- **MQTT over WebSockets** (issue #1): `[listeners.ws]` (plain, loopback by default, for use
+  behind a TLS-terminating proxy) and `[listeners.wss]` (inside wolfSSL TLS, optional client
+  certificates). RFC 6455 and MQTT chapter 6: subprotocol `mqtt`, binary frames only, packets
+  spanning frames, masked client frames, ping/pong and close handshake. Browser `Origin`
+  allow-list (same-origin requests, as Paho sends, always pass), `X-Forwarded-For` from trusted proxies only, bounded upgrade size and time, no
+  compression extension.
+- The WebSocket layer is implemented in WolfiMQ: the handshake digest uses wolfCrypt SHA-1 and
+  client mask keys wolfCrypt's DRBG, so wolfSSL stays the only cryptographic code (WebSocket
+  crates would have brought ChaCha20 and SHA-1 implementations of their own).
+- Benchmarks: `wolf-bench-tls --transport wss`; CI and release reports now compare MQTT over
+  WebSocket + TLS 1.3 between WolfiMQ (wolfSSL) and Mosquitto (OpenSSL), next to the existing
+  mutual-TLS comparison.
+- Interoperability checked with Paho Python 2.1 (`transport="websockets"`, MQTT 3.1.1 and 5.0)
+  and tokio-tungstenite.
+
+---
+
 ## [0.6.0] - 2026-10-13
 
 Fixes from a second full review (code, OASIS MQTT v3.1.1 / v5.0 / MQTT-SN v1.2 conformance,

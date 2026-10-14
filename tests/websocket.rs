@@ -181,6 +181,33 @@ async fn websockets_over_wolfssl_tls() {
     assert_eq!(&next_publish(&mut c).await.payload[..], b"tls+ws");
 }
 
+#[tokio::test]
+async fn bundled_websocket_client_interoperates_with_the_listener() {
+    // The client used by wolf-bench-tls: wolfCrypt mask keys, Sec-WebSocket-Accept check.
+    let b = start(false).await;
+    let tcp = TcpStream::connect(b.ws).await.unwrap();
+    let pipe = wolf_mqtt::ws::connect_client(tcp, "localhost", "/mqtt", 1 << 20)
+        .await
+        .unwrap();
+    let (mut c, ack) = RawClient::handshake(ClientStream::Pipe(pipe), v5("own-client"))
+        .await
+        .unwrap();
+    assert_eq!(ack.reason_code, 0);
+    c.subscribe("own/#", QoS::AtLeastOnce).await.unwrap();
+    c.publish(msg("own/echo", b"masked", QoS::AtLeastOnce))
+        .await
+        .unwrap();
+    assert_eq!(&next_publish(&mut c).await.payload[..], b"masked");
+
+    // A wrong path is refused with an error, not a hang.
+    let tcp = TcpStream::connect(b.ws).await.unwrap();
+    assert!(
+        wolf_mqtt::ws::connect_client(tcp, "localhost", "/nope", 1 << 20)
+            .await
+            .is_err()
+    );
+}
+
 // ── Raw protocol checks ──────────────────────────────────────────────────────────────────
 
 async fn raw_upgrade(addr: SocketAddr, extra: &str) -> (TcpStream, String) {

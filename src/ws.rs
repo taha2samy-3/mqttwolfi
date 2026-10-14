@@ -123,6 +123,17 @@ pub fn accept_key(client_key: &str) -> String {
     ))
 }
 
+/// `host[:port]` in lower case without the scheme's default port, for origin comparison.
+fn authority(value: &str) -> String {
+    let v = value.trim().to_ascii_lowercase();
+    let v = v.split_once("://").map_or(v.as_str(), |(_, rest)| rest);
+    let v = v.trim_end_matches('/');
+    v.strip_suffix(":80")
+        .or_else(|| v.strip_suffix(":443"))
+        .unwrap_or(v)
+        .to_owned()
+}
+
 /// A `Sec-WebSocket-Key` is the Base64 encoding of 16 bytes: 22 characters and `==`.
 fn valid_client_key(key: &str) -> bool {
     key.len() == 24
@@ -182,12 +193,16 @@ pub fn check_request(
         return Err(refuse(400, "the 'mqtt' subprotocol was not offered"));
     }
     // Browsers always send Origin; refusing unknown ones stops other web sites from opening
-    // connections with a visitor's browser (RFC 6455 §10.2).
+    // connections with a visitor's browser (RFC 6455 §10.2). A same-origin request (Origin
+    // equal to the Host the client asked for, as Paho and pages served by this host send) is
+    // always allowed: a foreign site cannot claim it.
     if let Some(origin) = one("Origin") {
-        let allowed = settings
-            .allowed_origins
-            .iter()
-            .any(|o| o == "*" || o.eq_ignore_ascii_case(origin.trim()));
+        let same_origin = one("Host").is_some_and(|h| authority(h) == authority(origin));
+        let allowed = same_origin
+            || settings
+                .allowed_origins
+                .iter()
+                .any(|o| o == "*" || o.eq_ignore_ascii_case(origin.trim()));
         if !allowed {
             return Err(refuse(403, format!("origin {origin} is not allowed")));
         }
@@ -316,19 +331,32 @@ pub enum Event {
     Close,
 }
 
-/// Incremental parser of client-to-server frames (RFC 6455 §5).
+/// Incremental parser of WebSocket frames (RFC 6455 §5).
 #[derive(Debug)]
 pub struct FrameDecoder {
     max_frame_size: usize,
     /// A fragmented binary message is in progress.
     in_message: bool,
+    /// Frames come from a client and must be masked (server side); frames from a server must
+    /// not be (client side).
+    expect_masked: bool,
 }
 
 impl FrameDecoder {
+    /// Decoder for client-to-server frames.
     pub fn new(max_frame_size: usize) -> Self {
         Self {
             max_frame_size,
             in_message: false,
+            expect_masked: true,
+        }
+    }
+
+    /// Decoder for server-to-client frames.
+    pub fn for_client(max_frame_size: usize) -> Self {
+        Self {
+            expect_masked: false,
+            ..Self::new(max_frame_size)
         }
     }
 
@@ -345,10 +373,12 @@ impl FrameDecoder {
         if b0 & 0x70 != 0 {
             return Err(close::PROTOCOL_ERROR);
         }
-        // Every client frame must be masked (§5.1).
-        if b1 & 0x80 == 0 {
+        // Client frames are always masked, server frames never (§5.1).
+        let masked = b1 & 0x80 != 0;
+        if masked != self.expect_masked {
             return Err(close::PROTOCOL_ERROR);
         }
+        let mask_len = if masked { 4 } else { 0 };
         let (len, header) = match b1 & 0x7F {
             126 => {
                 if buf.len() < 4 {
@@ -395,21 +425,19 @@ impl FrameDecoder {
             return Err(close::MESSAGE_TOO_BIG);
         }
         let len = len as usize;
-        let total = header + 4 + len;
+        let total = header + mask_len + len;
         if buf.len() < total {
             buf.reserve(total - buf.len());
             return Ok(None);
         }
-        let mask = [
-            buf[header],
-            buf[header + 1],
-            buf[header + 2],
-            buf[header + 3],
-        ];
-        buf.advance(header + 4);
+        let mut mask = [0u8; 4];
+        mask[..mask_len].copy_from_slice(&buf[header..header + mask_len]);
+        buf.advance(header + mask_len);
         let mut payload = buf.split_to(len);
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= mask[i & 3];
+        if masked {
+            for (i, b) in payload.iter_mut().enumerate() {
+                *b ^= mask[i & 3];
+            }
         }
         Ok(Some(match opcode {
             OP_BINARY | OP_CONTINUATION => {
@@ -425,19 +453,31 @@ impl FrameDecoder {
 
 /// Appends a server-to-client frame (never masked, §5.1).
 pub fn encode_frame(opcode: u8, payload: &[u8], out: &mut BytesMut) {
+    encode_frame_with_mask(opcode, payload, None, out);
+}
+
+/// Appends a frame; client-to-server frames carry a fresh random mask (§5.3).
+fn encode_frame_with_mask(opcode: u8, payload: &[u8], mask: Option<[u8; 4]>, out: &mut BytesMut) {
+    let mask_bit = if mask.is_some() { 0x80 } else { 0 };
     out.put_u8(0x80 | opcode);
     match payload.len() {
-        n if n < 126 => out.put_u8(n as u8),
+        n if n < 126 => out.put_u8(mask_bit | n as u8),
         n if n <= u16::MAX as usize => {
-            out.put_u8(126);
+            out.put_u8(mask_bit | 126);
             out.put_u16(n as u16);
         }
         n => {
-            out.put_u8(127);
+            out.put_u8(mask_bit | 127);
             out.put_u64(n as u64);
         }
     }
-    out.extend_from_slice(payload);
+    match mask {
+        None => out.extend_from_slice(payload),
+        Some(m) => {
+            out.extend_from_slice(&m);
+            out.extend(payload.iter().enumerate().map(|(i, b)| b ^ m[i & 3]));
+        }
+    }
 }
 
 fn close_payload(code: u16) -> [u8; 2] {
@@ -459,28 +499,39 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (app, pipe) = tokio::io::duplex(PIPE_CAPACITY);
-    tokio::spawn(pump(stream, leftover, pipe, max_frame_size));
+    tokio::spawn(pump(
+        stream,
+        leftover,
+        pipe,
+        FrameDecoder::new(max_frame_size),
+        None,
+    ));
     app
 }
 
-async fn pump<S>(stream: S, leftover: BytesMut, pipe: DuplexStream, max_frame_size: usize)
-where
+async fn pump<S>(
+    stream: S,
+    leftover: BytesMut,
+    pipe: DuplexStream,
+    decoder: FrameDecoder,
+    mut masker: Option<crypto::Rng>,
+) where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
+    let mut mask = move || {
+        masker.as_mut().map(|rng| {
+            let mut m = [0u8; 4];
+            rng.fill(&mut m);
+            m
+        })
+    };
     let (mut net_rd, mut net_wr) = tokio::io::split(stream);
     let (mut pipe_rd, mut pipe_wr) = tokio::io::split(pipe);
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<Control>(16);
 
     // Client → broker: frames in, MQTT bytes out. Only this task reads the socket.
     let inbound = tokio::spawn(async move {
-        let code = inbound_loop(
-            &mut net_rd,
-            leftover,
-            &mut pipe_wr,
-            &ctrl_tx,
-            max_frame_size,
-        )
-        .await;
+        let code = inbound_loop(&mut net_rd, leftover, &mut pipe_wr, &ctrl_tx, decoder).await;
         // The connection handler sees end-of-stream (an abnormal close unless it got
         // DISCONNECT), then the client gets its Close frame.
         let _ = pipe_wr.shutdown().await;
@@ -495,13 +546,15 @@ where
         tokio::select! {
             biased;
             ctrl = ctrl_rx.recv() => match ctrl {
-                Some(Control::Pong(payload)) => encode_frame(OP_PONG, &payload, &mut out),
+                Some(Control::Pong(payload)) => {
+                    encode_frame_with_mask(OP_PONG, &payload, mask(), &mut out)
+                }
                 Some(Control::Close(code)) => break code,
                 None => break None,
             },
             n = pipe_rd.read(&mut chunk) => match n {
                 Ok(0) | Err(_) => break Some(close::NORMAL),
-                Ok(n) => encode_frame(OP_BINARY, &chunk[..n], &mut out),
+                Ok(n) => encode_frame_with_mask(OP_BINARY, &chunk[..n], mask(), &mut out),
             },
         }
         if net_wr.write_all(&out).await.is_err() || net_wr.flush().await.is_err() {
@@ -510,7 +563,7 @@ where
     };
     if let Some(code) = final_code {
         out.clear();
-        encode_frame(OP_CLOSE, &close_payload(code), &mut out);
+        encode_frame_with_mask(OP_CLOSE, &close_payload(code), mask(), &mut out);
         let _ = net_wr.write_all(&out).await;
         let _ = net_wr.flush().await;
     }
@@ -524,13 +577,12 @@ async fn inbound_loop<R, W>(
     mut buf: BytesMut,
     app: &mut W,
     ctrl: &mpsc::Sender<Control>,
-    max_frame_size: usize,
+    mut decoder: FrameDecoder,
 ) -> Option<u16>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut decoder = FrameDecoder::new(max_frame_size);
     loop {
         loop {
             match decoder.decode(&mut buf) {
@@ -556,6 +608,81 @@ where
             Ok(_) => {}
         }
     }
+}
+
+// ── Client ─────────────────────────────────────────────────────────────────────────────────
+
+/// Opens MQTT over WebSockets on an established stream (TCP or wolfSSL TLS) and returns the
+/// byte stream to speak MQTT on. Used by the bundled tools; mask keys come from wolfCrypt.
+pub async fn connect_client<S>(
+    mut stream: S,
+    host: &str,
+    path: &str,
+    max_frame_size: usize,
+) -> std::io::Result<DuplexStream>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    use std::io::{Error, ErrorKind};
+    let mut rng = crypto::Rng::new();
+    let mut nonce = [0u8; 16];
+    rng.fill(&mut nonce);
+    let key = crypto::base64_encode(&nonce);
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Protocol: {SUBPROTOCOL}\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+
+    let mut buf = BytesMut::with_capacity(1024);
+    let consumed = loop {
+        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+        let mut resp = httparse::Response::new(&mut headers);
+        if let httparse::Status::Complete(n) = resp
+            .parse(&buf)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, e))?
+        {
+            if resp.code != Some(101) {
+                return Err(Error::new(
+                    ErrorKind::ConnectionRefused,
+                    format!("WebSocket upgrade refused with HTTP {:?}", resp.code),
+                ));
+            }
+            let value = |name: &str| {
+                resp.headers
+                    .iter()
+                    .find(|h| h.name.eq_ignore_ascii_case(name))
+                    .and_then(|h| std::str::from_utf8(h.value).ok())
+                    .map(str::trim)
+            };
+            if value("Sec-WebSocket-Accept") != Some(accept_key(&key).as_str())
+                || value("Sec-WebSocket-Protocol") != Some(SUBPROTOCOL)
+            {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid WebSocket upgrade response",
+                ));
+            }
+            break n;
+        }
+        if buf.len() > 16 * 1024 || stream.read_buf(&mut buf).await? == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "no WebSocket upgrade response",
+            ));
+        }
+    };
+    buf.advance(consumed);
+    let (app, pipe) = tokio::io::duplex(PIPE_CAPACITY);
+    tokio::spawn(pump(
+        stream,
+        buf,
+        pipe,
+        FrameDecoder::for_client(max_frame_size),
+        Some(rng),
+    ));
+    Ok(app)
 }
 
 #[cfg(test)]
@@ -645,6 +772,9 @@ mod tests {
                 .status,
             403
         );
+        // Same-origin requests (Origin equal to Host) need no allow-list entry.
+        let same = request(&[("Origin", "https://broker.example.com")]);
+        assert!(check_request("GET", "/mqtt", &same, &WsSettings::default(), None).is_ok());
         let any = WsSettings {
             allowed_origins: vec!["*".into()],
             ..Default::default()
@@ -759,6 +889,28 @@ mod tests {
         buf.extend_from_slice(&client_frame(0x82, b"b"));
         assert!(d.decode(&mut buf).unwrap().is_some());
         assert_eq!(d.decode(&mut buf), Err(close::PROTOCOL_ERROR));
+    }
+
+    #[test]
+    fn client_side_decoder_requires_unmasked_frames() {
+        let mut server_frame = BytesMut::new();
+        encode_frame(OP_BINARY, b"to-client", &mut server_frame);
+        assert_eq!(
+            FrameDecoder::for_client(1024).decode(&mut server_frame.clone()),
+            Ok(Some(Event::Data(BytesMut::from(&b"to-client"[..]))))
+        );
+        // A server must not mask (RFC 6455 §5.1).
+        assert_eq!(
+            FrameDecoder::for_client(1024).decode(&mut client_frame(0x82, b"x")),
+            Err(close::PROTOCOL_ERROR)
+        );
+        // Our client's masked frames decode on the server side.
+        let mut masked = BytesMut::new();
+        encode_frame_with_mask(OP_BINARY, b"to-server", Some([1, 2, 3, 4]), &mut masked);
+        assert_eq!(
+            FrameDecoder::new(1024).decode(&mut masked),
+            Ok(Some(Event::Data(BytesMut::from(&b"to-server"[..]))))
+        );
     }
 
     #[test]

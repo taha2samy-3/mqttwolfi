@@ -160,7 +160,7 @@ pub struct WsListenerConfig {
     /// HTTP path accepting MQTT connections.
     pub path: String,
     /// Browser origins allowed to connect (`"*"` = any). Clients that send no Origin header
-    /// (non-browser clients) are always accepted.
+    /// and same-origin requests are always accepted.
     pub allowed_origins: Vec<String>,
     /// Reverse proxy addresses whose `X-Forwarded-For` header gives the client address.
     pub trusted_proxies: Vec<String>,

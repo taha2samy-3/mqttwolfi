@@ -22,6 +22,11 @@ disclosure date with you once a fix is available.
 - **Transport**: plain TCP is intended for loopback / trusted networks only. Use the wolfSSL TLS
   listener (TLS 1.3 by default, optional mutual TLS, CRL-based revocation of client
   certificates, RSA ≥ 2048 / ECC ≥ 256 bits, no session resumption or 0-RTT) for anything else.
+- **WebSockets**: `wss` runs inside wolfSSL TLS; plain `ws` is meant for loopback behind a
+  TLS-terminating proxy. Browser origins must be allow-listed (`allowed_origins`), the upgrade
+  request size and time are bounded, no compression extension is negotiated, and
+  `X-Forwarded-For` is only trusted from configured proxies. The handshake digest and client
+  mask keys use wolfCrypt; no other crypto library is linked.
 - **MQTT-SN** runs over plain UDP with no authentication and no encryption; clients are
   identified by a source address that can be spoofed, and every SN client acts with the
   rights of the configured `acl_user`. It is disabled in the sample configuration; only expose

@@ -11,6 +11,7 @@ Reference for configuring, securing and operating the `wolf-broker` binary.
 5. [Access control (`acl.conf`)](#5-access-control-aclconf)
 6. [TLS and PKI](#6-tls-and-pki)
 7. [MQTT protocol behaviour](#7-mqtt-protocol-behaviour)
+   - [MQTT over WebSockets](#7a-mqtt-over-websockets)
 8. [MQTT-SN gateway](#8-mqtt-sn-gateway)
 9. [Monitoring](#9-monitoring)
 10. [Deployment](#10-deployment)
@@ -110,6 +111,23 @@ set `WorkingDirectory=` (see the systemd unit below).
 | `enabled` | `false` | TLS listener (settings in `[security.tls]`). The sample file enables it. |
 | `bind_address` | `"0.0.0.0"` | |
 | `port` | `8883` | |
+
+### `[listeners.ws]` / `[listeners.wss]` — MQTT over WebSockets
+
+| Key | Default (`ws` / `wss`) | Description |
+| :--- | :--- | :--- |
+| `enabled` | `false` / `false` | |
+| `bind_address` | `"127.0.0.1"` / `"0.0.0.0"` | Plain `ws` carries credentials unencrypted: keep it on loopback behind a TLS-terminating reverse proxy (a warning is logged otherwise). |
+| `port` | `8083` / `8084` | |
+| `path` | `"/mqtt"` | HTTP path accepting MQTT; other paths get 404. Query strings are ignored. |
+| `allowed_origins` | `[]` | Browser origins allowed to connect, e.g. `["https://dashboard.example.com"]`; `"*"` allows any. Requests without an `Origin` header (non-browser clients) and same-origin requests (`Origin` equal to the `Host` the client connected to, as Paho sends) are always accepted; other origins get 403. This stops other web sites from connecting with a visitor's browser (cross-site WebSocket hijacking). |
+| `trusted_proxies` | `[]` | IP addresses of reverse proxies whose `X-Forwarded-For` header gives the client address (last entry). Ignored from any other peer. |
+| `max_header_bytes` | `8192` | Largest HTTP upgrade request (1024–65536); larger requests get 431. |
+| `require_client_cert` | — / `false` | `wss` only: require client certificates on this listener. With `security.tls.verify_client_identity = true`, clients without a certificate are refused on every listener. |
+
+`wss` uses the certificate, key, CA, CRL, cipher and minimum-version settings of
+`[security.tls]`. The HTTP upgrade must complete within `connect_timeout_sec`; WebSocket frames
+larger than `max_packet_size` are refused (close code 1009).
 
 ### `[listeners.mqtt_sn]` — MQTT-SN gateway (UDP)
 
@@ -393,6 +411,25 @@ wolf-simulate --tls --port 8883 --ca certs/ca-cert.pem --cert certs/client-cert.
 - **Enhanced authentication** (AUTH packets, v5.0 Authentication Method) is not supported:
   CONNACK 0x8C.
 
+## 7a. MQTT over WebSockets
+
+The WebSocket transport follows RFC 6455 and chapter 6 of MQTT v3.1.1 / v5.0. After the HTTP
+upgrade the connection is handled exactly like a TCP or TLS connection (same authentication,
+ACL, sessions and limits).
+
+- **Upgrade:** `GET <path>` over HTTP/1.1 with `Upgrade: websocket`, `Sec-WebSocket-Version:
+  13` (otherwise 426) and a valid `Sec-WebSocket-Key`. The client must offer the subprotocol
+  `mqtt` (MQTT-6.0.0-3), which the server selects (MQTT-6.0.0-4); MQTT 3.1's `mqttv3.1` alone is
+  refused. The `Sec-WebSocket-Accept` digest is computed with wolfCrypt.
+- **Frames:** MQTT is carried in binary frames only; a text frame closes the connection with
+  1003 (MQTT-6.0.0-1). MQTT packets may span frames and a frame may hold several packets
+  (MQTT-6.0.0-2). Client frames must be masked (1002 otherwise); extensions such as
+  `permessage-deflate` are not negotiated (compression of encrypted traffic enables
+  CRIME/BREACH-style attacks); pings are answered with pongs.
+- **Closing:** a WebSocket Close without an MQTT DISCONNECT is an abnormal end: the Will is
+  published, as for a dropped TCP connection.
+- **Not supported:** serving web pages, HTTP/2 WebSockets (RFC 8441), the PROXY protocol.
+
 ## 8. MQTT-SN gateway
 
 The gateway implements MQTT-SN v1.2 over UDP as an aggregating gateway: SN clients get broker
@@ -539,11 +576,13 @@ release). Locally:
 ```bash
 task bench                 # codec, trie, retained store and loopback micro-benchmarks
 task bench:tls             # MQTT over TLS 1.3 throughput with 8 clients
-task bench:tls:compare     # the same, side by side with a local Mosquitto if installed
+task bench:tls:compare     # TLS and WebSocket + TLS, side by side with a local Mosquitto if installed
 task bench:report          # everything, written to BENCHMARKS.md
 ```
 
-`wolf-bench-tls` options: `--concurrency <n>`, `--count <messages>`, `--payload-size <bytes>`,
+`wolf-bench-tls` options: `--transport tls|wss` (mutual TLS, or WebSocket + TLS with server
+authentication only, as browsers use), `--ws-path <path>`, `--concurrency <n>`,
+`--count <messages>`, `--payload-size <bytes>`,
 `--external-port <port>` / `--external-name <name>` (benchmark another broker),
 `--markdown-output <file>`. Numbers depend heavily on the machine; compare runs from the same
 hardware only.

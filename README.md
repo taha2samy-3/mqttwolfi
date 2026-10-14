@@ -28,7 +28,7 @@ optional FIPS-Ready build), and ships as a single binary for Linux, Windows and 
 | Area | Supported |
 | :--- | :--- |
 | Protocols | MQTT v3.1.1, MQTT v5.0, MQTT-SN v1.2 over UDP — all sharing one routing core |
-| Transports | TCP, TLS 1.2 / 1.3 via wolfSSL (mutual TLS, ALPN, cipher selection), UDP for MQTT-SN |
+| Transports | TCP, TLS 1.2 / 1.3 via wolfSSL (mutual TLS, ALPN, cipher selection), WebSockets plain and over wolfSSL TLS (browsers, dashboards), UDP for MQTT-SN |
 | QoS | 0, 1 and 2 in both directions, per-session packet ids, DUP resend on session resume |
 | Sessions | Clean and persistent sessions (v3.1.1 `CleanSession=0`, v5.0 Session Expiry), session takeover |
 | MQTT v5.0 | Properties forwarding, topic aliases, subscription identifiers, No Local, Retain As Published, Retain Handling, shared subscriptions (`$share/…`), Receive Maximum, Maximum Packet Size, Message Expiry, Will Delay, reason codes, server DISCONNECT |
@@ -37,8 +37,12 @@ optional FIPS-Ready build), and ships as a single binary for Linux, Windows and 
 | Operations | TOML config + `WOLFIMQ_*` environment overrides, `$SYS/broker/...` metrics, SIGHUP ACL reload, graceful SIGTERM |
 | MQTT-SN | Predefined and short topic ids, REGISTER, QoS −1, Will, sleeping clients, retransmission, forwarder encapsulation |
 
-Not implemented: clustering, disk persistence, MQTT over WebSockets, MQTT v5.0 enhanced
-authentication (AUTH), DTLS for MQTT-SN.
+Not implemented: clustering, disk persistence, bridging, MQTT v5.0 enhanced authentication
+(AUTH), DTLS for MQTT-SN.
+
+wolfSSL is the only cryptographic code in the broker: TLS, and also the WebSocket handshake
+digest (wolfCrypt SHA-1) and random numbers (wolfCrypt DRBG). The WebSocket layer is
+implemented in WolfiMQ itself rather than taken from a library that brings its own crypto.
 
 ## Quick start
 
@@ -157,6 +161,22 @@ so a drone publishing over MQTT-SN reaches a ground station subscribed over TLS 
   address that can be spoofed. The gateway is disabled in the sample configuration; enable it
   only on a trusted network.
 
+## MQTT over WebSockets
+
+For browsers and web dashboards (MQTT.js, Paho JavaScript):
+
+- `[listeners.wss]` (port 8084, path `/mqtt`): WebSocket inside wolfSSL TLS, using the
+  certificates of `[security.tls]`; client certificates optional.
+- `[listeners.ws]` (port 8083, loopback): plain WebSocket for use behind a TLS-terminating
+  reverse proxy; `trusted_proxies` lets the broker log the real client address.
+- Follows RFC 6455 and MQTT chapter 6: subprotocol `mqtt`, binary frames only, packets may span
+  frames. Browser `Origin`s must be listed in `allowed_origins`; no compression extension.
+
+```js
+// MQTT.js in the browser
+mqtt.connect("wss://broker.example.com:8084/mqtt", { username, password });
+```
+
 ## Benchmarks
 
 Benchmark figures are produced by CI on GitHub-hosted runners, not maintained by hand:
@@ -164,8 +184,9 @@ Benchmark figures are produced by CI on GitHub-hosted runners, not maintained by
 - every [release](../../releases) contains `BENCHMARKS.md` and shows the results in its notes;
 - every push to the main branch publishes the same report in the workflow run summary.
 
-The report covers end-to-end MQTT over TLS 1.3 throughput and latency (side by side with
-Mosquitto on the same runner) plus codec and routing micro-benchmarks. Run it locally with:
+The report covers end-to-end throughput and latency for MQTT over TLS 1.3 (mutual TLS) and
+for MQTT over WebSocket + TLS 1.3, each side by side with Mosquitto (OpenSSL) on the same
+runner, plus codec and routing micro-benchmarks. Run it locally with:
 
 ```bash
 task bench:report          # or: bash scripts/ci_benchmarks.sh BENCHMARKS.md
